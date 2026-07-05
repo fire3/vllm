@@ -8,11 +8,36 @@
 
 ## Changelog
 
+### 2026-07-06
+
+- 增加 **SM80/A800 测试性适配**说明。SM80 路径仅用于自测和实验，不代表生产级支持。
+- 在 4× A800 上完成 DeepSeek-V4-Flash DSpark 推测解码冒烟与吞吐测试，测试参数为 `method=dspark`、`num_speculative_tokens=6`、`draft_sample_method=greedy`，并开启 FlashInfer sampler、sparse MLA warmup、`max-num-batched-tokens=16384`。
+- 只记录 decode 侧结果：8k 输入、1k 输出、单并发为 **229.8 tok/s/req**；32k 输入、1k 输出、单并发为 **274.2 tok/s/req**。对应无 DSpark `mbt16k` 基线分别为 57.6 和 58.1 tok/s/req。
+
 ### 2026-07-01
 
 - 完成 **DeepSeek-V4-Flash-DSpark** 模型适配，支持 `method=dspark` 推测解码；当前 release wheel 打包目标切换为 **CUDA 13.0 工具链 + torch 2.11.0+cu130**，并已在 CUDA 13.x / 4× RTX 4090 上验证 `vllm serve`、tool call 和 vLLM bench。
 - DSpark 单并发 `8K / 32K / 128K` 输入、`1K` 输出均 `10/10` 成功;decode 折算为 **355 / 336 / 219 tok/s**。相比非 DSpark 源模型基线 decode **~82 tok/s**，分别提升约 **4.3× / 4.1× / 2.7×**。
 - 推荐 DSpark 服务配置:`gpu-memory-utilization=0.96`、`max-model-len=262144`、`max-num-batched-tokens=2048`、`max-num-seqs=4`、`block-size=256`、`kv-cache-dtype=fp8_ds_mla`。
+
+---
+
+## SM80/A800 测试性适配
+
+SM80/A800 路径已经可以用于 DeepSeek-V4-Flash + DSpark 推测解码自测，但仍是测试性适配，不是生产支持承诺。当前已验证的 A800 配置使用：
+
+```bash
+--speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
+```
+
+并开启 FlashInfer sampler、sparse MLA warmup、`max-num-batched-tokens=16384`。
+
+| 输入 -> 输出 | 并发 | DSpark decode | 无 DSpark decode | decode 提升 |
+|---|---:|---:|---:|---:|
+| 8,192 -> 1,024 | 1 | **229.8 tok/s/req** | 57.6 tok/s/req | **3.99×** |
+| 32,768 -> 1,024 | 1 | **274.2 tok/s/req** | 58.1 tok/s/req | **4.72×** |
+
+这里仅列 decode 结果；SM80 长上下文 prefill 仍需单独评估。
 
 ---
 
@@ -83,11 +108,15 @@ pip install \
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install torch==2.11.0 --torch-backend=cu130
-uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
+uv pip install torch==2.11.0 --torch-backend=cu130 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --extra-index-url https://download.pytorch.org/whl/cu130
+uv pip install -r requirements/build/cuda.txt --torch-backend=cu130 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
-### 4.2 Rust 工具链(vLLM 0.11 有 Rust frontend)
+### 4.2 Rust 工具链(vLLM 构建需要 Rust frontend)
 
 ```bash
 export RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
@@ -123,6 +152,7 @@ uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```
 
 > DeepGEMM **不要**装(Ada 不支持)。
+> 如果要为 SM80/A100/A800 构建 wheel，把 `TORCH_CUDA_ARCH_LIST` 改成 `8.0`。
 > wheel 文件名遵循 release 命名:`vllm-0.23.1rc1.dev145+g<commit>.cu130-cp312-cp312-linux_x86_64.whl`。
 
 ---
@@ -206,13 +236,13 @@ A: 长城是中国古代为抵御北方游牧民族入侵而修筑的、横跨�
 
 输入长度 sweep(256K 配置，均成功):64K(25s)/128K(37s)/200K(74s)/262K(71s)。
 
-### 7.3 性能(单并发，输出 512 token)
-| 输入 | TTFT | Prefill | Decode |
-|---|---|---|---|
-| 8,192 | 1.97s | **~4,160 tok/s** | **~82 tok/s** |
-| 32,768 | 7.81s | **~4,195 tok/s** | **~82 tok/s** |
+### 7.3 非 DSpark decode 性能(4× RTX 4090，单并发)
+| 输入 | Decode |
+|---|---:|
+| 8,192 | **~82 tok/s** |
+| 32,768 | **~82 tok/s** |
 
-Decode ~82 tok/s 受 Marlin MoE 反量化开销影响(Ada 无 FP4 张量核)。
+Decode 主要受 Marlin MoE 反量化开销影响(Ada 无 FP4 张量核)。
 
 ### 7.4 Tool call(`deepseek_v4` parser)
 ```
@@ -242,11 +272,10 @@ vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
   --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
 ```
 
-| 输入 → 输出 | 成功 | mean TTFT | mean TPOT | Prefill | Decode | output tok/s | total tok/s | acceptance |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8,192 → 1,024 | 10/10 | 2.428s | 2.816ms | **3,374 tok/s** | **355 tok/s** | 192.9 | 1,736.0 | 92.81% |
-| 32,768 → 1,024 | 10/10 | 9.442s | 2.974ms | **3,470 tok/s** | **336 tok/s** | 82.0 | 2,706.6 | 89.12% |
-| 131,072 → 1,024 | 10/10 | 42.829s | 4.568ms | **3,060 tok/s** | **219 tok/s** | 21.6 | 2,780.8 | 58.25% |
+| 输入 → 输出 | 成功 | Decode | acceptance |
+|---|---:|---:|---:|
+| 8,192 → 1,024 | 10/10 | **355 tok/s** | 92.81% |
+| 32,768 → 1,024 | 10/10 | **336 tok/s** | 89.12% |
 
 ## 8. 许可 / 来源
 

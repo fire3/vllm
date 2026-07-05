@@ -8,11 +8,36 @@ It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM8
 
 ## Changelog
 
+### 2026-07-06
+
+- Added notes for the **SM80/A800 test adaptation**. The SM80 path is for experiments and self-testing only, not production-grade support.
+- Completed DeepSeek-V4-Flash DSpark speculative decoding smoke and throughput tests on a 4× A800 server with `method=dspark`, `num_speculative_tokens=6`, `draft_sample_method=greedy`, the FlashInfer sampler, sparse MLA warmup, and `max-num-batched-tokens=16384`.
+- Only decode-side results are reported: **229.8 tok/s/req** for 8k input -> 1k output, single concurrency; **274.2 tok/s/req** for 32k input -> 1k output, single concurrency. The matching no-DSpark `mbt16k` baselines are 57.6 and 58.1 tok/s/req.
+
 ### 2026-07-01
 
 - Completed **DeepSeek-V4-Flash-DSpark** model adaptation with `method=dspark` speculative decoding. The current release wheel target is **CUDA 13.0 toolkit + torch 2.11.0+cu130**, and `vllm serve`, tool calling, and vLLM bench have been validated on CUDA 13.x / 4× RTX 4090.
 - DSpark single-concurrency `8K / 32K / 128K` input and `1K` output cases all passed `10/10`; converted decode throughput is **355 / 336 / 219 tok/s**. Compared with the non-DSpark source-model baseline decode throughput of **~82 tok/s**, this is about **4.3× / 4.1× / 2.7×** faster.
 - Recommended DSpark serving config: `gpu-memory-utilization=0.96`, `max-model-len=262144`, `max-num-batched-tokens=2048`, `max-num-seqs=4`, `block-size=256`, `kv-cache-dtype=fp8_ds_mla`.
+
+---
+
+## SM80/A800 Test Adaptation
+
+The SM80/A800 path can now be used for DeepSeek-V4-Flash + DSpark speculative decoding self-tests, but it remains a test-only adaptation and is not a production support commitment. The validated A800 setup used:
+
+```bash
+--speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
+```
+
+with the FlashInfer sampler, sparse MLA warmup, and `max-num-batched-tokens=16384`.
+
+| input -> output | concurrency | DSpark decode | no-DSpark decode | decode speedup |
+|---|---:|---:|---:|---:|
+| 8,192 -> 1,024 | 1 | **229.8 tok/s/req** | 57.6 tok/s/req | **3.99×** |
+| 32,768 -> 1,024 | 1 | **274.2 tok/s/req** | 58.1 tok/s/req | **4.72×** |
+
+This table reports decode-side results only; SM80 long-context prefill needs separate evaluation.
 
 ---
 
@@ -83,11 +108,15 @@ pip install \
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install torch==2.11.0 --torch-backend=cu130
-uv pip install -r requirements/build/cuda.txt --torch-backend=cu130
+uv pip install torch==2.11.0 --torch-backend=cu130 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --extra-index-url https://download.pytorch.org/whl/cu130
+uv pip install -r requirements/build/cuda.txt --torch-backend=cu130 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
-### 4.2 Rust toolchain (vLLM 0.11 ships a Rust frontend)
+### 4.2 Rust toolchain (vLLM builds the Rust frontend)
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95 --profile minimal
@@ -117,6 +146,7 @@ uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```
 
 > Do **not** install DeepGEMM (unsupported on Ada).
+> To build an SM80/A100/A800 wheel, set `TORCH_CUDA_ARCH_LIST` to `8.0`.
 > Wheel names follow the release convention: `vllm-0.23.1rc1.dev145+g<commit>.cu130-cp312-cp312-linux_x86_64.whl`.
 
 ---
@@ -199,13 +229,13 @@ Longest input that completed: **768K (786,000 tokens, prefill ~147 s)**. 1M star
 
 Input-length sweep (256K config, all succeeded): 64K (25 s) / 128K (37 s) / 200K (74 s) / 262K (71 s).
 
-### 7.3 Performance (single concurrency, 512 output tokens)
-| input | TTFT | prefill | decode |
-|---|---|---|---|
-| 8,192 | 1.97 s | **~4,160 tok/s** | **~82 tok/s** |
-| 32,768 | 7.81 s | **~4,195 tok/s** | **~82 tok/s** |
+### 7.3 Non-DSpark decode performance (4× RTX 4090, single concurrency)
+| input | decode |
+|---|---:|
+| 8,192 | **~82 tok/s** |
+| 32,768 | **~82 tok/s** |
 
-Decode ~82 tok/s is bounded by Marlin MoE dequantization overhead (no FP4 tensor cores on Ada).
+Decode is mainly bounded by Marlin MoE dequantization overhead (no FP4 tensor cores on Ada).
 
 ### 7.4 Tool call (`deepseek_v4` parser)
 ```
@@ -235,11 +265,10 @@ vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
   --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
 ```
 
-| Input → output | Success | mean TTFT | mean TPOT | Prefill | Decode | output tok/s | total tok/s | acceptance |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8,192 → 1,024 | 10/10 | 2.428 s | 2.816 ms | **3,374 tok/s** | **355 tok/s** | 192.9 | 1,736.0 | 92.81% |
-| 32,768 → 1,024 | 10/10 | 9.442 s | 2.974 ms | **3,470 tok/s** | **336 tok/s** | 82.0 | 2,706.6 | 89.12% |
-| 131,072 → 1,024 | 10/10 | 42.829 s | 4.568 ms | **3,060 tok/s** | **219 tok/s** | 21.6 | 2,780.8 | 58.25% |
+| Input → output | Success | Decode | acceptance |
+|---|---:|---:|---:|
+| 8,192 → 1,024 | 10/10 | **355 tok/s** | 92.81% |
+| 32,768 → 1,024 | 10/10 | **336 tok/s** | 89.12% |
 
 ## 8. License / provenance
 
