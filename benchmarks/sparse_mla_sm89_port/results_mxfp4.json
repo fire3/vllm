@@ -1,0 +1,72 @@
+[
+  {
+    "tokens": 1,
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "num_experts": 8,
+    "topk": 2,
+    "deepgemm_output_all_finite": false,
+    "deepgemm_ms": 0.22944319248199463,
+    "marlin_output_all_finite": true,
+    "marlin_ms": 0.08289759755134582,
+    "marlin_over_deepgemm": 0.3612990067589438
+  },
+  {
+    "tokens": 16,
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "num_experts": 8,
+    "topk": 2,
+    "deepgemm_error": "AssertionError: ",
+    "marlin_output_all_finite": true,
+    "marlin_ms": 0.09875839948654175
+  },
+  {
+    "tokens": 64,
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "num_experts": 8,
+    "topk": 2,
+    "deepgemm_output_all_finite": false,
+    "deepgemm_ms": 0.22190239429473876,
+    "marlin_output_all_finite": true,
+    "marlin_ms": 0.08219839930534363,
+    "marlin_over_deepgemm": 0.37042592337316
+  },
+  {
+    "tokens": 256,
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "num_experts": 8,
+    "topk": 2,
+    "deepgemm_output_all_finite": false,
+    "deepgemm_ms": 0.2181328058242798,
+    "marlin_output_all_finite": true,
+    "marlin_ms": 0.1347872018814087,
+    "marlin_over_deepgemm": 0.6179134833574211
+  },
+  {
+    "tokens": 1024,
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "num_experts": 8,
+    "topk": 2,
+    "deepgemm_output_all_finite": false,
+    "deepgemm_ms": 0.2448335886001587,
+    "marlin_output_all_finite": true,
+    "marlin_ms": 0.3682480096817017,
+    "marlin_over_deepgemm": 1.5040747137154162
+  },
+  {
+    "tokens": 4096,
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "num_experts": 8,
+    "topk": 2,
+    "deepgemm_output_all_finite": false,
+    "deepgemm_ms": 0.821940803527832,
+    "marlin_output_all_finite": true,
+    "marlin_ms": 1.350596809387207,
+    "marlin_over_deepgemm": 1.6431801458089723
+  }
+]
