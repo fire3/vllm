@@ -95,12 +95,14 @@ def make_topk_indices(
     """Build deterministic per-token global slot ids."""
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
-    return torch.stack(
-        [
-            torch.randperm(num_slots, device=device, generator=generator)[:topk]
-            for _ in range(num_tokens)
-        ]
-    ).to(torch.int32)
+    return torch.randint(
+        0,
+        num_slots,
+        (num_tokens, topk),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
+    )
 
 
 def make_queries(
