@@ -1,0 +1,50 @@
+2.11.0+cu130 0.6.14 0.23.1rc1.dev889+g587bd29cc.d20260707
+name, compute_cap, driver_version
+NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 12.0, 595.45.04
+
+# Notes (Plan Task 1 smoke test findings)
+# - torch/vllm installed via VLLM_USE_PRECOMPILED=1 editable install (no source
+#   build needed); flashinfer-python upgraded to 0.6.14 on top of vllm's pulled
+#   0.6.13 dependency.
+# - flashinfer-cubin has no 0.6.14 release upstream (checked pypi.org directly,
+#   max is 0.6.13); flashinfer-cubin==0.6.13 was installed per plan fallback.
+#   flashinfer's import-time version check hard-errors on this python-vs-cubin
+#   mismatch; set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass it (cubin only
+#   affects the SM100 trtllm-gen path, unused here). Actual installed:
+#   flashinfer 0.6.14, flashinfer_cubin 0.6.13.
+# - trtllm_batch_decode_sparse_mla_dsv4's plan-template call form does not match
+#   this flashinfer version's SM120 code path (flashinfer/mla/_core.py):
+#     * SM120/SM121 dispatches to backend="sparse", which requires
+#       swa_topk_lens=<int32 [sum_q]> instead of seq_lens (seq_lens is
+#       trtllm-gen/SM100-only and raises "backend='sparse' requires
+#       swa_topk_lens" if omitted).
+#     * swa_kv_cache must be the packed uint8 DSv4 SWA layout, last dim 584
+#       bytes/token (448 NoPE fp8 + 128 RoPE bf16 + 8 scale bytes; see
+#       vllm/models/deepseek_v4/sparse_mla.py get_kv_cache_shape,
+#       cache_dtype_str="fp8_ds_mla"), NHD layout shape
+#       [num_pages, page_size, 1, 584]. A same-dtype-as-query bf16 head_dim=512
+#       swa_kv_cache is accepted by _core.py's validation but the underlying
+#       sm120 kernel (_sparse_mla_sm120.py) unconditionally requires the packed
+#       584B/token layout for model_type=DSV4, so bf16/512 fails at runtime
+#       with "kv_cache last dim must be 584, got 512".
+#   Working call form (verified on this GPU, output OK torch.Size([4, 1, 64, 512])
+#   torch.bfloat16, no NaNs):
+#     from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+#     T, H, D, SWA = 4, 64, 512, 128
+#     NUM_PAGES, PAGE_SIZE, BPT = 64, 64, 584
+#     q = torch.randn(T, 1, H, D, device="cuda", dtype=torch.bfloat16)
+#     swa_kv = torch.randint(0, 256, (NUM_PAGES, PAGE_SIZE, 1, BPT),
+#                             device="cuda", dtype=torch.uint8)
+#     idx = torch.arange(SWA, device="cuda", dtype=torch.int32).expand(T, SWA).contiguous()
+#     swa_topk_lens = torch.full((T,), SWA, device="cuda", dtype=torch.int32)
+#     ws = torch.zeros(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+#     out = trtllm_batch_decode_sparse_mla_dsv4(
+#         query=q, swa_kv_cache=swa_kv, workspace_buffer=ws, sparse_indices=idx,
+#         swa_topk_lens=swa_topk_lens, bmm1_scale=D ** -0.5, kv_layout="NHD")
+#   Reference for a real (fp8-cache, paged) call: see
+#   vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
+#   (DeepseekV4FlashInferSM120Attention._forward_decode/_forward_prefill), which
+#   calls flashinfer_trtllm_batch_decode_sparse_mla_dsv4 with
+#   swa_kv_cache=kv_cache.view(torch.uint8) when the physical cache dtype is
+#   torch.float8_e4m3fn (fp8_ds_mla layout), plus extra_sparse_indices/
+#   extra_sparse_topk_lens for the compressed (non-SWA) segment.
