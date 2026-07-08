@@ -49,6 +49,21 @@ Summary: Triton is faster for tiny decode batches on this synthetic SWA-only
 shape. FlashInfer becomes faster at larger batches and is much faster after the
 SM120 FlashInfer path routes through its prefill orchestrator (`num_tokens > 64`).
 
+Source install check:
+
+```bash
+FLASHINFER_DISABLE_VERSION_CHECK=1 CUDA_HOME=/usr/local/cuda-13.2 \
+  FLASHINFER_NVCC=/usr/local/cuda-13.2/bin/nvcc \
+  .venv-sm120/bin/python benchmarks/sparse_mla_sm89_port/bench_sparse_mla_decode.py \
+  --num-heads 64 --num-slots 65536 \
+  --out benchmarks/sparse_mla_sm89_port/results_decode_source_h64.json
+```
+
+This rerun used editable `flashinfer-python==0.6.14` from
+`/home/yyf/flashinfer`. The stable rerun stayed close to the wheel baseline for
+the FlashInfer path: 0.0779 ms at 1 token, 0.0752 ms at 64 tokens, 0.0343 ms at
+128 tokens, and 0.0474 ms at 256 tokens.
+
 ## Sparse MLA prefill
 
 Command:
