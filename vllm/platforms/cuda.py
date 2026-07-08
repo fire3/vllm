@@ -139,6 +139,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
+                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
     else:
         if device_capability.major == 10:

@@ -68,6 +68,7 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
+    _is_flashinfer_sparse_jit_capability,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
@@ -776,7 +777,9 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             "sparse MLA."
         )
     if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
-        if device_capability is not None and device_capability.major == 12:
+        if device_capability is not None and _is_flashinfer_sparse_jit_capability(
+            device_capability
+        ):
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
     if backend in (
@@ -785,7 +788,9 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     ):
         return DeepseekV4FlashMLAAttention
 
-    if device_capability is not None and device_capability.major == 12:
+    if device_capability is not None and _is_flashinfer_sparse_jit_capability(
+        device_capability
+    ):
         return DeepseekV4FlashInferSM120Attention
     return DeepseekV4FlashMLAAttention
 

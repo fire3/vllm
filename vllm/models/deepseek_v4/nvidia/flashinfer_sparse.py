@@ -33,6 +33,11 @@ _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
 
+def _is_flashinfer_sparse_jit_capability(capability: DeviceCapability) -> bool:
+    """SM12 native; SM89 via ported sparse MLA JIT kernels."""
+    return capability.major == 12 or (capability.major, capability.minor) == (8, 9)
+
+
 def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
     workspace = _flashinfer_dsv4_workspace_by_device.get(device)
     if workspace is None:
@@ -83,7 +88,11 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [10, 12]
+        return (
+            capability.major == 10
+            or capability.major == 12
+            or (capability.major == 8 and capability.minor == 9)
+        )
 
     @classmethod
     def supports_combination(
@@ -107,7 +116,7 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
             if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
                 return "kv_cache_dtype not supported"
             return None
-        if device_capability.major == 12:
+        if _is_flashinfer_sparse_jit_capability(device_capability):
             if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
                 return "kv_cache_dtype not supported"
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
@@ -129,7 +138,9 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         device_capability = current_platform.get_device_capability()
-        if device_capability is not None and device_capability.major == 12:
+        if device_capability is not None and _is_flashinfer_sparse_jit_capability(
+            device_capability
+        ):
             return DeepseekV4FlashMLABackend.get_kv_cache_shape(
                 num_blocks,
                 block_size,
