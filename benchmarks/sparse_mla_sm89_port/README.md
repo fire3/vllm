@@ -64,6 +64,30 @@ This rerun used editable `flashinfer-python==0.6.14` from
 the FlashInfer path: 0.0779 ms at 1 token, 0.0752 ms at 64 tokens, 0.0343 ms at
 128 tokens, and 0.0474 ms at 256 tokens.
 
+SM89-primitives-on-SM120 check:
+
+```bash
+FLASHINFER_DISABLE_VERSION_CHECK=1 FLASHINFER_SPARSE_MLA_FORCE_SM89_PRIMS=1 \
+  CUDA_HOME=/usr/local/cuda-13.2 FLASHINFER_NVCC=/usr/local/cuda-13.2/bin/nvcc \
+  .venv-sm120/bin/python benchmarks/sparse_mla_sm89_port/bench_sparse_mla_decode.py \
+  --out benchmarks/sparse_mla_sm89_port/results_decode_sm89prims_on_sm120.json
+```
+
+This rerun forced the ported SM89 primitive path on the SM120 workstation. It is
+an upper-bound probe for the eventual SM89 path, not a final SM89 measurement.
+The same Q-quantization caveat applies; relative diff is high for small-token
+synthetic cases and drops to about 1.3-1.5% once the FlashInfer orchestrator path
+is active.
+
+| heads | tokens | FlashInfer ms | Triton ms | Triton/FlashInfer |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 1 | 0.0801 | 0.0540 | 0.67 |
+| 64 | 8 | 0.0841 | 0.0620 | 0.74 |
+| 64 | 32 | 0.0772 | 0.0842 | 1.09 |
+| 64 | 64 | 0.1764 | 0.1635 | 0.93 |
+| 64 | 128 | 0.0465 | 0.2700 | 5.80 |
+| 64 | 256 | 0.0668 | 0.4993 | 7.48 |
+
 ## Sparse MLA prefill
 
 Command:
