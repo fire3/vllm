@@ -144,3 +144,67 @@ a model-faithful MXFP4 packing source before treating the values as correctness
 or final performance evidence. For SM89 planning, Marlin remains the realistic
 fallback path because DeepGEMM FP4 is Blackwell/Hopper-oriented and not expected
 to run on Ada SM89.
+
+## Remote deployment artifacts
+
+Generated on 2026-07-08 for the remote SM89 validation pass.
+
+- vLLM branch commit: `557a0c6f0`
+- FlashInfer fork: `/home/yyf/flashinfer`, branch `sparse-mla-sm89`, commit
+  `5534ee7a`
+- vLLM SM89 wheel:
+  `dist-sm89/vllm-0.23.1rc1.dev899+g557a0c6f0.d20260708.cu132-cp312-cp312-linux_x86_64.whl`
+- wheel size: 433M
+- wheel SHA256:
+  `ac5c39619b8a03c4eb87c1b63a04ee77e944e93a9a52b2b0f20d0527f30b39b9`
+
+Build command:
+
+```bash
+TORCH_CUDA_ARCH_LIST="8.9" CUDA_HOME=/usr/local/cuda-13.2 \
+  UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+  uv build --wheel -o dist-sm89/
+```
+
+The build log is `/tmp/vllm_sm89_wheel_build.log` on the local workstation. The
+log confirms `-gencode;arch=compute_89,code=sm_89`; DeepGEMM, FlashMLA,
+QuTLASS, SM90/SM100/SM120-only kernels, and CUTLASS MLA were skipped for the
+SM89 wheel.
+
+Local regression before packaging:
+
+```bash
+FLASHINFER_DISABLE_VERSION_CHECK=1 .venv-sm120/bin/python -m pytest \
+  tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py \
+  tests/v1/attention/test_sparse_mla_backends.py -v
+```
+
+Result: 22 passed, 504 skipped in 201.66s.
+
+Decode regression command:
+
+```bash
+FLASHINFER_DISABLE_VERSION_CHECK=1 CUDA_HOME=/usr/local/cuda-13.2 \
+  FLASHINFER_NVCC=/usr/local/cuda-13.2/bin/nvcc \
+  .venv-sm120/bin/python benchmarks/sparse_mla_sm89_port/bench_sparse_mla_decode.py \
+  --out /tmp/regress_decode.json
+```
+
+The FlashInfer timings in `/tmp/regress_decode.json` are within +/-5% of the
+Task 3 `results_decode_h64.json` baseline at all six token counts.
+
+Suggested remote install sequence:
+
+```bash
+uv venv --python 3.12 ~/venv-sm89
+uv pip install --python ~/venv-sm89/bin/python \
+  /path/to/vllm-0.23.1rc1.dev899+g557a0c6f0.d20260708.cu132-cp312-cp312-linux_x86_64.whl \
+  --torch-backend=auto
+
+cd /path/to/flashinfer
+git checkout 5534ee7a
+FLASHINFER_DISABLE_VERSION_CHECK=1 uv pip install --python ~/venv-sm89/bin/python -e .
+```
+
+FlashInfer sparse MLA remains JIT-compiled on first remote SM89 use; no local
+FlashInfer wheel is required for this handoff.
