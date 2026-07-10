@@ -13,6 +13,7 @@ It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM8
 
 - Switched SM89 sparse MLA prefill/decode to the **FlashInfer 0.6.14 sparse MLA JIT fork**. The release includes the matching FlashInfer wheel, and runtime validation rejects an official package without the SM89 patch.
 - Fixed Lightning Indexer scheduler metadata selection to use actual DeepGEMM hardware support instead of package presence. An installed DeepGEMM package no longer makes SM89 call an unsupported metadata API.
+- The wheel build script now honors an explicit `VLLM_VERSION_OVERRIDE` and ignores historical CUDA/SM release tags during automatic version resolution, preventing a pre-build `setuptools_scm` parse failure.
 - This release does not update `confidence_head` and does not include per-request adaptive ℓ; DSpark remains fixed at `ℓ=6`.
 - On 4× RTX 4090, TP=4, single concurrency, all five requests per case passed. For `8K / 32K / 128K -> 1K`, Prefill TPS is **3515.72 / 4881.18 / 3812.00** and Decode TPS is **286.82 / 344.63 / 313.57**.
 

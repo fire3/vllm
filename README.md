@@ -13,6 +13,7 @@
 
 - SM89 sparse MLA 的 prefill/decode 路径切换到 **FlashInfer 0.6.14 sparse MLA JIT fork**；release 同时提供匹配的 FlashInfer wheel，运行时会拒绝未包含 SM89 补丁的官方包。
 - 修复 Lightning Indexer 仅按“是否安装 DeepGEMM”生成 scheduler metadata 的问题；现在按当前 GPU 的实际 DeepGEMM 支持能力判断，SM89 无需卸载 DeepGEMM 环境即可避开不支持的 metadata 路径。
+- wheel 构建脚本会优先使用显式 `VLLM_VERSION_OVERRIDE`，自动推导版本时忽略历史 CUDA/SM Release tag，避免 `setuptools_scm` 在编译前解析失败。
 - 本次不更新 `confidence_head`，也不包含 per-request adaptive ℓ；DSpark 继续使用固定 `ℓ=6`。
 - 4× RTX 4090、TP=4、单并发、每组 5 次均 `5/5` 成功。`8K / 32K / 128K -> 1K` 的 Prefill TPS 为 **3515.72 / 4881.18 / 3812.00**，Decode TPS 为 **286.82 / 344.63 / 313.57**。
 
