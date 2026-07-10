@@ -42,7 +42,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 
@@ -121,27 +120,6 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
-                ),
-            )
-        ],
-    )
-
-
-def make_mla_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
-    return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"],
-                MLAAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=1,
-                    head_size=512,
-                    dtype=torch.float8_e4m3fn,
-                    cache_dtype_str="fp8_ds_mla",
-                    compress_ratio=2,
-                    model_version="deepseek_v4",
                 ),
             )
         ],
@@ -313,13 +291,12 @@ def test_prefill(hash_fn):
     # All blocks should be available.
     assert free_block_queue.num_free_blocks == 10
     # The order should be
+    # [partial without hashes from req1 and req0 (5, 4) - prepended for immediate reuse]
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Cache hit in the common prefix when the original block is already free.
     # Incomplete 1 block (6 tokens)
@@ -333,7 +310,7 @@ def test_prefill(hash_fn):
     blocks = manager.allocate_slots(
         req2, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([6],)
+    assert blocks is not None and blocks.get_block_ids() == ([5],)  # reuse partial [5]
 
     # Although we only have 6 free blocks, we have 8 blocks in
     # the free block queue due to lazy removal.
@@ -353,7 +330,7 @@ def test_prefill(hash_fn):
     )
     # This block ID order also checks the eviction order.
     assert blocks is not None and blocks.get_block_ids() == (
-        [7, 8, 9, 10, 4, 5, 6, 3, 2, 1],
+        [5, 4, 6, 7, 8, 9, 10, 3, 2, 1],
     )
 
     assert free_block_queue.num_free_blocks == 0
@@ -1238,13 +1215,12 @@ def test_prefill_plp():
     # All blocks should be available.
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     # The order should be
+    # [partial without hashes from req1 and req0 (5, 4) - prepended for immediate reuse]
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [6, 7, 8, 9, 10, 4, 5, 3, 2, 1]
+    ] == [5, 4, 6, 7, 8, 9, 10, 3, 2, 1]
 
     # Request #2 is a prompt-logprobs request:
     # NO cache hit in the common prefix; duplicates request #0 cached blocks
@@ -1373,11 +1349,15 @@ def test_evict():
     assert manager.block_pool.free_block_queue.num_free_blocks == 1
 
     manager.free(req0)
+    # partial blocks (without hash) at head, other at tail (LRU policy):
+    assert [
+        b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+    ] == [6, 10, 5, 4, 3, 2, 1]
     manager.free(req1)
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
-    ] == [10, 6, 5, 4, 3, 2, 1, 9, 8, 7]
+    ] == [6, 10, 5, 4, 3, 2, 1, 9, 8, 7]
 
     # Touch the first 2 blocks.
     req2 = make_request("2", list(range(2 * 16 + 3)), block_size, sha256)
@@ -1387,7 +1367,7 @@ def test_evict():
     blocks = manager.allocate_slots(
         req2, 3, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([10],)
+    assert blocks is not None and blocks.get_block_ids() == ([6],)
     assert manager.block_pool.free_block_queue.num_free_blocks == 7
 
 
@@ -1673,38 +1653,6 @@ def test_cache_blocks_multi_group():
         block_pool.get_cached_block(req.block_hashes[2], kv_cache_group_ids=[0, 1])
         is None
     )
-
-
-def test_deepseek_v4_mla_prompt_protection_scales_with_max_num_seqs():
-    block_size = 4
-    manager = make_kv_cache_manager(
-        make_mla_kv_cache_config(block_size=block_size, num_blocks=64),
-        max_model_len=16,
-        max_num_batched_tokens=16,
-        max_num_seqs=4,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    mla_manager = manager.coordinator.single_type_managers[0]
-
-    assert mla_manager._max_protected_prompt_blocks() == 16
-
-
-def test_deepseek_v4_mla_prompt_protection_leaves_allocation_headroom():
-    block_size = 4
-    manager = make_kv_cache_manager(
-        make_mla_kv_cache_config(block_size=block_size, num_blocks=15),
-        max_model_len=16,
-        max_num_batched_tokens=16,
-        max_num_seqs=4,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    mla_manager = manager.coordinator.single_type_managers[0]
-
-    assert mla_manager._max_protected_prompt_blocks() == 10
 
 
 def test_mm_prefix_caching():
@@ -2055,7 +2003,7 @@ def test_maybe_evict_cached_block():
     assert len(pool.blocks) == len(block_hashes)
     # Manually add all blocks to cached_blocks
     for block, block_hash in zip(pool.blocks, block_hashes):
-        block.block_hash = block_hash
+        block.set_block_hash(block_hash)
         pool.cached_block_hash_to_block.insert(block_hash, block)
 
     block0, block1, block2, block3 = pool.blocks
@@ -2086,34 +2034,6 @@ def test_maybe_evict_cached_block():
     # Evict block3
     pool._maybe_evict_cached_block(block3)
     assert pool.cached_block_hash_to_block._cache == {}
-
-
-@pytest.mark.parametrize("cache_state", ["missing", "different_block"])
-def test_maybe_evict_cached_block_resets_stale_hash_on_miss(cache_state: str):
-    pool = BlockPool(
-        num_gpu_blocks=3,
-        enable_caching=True,
-        hash_block_size=16,
-        enable_kv_cache_events=True,
-    )
-    block = pool.blocks[1]
-    other_block = pool.blocks[2]
-    block_hash = make_block_hash_with_group_id(BlockHash(b"stale"), 0)
-
-    block.block_hash = block_hash
-    if cache_state == "different_block":
-        other_block.block_hash = block_hash
-        pool.cached_block_hash_to_block.insert(block_hash, other_block)
-
-    assert pool._maybe_evict_cached_block(block) is False
-    assert block.block_hash is None
-    assert pool.kv_event_queue == []
-
-    if cache_state == "different_block":
-        assert pool.cached_block_hash_to_block._cache == {block_hash: other_block}
-        assert other_block.block_hash == block_hash
-    else:
-        assert pool.cached_block_hash_to_block._cache == {}
 
 
 @pytest.mark.parametrize("blocks_to_cache", [2, 3, 10])
@@ -3005,14 +2925,12 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
             )
 
 
-def test_hybrid_cache_blocks_keeps_tail_blocks_but_hits_stay_lcm_aligned():
-    """HybridKVCacheCoordinator.cache_blocks() keeps complete tail blocks.
-
-    find_longest_cache_hit still returns lcm-aligned hits, so caching the
-    complete blocks past the last lcm boundary must not produce partial hybrid
-    cache hits. Keeping those blocks lets later turns complete a reusable
-    lcm-aligned segment instead of permanently dropping the tail.
-    """
+def test_hybrid_cache_blocks_clamped_to_lcm():
+    """HybridKVCacheCoordinator.cache_blocks() clamps to scheduler_block_size.
+    Chunks past the last lcm-aligned boundary can never participate in a
+    cache hit (find_longest_cache_hit always returns lcm-aligned hits), so
+    caching them only pollutes the prefix-cache hash map and keeps blocks
+    on the LRU list that could otherwise return to the free pool."""
     block_size = 16
     # Full attn block_size=32, SWA block_size=16 -> lcm=32.
     kv_cache_config = KVCacheConfig(
@@ -3047,9 +2965,8 @@ def test_hybrid_cache_blocks_keeps_tail_blocks_but_hits_stay_lcm_aligned():
         hash_block_size=block_size,
     )
 
-    # 7 hash-blocks of 16 tokens (112 tokens). The trailing SWA block is a
-    # complete block and should be cached, but a later hit is still capped by
-    # the full-attention group at the last 32-token lcm boundary.
+    # 7 hash-blocks of 16 tokens (112 tokens). With lcm=32 the clamp truncates
+    # to 96 tokens — SWA caches 6 hashes, full-attn caches 3.
     token_ids = [i for i in range(7) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
     computed_blocks, _ = manager.get_computed_blocks(req)
@@ -3063,18 +2980,16 @@ def test_hybrid_cache_blocks_keeps_tail_blocks_but_hits_stay_lcm_aligned():
     assert len(req.block_hashes) == 7
 
     pool = manager.block_pool
-    # SWA group_id=1: all complete SWA blocks should be cached.
-    for i in range(7):
+    # SWA group_id=1: hashes 0..5 cached (6 blocks * 16 tokens = 96), hash 6
+    # spans tokens [96, 112) past the lcm boundary and must NOT be cached.
+    for i in range(6):
         assert (
             pool.get_cached_block(req.block_hashes[i], kv_cache_group_ids=[1])
             is not None
         ), f"SWA hash {i} should be cached"
-
-    warm = make_request("1", token_ids, block_size, sha256)
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(warm)
-    assert len(computed_blocks.blocks[0]) == 3
-    assert len(computed_blocks.blocks[1]) == 6
-    assert num_computed_tokens == 6 * block_size
+    assert pool.get_cached_block(req.block_hashes[6], kv_cache_group_ids=[1]) is None, (
+        "SWA hash 6 spans tokens past the lcm boundary; should not be cached"
+    )
 
 
 def test_hybrid_local_kv_retention_interval_aligns_in_manager(monkeypatch):
@@ -3555,272 +3470,6 @@ def test_can_fit_full_sequence_swa_cap_admits_long_prompt():
     )
 
 
-def test_deepseek_v4_mla_prompt_cache_survives_decode_pressure():
-    hash_block_size = 2
-    full_block_size = 8
-    swa_block_size = 2
-    prompt_tokens = 35
-    chunk_tokens = 4 * full_block_size
-    expected_hit_tokens = (prompt_tokens - 1) // full_block_size * full_block_size
-
-    config = KVCacheConfig(
-        num_blocks=70,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer_full"],
-                MLAAttentionSpec(
-                    block_size=full_block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.uint8,
-                    cache_dtype_str="fp8_ds_mla",
-                    model_version="deepseek_v4",
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer_swa_mla_0"],
-                SlidingWindowMLASpec(
-                    block_size=swa_block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.uint8,
-                    sliding_window=2 * swa_block_size,
-                    cache_dtype_str="fp8_ds_mla",
-                    model_version="deepseek_v4",
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer_swa_mla_1"],
-                SlidingWindowMLASpec(
-                    block_size=swa_block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.uint8,
-                    sliding_window=2 * swa_block_size,
-                    cache_dtype_str="fp8_ds_mla",
-                    model_version="deepseek_v4",
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["layer_swa_mla_compressor_state"],
-                SlidingWindowMLASpec(
-                    block_size=swa_block_size,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float32,
-                    sliding_window=2 * swa_block_size,
-                ),
-            ),
-        ],
-    )
-    manager = KVCacheManager(
-        config,
-        max_model_len=128,
-        scheduler_block_size=full_block_size,
-        max_num_batched_tokens=chunk_tokens,
-        enable_caching=True,
-        hash_block_size=hash_block_size,
-    )
-
-    def run_request(request: Request, num_decode_tokens: int) -> int:
-        computed_blocks, num_computed_tokens = manager.get_computed_blocks(request)
-        computed_so_far = num_computed_tokens
-        remaining_prompt_tokens = request.num_prompt_tokens - num_computed_tokens
-        first_chunk = True
-        while remaining_prompt_tokens > 0:
-            num_new_tokens = min(chunk_tokens, remaining_prompt_tokens)
-            allocated = manager.allocate_slots(
-                request,
-                num_new_tokens,
-                num_computed_tokens if first_chunk else 0,
-                computed_blocks if first_chunk else None,
-            )
-            assert allocated is not None
-            computed_so_far += num_new_tokens
-            request.num_computed_tokens = computed_so_far
-            remaining_prompt_tokens -= num_new_tokens
-            first_chunk = False
-
-        for i in range(num_decode_tokens):
-            request.append_output_token_ids(10_000 + i)
-            allocated = manager.allocate_slots(request, 1)
-            assert allocated is not None
-            computed_so_far += 1
-            request.num_computed_tokens = computed_so_far
-        return num_computed_tokens
-
-    prompt_a = list(range(prompt_tokens))
-    req_a = make_request("a", prompt_a, hash_block_size, sha256)
-    assert run_request(req_a, num_decode_tokens=0) == 0
-    manager.free(req_a)
-
-    warm_a = make_request("warm_a", prompt_a, hash_block_size, sha256)
-    assert run_request(warm_a, num_decode_tokens=8) == expected_hit_tokens
-    assert manager.get_num_common_prefix_blocks("warm_a")[0] >= (
-        expected_hit_tokens // full_block_size
-    )
-    manager.free(warm_a)
-
-    pressure_blocks = manager.block_pool.get_new_blocks(
-        manager.block_pool.get_num_free_blocks()
-    )
-    manager.block_pool.free_blocks(reversed(pressure_blocks))
-
-    req_a_again = make_request("a_again", prompt_a, hash_block_size, sha256)
-    _, num_computed_tokens = manager.get_computed_blocks(req_a_again)
-    assert num_computed_tokens == expected_hit_tokens
-
-
-def test_deepseek_v4_mla_cached_prompts_do_not_block_admission():
-    block_size = 8
-    prompt_tokens = 4 * block_size + 3
-    num_prompts = 10
-    num_blocks = 80
-    manager = KVCacheManager(
-        KVCacheConfig(
-            num_blocks=num_blocks,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer_full"],
-                    MLAAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype=torch.uint8,
-                        cache_dtype_str="fp8_ds_mla",
-                        model_version="deepseek_v4",
-                    ),
-                )
-            ],
-        ),
-        max_model_len=512,
-        scheduler_block_size=block_size,
-        max_num_batched_tokens=128,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    for i in range(num_prompts):
-        prompt = list(range(i * 1000, i * 1000 + prompt_tokens))
-        req = make_request(f"protected_{i}", prompt, block_size, sha256)
-        assert manager.allocate_slots(req, prompt_tokens) is not None
-        req.num_computed_tokens = prompt_tokens
-        manager.free(req)
-
-    assert manager.block_pool.get_num_free_blocks() < 64
-
-    long_req = make_request(
-        "long",
-        list(range(100_000, 100_000 + 64 * block_size)),
-        block_size,
-        sha256,
-    )
-    assert (
-        manager.allocate_slots(long_req, block_size, full_sequence_must_fit=True)
-        is not None
-    )
-
-
-@pytest.mark.skip_global_cleanup
-def test_deepseek_v4_mla_prefix_hit_under_pressure_does_not_overallocate():
-    block_size = 8
-    prompt_tokens = 5 * block_size
-    manager = KVCacheManager(
-        KVCacheConfig(
-            num_blocks=12,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer_full"],
-                    MLAAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype=torch.uint8,
-                        cache_dtype_str="fp8_ds_mla",
-                        model_version="deepseek_v4",
-                    ),
-                )
-            ],
-        ),
-        max_model_len=512,
-        scheduler_block_size=block_size,
-        max_num_batched_tokens=128,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    warm_req = make_request("warm", list(range(prompt_tokens)), block_size, sha256)
-    assert manager.allocate_slots(warm_req, prompt_tokens) is not None
-    warm_req.num_computed_tokens = prompt_tokens
-    manager.free(warm_req)
-
-    pressure_blocks = manager.block_pool.get_new_blocks(
-        manager.block_pool.get_num_free_blocks() - 2
-    )
-
-    reuse_req = make_request(
-        "reuse",
-        list(range(prompt_tokens)) + list(range(10_000, 10_000 + 2 * block_size)),
-        block_size,
-        sha256,
-    )
-    computed_blocks, num_computed_tokens = manager.get_computed_blocks(reuse_req)
-
-    try:
-        assert (
-            manager.allocate_slots(
-                reuse_req,
-                2 * block_size,
-                num_new_computed_tokens=num_computed_tokens,
-                new_computed_blocks=computed_blocks,
-            )
-            is None
-        )
-        req_blocks = manager.coordinator.single_type_managers[0].req_to_blocks
-        assert "reuse" not in req_blocks
-    finally:
-        manager.block_pool.free_blocks(reversed(pressure_blocks))
-
-
-def test_reset_prefix_cache_after_deepseek_v4_mla_prompt_cache():
-    block_size = 8
-    prompt_tokens = 4 * block_size + 3
-    manager = KVCacheManager(
-        KVCacheConfig(
-            num_blocks=32,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["layer_full"],
-                    MLAAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype=torch.uint8,
-                        cache_dtype_str="fp8_ds_mla",
-                        model_version="deepseek_v4",
-                    ),
-                )
-            ],
-        ),
-        max_model_len=512,
-        scheduler_block_size=block_size,
-        max_num_batched_tokens=128,
-        enable_caching=True,
-        hash_block_size=block_size,
-    )
-
-    req = make_request("protected", list(range(prompt_tokens)), block_size, sha256)
-    assert manager.allocate_slots(req, prompt_tokens) is not None
-    req.num_computed_tokens = prompt_tokens
-    manager.free(req)
-
-    assert manager.reset_prefix_cache()
-
-
 def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     """The cap only loosens the SWA group; a prompt that exceeds the
     full-attention pool capacity must still be rejected."""
@@ -4256,3 +3905,41 @@ def test_pure_swa_retention_dense_default_caches_all(monkeypatch):
         is not None
     }
     assert cached == set(range(16))
+
+
+def test_mamba_reachable_block_mask_sparsifies_retention():
+    """Mamba state-snapshot retention: with VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+    the manager keeps one cached state per interval-sized segment (plus the
+    latest replay boundary) instead of a snapshot per block, which is what
+    lets a small attention block_size avoid Mamba dominating the KV pool."""
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    block_size = 16
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+    def retained(retention_interval, num_prompt_tokens=256, end_block=16):
+        m = MambaManager.reachable_block_mask(
+            start_block=0,
+            end_block=end_block,
+            alignment_tokens=block_size,
+            kv_cache_spec=spec,
+            use_eagle=False,
+            retention_interval=retention_interval,
+            num_prompt_tokens=num_prompt_tokens,
+        )
+        return None if m is None else {i for i, v in enumerate(m) if v}
+
+    # Dense default (None) -> no mask, every block cached (unchanged behavior).
+    assert retained(None) is None
+    # interval == block_size -> every block is a boundary -> stays dense.
+    assert retained(block_size) is None
+    # interval 64 = 4 blocks: segment tails at i%4==3 -> {3,7,11,15}; latest
+    # replay boundary 240//16 - 1 = 14. Sparse subset of the 16 blocks.
+    assert retained(64) == {3, 7, 11, 14, 15}
+    # interval 0 -> only the latest replay boundary (block 14).
+    assert retained(0) == {14}

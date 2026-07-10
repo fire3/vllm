@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import dataclasses
 from importlib.util import find_spec
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -14,6 +15,11 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+
+if TYPE_CHECKING:
+    from vllm.v1.spec_decode.vocab_mapping import VocabMapping
+
+from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
@@ -22,11 +28,13 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+from vllm.model_executor.models.qwen3_eagle3 import Eagle3Qwen3ForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
-from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
@@ -34,7 +42,6 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
-    apply_top_k_top_p,
     empty_exponential_noise_like,
     sample_with_exponential_noise,
 )
@@ -78,6 +85,7 @@ class SpecDecodeBaseProposer:
         self.dtype = vllm_config.model_config.dtype
         self.max_model_len = vllm_config.model_config.max_model_len
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.eplb_state: EplbState | None = None
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
         # We need to get the hidden size from the draft model config because
@@ -121,6 +129,11 @@ class SpecDecodeBaseProposer:
             self.speculative_config.use_local_argmax_reduction
         )
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
+
+        self.use_heterogeneous_vocab: bool = (
+            self.speculative_config.use_heterogeneous_vocab
+        )
+        self.vocab_mapping: VocabMapping | None = None
 
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -229,27 +242,18 @@ class SpecDecodeBaseProposer:
         self.backup_next_token_ids = CpuGpuBuffer(
             self.max_batch_size,
             dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
+            pin_memory=PIN_MEMORY,
             device=device,
             with_numpy=True,
         )
         self._enable_probabilistic_draft_probs = (
             self.speculative_config.rejection_sample_method == "standard"
             and self.speculative_config.draft_sample_method == "probabilistic"
-        ) or self.method == "mtp"
-        # MTP drafts benefit from probabilistic sampling at ``temperature > 0``:
-        # the draft model is a near-copy of the target, so sampling from
-        # ``softmax(draft_logits)`` covers the target distribution much better
-        # than argmax and lifts acceptance by ~9 pp on DSv4-Flash mt-bench
-        # (measured 58.9% → 67.8%). The ``all_greedy`` fast path inside
-        # ``_sample_draft_tokens`` still falls back to argmax for ``temp==0``
-        # requests so this override only changes behaviour where it helps.
+        )
         self._last_draft_probs: torch.Tensor | None = None
 
         self._slot_mapping_buffer = torch.zeros(
-            self.max_positions,
-            dtype=torch.int64,
-            device=device,
+            self.max_positions, dtype=torch.int64, device=device
         )
 
         # Determine allowed attention backends once during initialization.
@@ -336,6 +340,10 @@ class SpecDecodeBaseProposer:
                 "does not support M-RoPE yet"
             )
 
+    def set_eplb_state(self, eplb_state: EplbState) -> None:
+        """Inject EPLB state after construction."""
+        self.eplb_state = eplb_state
+
     def _init_parallel_drafting_params(self):
         # For parallel drafting, we need the token ID to use for masked slots
         # And for EAGLE + parallel drafting, we need the hidden state tensor to use
@@ -417,53 +425,17 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
-    def _get_effective_spec_step_idx(self, spec_step_idx: int) -> int:
-        if self.method != "mtp":
-            return 0
-
-        config = getattr(self.model, "config", None)
-        num_mtp_layers = getattr(config, "num_nextn_predict_layers", None)
-        if not isinstance(num_mtp_layers, int):
-            inner_model = getattr(self.model, "model", None)
-            num_mtp_layers = getattr(inner_model, "num_mtp_layers", None)
-
-        if isinstance(num_mtp_layers, int) and num_mtp_layers > 0:
-            return spec_step_idx % num_mtp_layers
-        return spec_step_idx
-
-    def _compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        spec_step_idx: int = 0,
-    ) -> torch.Tensor:
-        if self.method == "mtp":
-            return self.model.compute_logits(
-                hidden_states,
-                spec_step_idx=self._get_effective_spec_step_idx(spec_step_idx),
-            )
-        return self.model.compute_logits(hidden_states)
-
-    def _add_spec_step_idx(
-        self,
-        model_kwargs: dict[str, torch.Tensor | None],
-        spec_step_idx: int,
-    ) -> dict[str, torch.Tensor | int | None]:
-        if self.method != "mtp":
-            return model_kwargs
-        return {
-            **model_kwargs,
-            "spec_step_idx": self._get_effective_spec_step_idx(spec_step_idx),
-        }
-
-    def _greedy_sample(
-        self,
-        hidden_states: torch.Tensor,
-        spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
-        return self._compute_logits(hidden_states, spec_step_idx).argmax(dim=-1)
+        if self.use_heterogeneous_vocab:
+            logits = self.model.compute_logits(hidden_states)
+            assert self.vocab_mapping is not None
+            logits = self.vocab_mapping.constrain_draft_logits(logits)
+            draft_token_ids = logits.argmax(dim=-1)
+            return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)
+        return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
     def _sample_from_logits(
         self,
@@ -474,6 +446,21 @@ class SpecDecodeBaseProposer:
             return logits.argmax(dim=-1), None
         if sampling_metadata.all_greedy:
             return logits.argmax(dim=-1), None
+
+        # Parallel drafting (e.g. DFlash) samples num_speculative_tokens rows
+        # per request in a single pass, so logits has batch_size * K rows while
+        # the sampling metadata is per-request. The rows are request-major
+        # (K consecutive slots per request), so repeat_interleave the
+        # per-request temperature to match before probabilistic sampling.
+        temperature = sampling_metadata.temperature
+        if temperature is not None and temperature.shape[0] != logits.shape[0]:
+            assert logits.shape[0] % temperature.shape[0] == 0
+            factor = logits.shape[0] // temperature.shape[0]
+            sampling_metadata = dataclasses.replace(
+                sampling_metadata,
+                temperature=temperature.repeat_interleave(factor, dim=0),
+            )
+
         return compute_probs_and_sample_next_token(
             logits, sampling_metadata, self.use_fp64_gumbel
         )
@@ -482,26 +469,32 @@ class SpecDecodeBaseProposer:
         self,
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-        spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Sample draft token ids (and optionally their probabilities).
-
-        ``spec_step_idx`` is forwarded to ``_compute_logits`` so that
-        MTP-style drafters can route the logits computation through the
-        correct draft layer (DSv4 cycles through ``num_nextn_predict_layers``
-        layers). For non-MTP drafters this argument is ignored.
-
-        Probabilities are only returned when
-        :attr:`_enable_probabilistic_draft_probs` is enabled (set by the
-        speculative config via ``rejection_sample_method="standard"`` and
-        ``draft_sample_method="probabilistic"``). In every other case we
-        fall back to argmax, matching the upstream
-        ``_sample_draft_tokens`` contract.
-        """
         if not self._enable_probabilistic_draft_probs or sampling_metadata.all_greedy:
-            return self._greedy_sample(hidden_states, spec_step_idx), None
-        logits = self._compute_logits(hidden_states, spec_step_idx)
-        return self._sample_from_logits(logits, sampling_metadata)
+            return self._greedy_sample(hidden_states), None
+        logits = self.model.compute_logits(hidden_states)
+        if self.use_heterogeneous_vocab:
+            assert self.vocab_mapping is not None
+            logits = self.vocab_mapping.constrain_draft_logits(logits)
+        draft_token_ids, draft_probs = self._sample_from_logits(
+            logits, sampling_metadata
+        )
+        if self.use_heterogeneous_vocab:
+            assert self.vocab_mapping is not None
+            draft_token_ids = self.vocab_mapping.map_draft_to_target_ids(
+                draft_token_ids
+            )
+            # Config validation ensures draft_sample_method == "greedy" when
+            # use_heterogeneous_vocab is True, so this branch should never be
+            # reached. Kept as a safety fallback until probabilistic rejection
+            # sampling with heterogeneous vocabularies is implemented.
+            # TODO: remap draft_probs to target-vocab space for lossless
+            # probabilistic rejection sampling with heterogeneous vocabularies.
+            assert draft_probs is None, (
+                "probabilistic draft sampling is not supported with "
+                "use_heterogeneous_vocab"
+            )
+        return draft_token_ids, draft_probs
 
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
@@ -540,6 +533,8 @@ class SpecDecodeBaseProposer:
                     Eagle3LlamaForCausalLM,
                     Eagle3DeepseekV2ForCausalLM,
                     DFlashQwen3ForCausalLM,
+                    Eagle3Qwen3ForCausalLM,
+                    DFlashLagunaForCausalLM,
                 ),
             )
             target_hidden_states = self.model.combine_hidden_states(
@@ -576,6 +571,12 @@ class SpecDecodeBaseProposer:
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(False)
 
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_forward(
+                self.draft_model_config,
+                num_tokens,
+            )
+
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -586,7 +587,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
         ):
-            ret_hidden_states = self.model(**self._add_spec_step_idx(model_kwargs, 0))
+            ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -597,6 +598,9 @@ class SpecDecodeBaseProposer:
         # and read the indices that step 0 just wrote into the shared buffer.
         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
             self.model.model.set_skip_topk(True)
+            # The topk indices were written for each query token in the multi-token
+            # batch. Compact the topk indices for each request's last token.
+            self.model.model.compact_topk_indices(token_indices_to_sample)
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
@@ -613,11 +617,8 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            # ``spec_step_idx=0`` selects the first MTP layer for DSv4 (and
-            # is ignored for non-MTP drafters). Probabilities only flow
-            # through when ``_enable_probabilistic_draft_probs`` is set.
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata, spec_step_idx=0
+                sample_hidden_states, sampling_metadata
             )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
@@ -638,8 +639,9 @@ class SpecDecodeBaseProposer:
             self.positions[:batch_size] = positions
 
         draft_token_ids, draft_probs = self._sample_draft_tokens(
-            sample_hidden_states, sampling_metadata, spec_step_idx=0
+            sample_hidden_states, sampling_metadata
         )
+        draft_probs_list = None if draft_probs is None else [draft_probs]
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -653,7 +655,6 @@ class SpecDecodeBaseProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
-        draft_probs_list = [] if draft_probs is None else [draft_probs]
 
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
@@ -683,6 +684,11 @@ class SpecDecodeBaseProposer:
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_list[-1].int()
+
+            if self.use_heterogeneous_vocab:
+                # Map target token IDs to draft vocab space (TLI algorithm)
+                assert self.vocab_mapping is not None
+                input_ids = self.vocab_mapping.map_target_to_draft_ids(input_ids)
 
             if not self.constant_draft_positions:
                 positions = self._update_positions_dependent_metadata(
@@ -724,6 +730,12 @@ class SpecDecodeBaseProposer:
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
 
+            if self.eplb_state is not None:
+                self.eplb_state.prepare_forward(
+                    self.draft_model_config,
+                    batch_size,
+                )
+
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -732,9 +744,7 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
-                ret_hidden_states = self.model(
-                    **self._add_spec_step_idx(model_kwargs, token_index + 1)
-                )
+                ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -743,17 +753,16 @@ class SpecDecodeBaseProposer:
 
             hidden_states = hidden_states[:batch_size]
             draft_token_ids, draft_probs = self._sample_draft_tokens(
-                last_hidden_states[:batch_size],
-                sampling_metadata,
-                spec_step_idx=token_index + 1,
+                last_hidden_states[:batch_size], sampling_metadata
             )
-            draft_token_ids_list.append(draft_token_ids)
             if draft_probs is not None:
+                assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
+            draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-        if draft_probs_list:
+        if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
 
@@ -819,6 +828,13 @@ class SpecDecodeBaseProposer:
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        # Map target token IDs to draft vocab space (TLI algorithm)
+        if self.use_heterogeneous_vocab:
+            assert self.vocab_mapping is not None
+            target_token_ids = self.vocab_mapping.map_target_to_draft_ids(
+                target_token_ids
+            )
+            next_token_ids = self.vocab_mapping.map_target_to_draft_ids(next_token_ids)
         if not self.needs_extra_input_slots:
             # Default EAGLE pathway: no reshaping of input tensors needed.
             # Simply rotate the input ids and leave the positions unchanged,
@@ -989,6 +1005,13 @@ class SpecDecodeBaseProposer:
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
+        if self.method == "mtp":
+            # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
+            # norm hidden, so its forward returns (logit_hidden,
+            # recycle_hidden). Other MTP families return a single tensor.
+            return "DeepSeekMTPModel" in (
+                self.draft_model_config.hf_config.architectures or []
+            )
         return self.method not in ("mtp", "draft_model", "dflash")
 
     def prepare_next_token_ids_cpu(
@@ -1191,7 +1214,7 @@ class SpecDecodeBaseProposer:
         new_query_start_loc_cpu = torch.zeros(
             query_start_loc_cpu.shape,
             dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
+            pin_memory=PIN_MEMORY,
         )
         new_query_start_loc_np = new_query_start_loc_cpu.numpy()
         np.cumsum(new_num_tokens_per_req_np, out=new_query_start_loc_np[1:])
@@ -1224,11 +1247,11 @@ class SpecDecodeBaseProposer:
         #  q1 + 0, q1 + 1, q1 + 2, q1 + 3,       // req 2
         #  q1 + q2 + 0, q1 + q2 + 1, q1 + q2 + 2] // req 3
         token_indices_np = token_offsets + old_query_start_locs_expanded
-        token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
+        token_indices = async_tensor_h2d(token_indices_np, device=device)
 
         spec_common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
-            seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
+            query_start_loc=async_tensor_h2d(new_query_start_loc_cpu, device=device),
+            seq_lens=async_tensor_h2d(new_seq_lens_cpu, device=device),
             query_start_loc_cpu=new_query_start_loc_cpu,
             _seq_lens_cpu=new_seq_lens_cpu,
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
@@ -1444,6 +1467,26 @@ class SpecDecodeBaseProposer:
                     "Detected MTP model. "
                     "Sharing target model embedding weights with the draft model."
                 )
+
+            if share_embeddings:
+                draft_embed = self.model.model.embed_tokens
+                # Only share when both models use the same embedding width.
+                # Guard with isinstance so non-Tensor weights (e.g. in tests)
+                # are not affected — mirrors the weight-equality check above.
+                if isinstance(target_embed_tokens.weight, torch.Tensor) and isinstance(
+                    draft_embed.weight, torch.Tensor
+                ):
+                    target_dim = target_embed_tokens.weight.shape[-1]
+                    draft_dim = draft_embed.weight.shape[-1]
+                    if target_dim != draft_dim:
+                        share_embeddings = False
+                        logger.info(
+                            "Target embedding dim (%d) differs from draft "
+                            "embedding dim (%d). Keeping separate embedding "
+                            "weights.",
+                            target_dim,
+                            draft_dim,
+                        )
 
             if share_embeddings:
                 if hasattr(self.model.model, "embed_tokens"):
@@ -1766,10 +1809,12 @@ class SpecDecodeBaseProposer:
         return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
 
 
-# NOTE(woosuk): This duplicates part of the main sampling code because MTP
-# needs both the sampled draft token ids and the draft probability tensor for
-# rejection sampling. Refactor this once the sampler exposes a reusable helper
-# that returns both values without extra packing.
+# NOTE(woosuk): Currently, the below code is not used and we always use argmax
+# to sample the draft tokens. We will use this after we find a way to manage
+# the draft prob tensor.
+# Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
+# FIXME(woosuk): The logic here is duplicated with the main sampling code.
+# We should refactor this to reuse the same sampling implementation.
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -1786,32 +1831,22 @@ def compute_probs_and_sample_next_token(
 
     # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
     # consistent with sampler.py's _SAMPLING_EPS threshold
-    num_tokens = logits.shape[0]
-    temperature = _expand_draft_sampling_tensor(
-        sampling_metadata.temperature,
-        num_tokens,
-    )
-    assert temperature is not None
+    temperature = sampling_metadata.temperature
     # Avoid division by zero if there are greedy requests.
     if not sampling_metadata.all_random:
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
-    top_k = _expand_draft_sampling_tensor(sampling_metadata.top_k, num_tokens)
-    top_p = _expand_draft_sampling_tensor(sampling_metadata.top_p, num_tokens)
-    logits = apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
-    generators = _expand_draft_sampling_generators(
-        sampling_metadata.generators,
-        sampling_metadata.temperature.shape[0],
-        num_tokens,
-    )
+    # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
+    # generating the draft tokens. We only use the temperature. While this
+    # could degrade the acceptance rate, it does not affect the distribution
+    # of the generated tokens after rejection sampling.
+
+    # TODO(woosuk): Consider seeds.
     q = empty_exponential_noise_like(probs, use_fp64_gumbel)
-    if len(generators) != num_tokens:
-        q.exponential_()
-    for i, generator in generators.items():
-        q[i].exponential_(generator=generator)
+    q.exponential_()
     # NOTE(woosuk): We shouldn't use `probs.div_(q)` because the draft_probs
     # will be used later for rejection sampling.
     next_token_ids = sample_with_exponential_noise(probs.clone(), q)
@@ -1819,41 +1854,3 @@ def compute_probs_and_sample_next_token(
         greedy_token_ids = probs.argmax(dim=-1)
         next_token_ids = torch.where(is_greedy, greedy_token_ids, next_token_ids)
     return next_token_ids, probs
-
-
-def _expand_draft_sampling_tensor(
-    tensor: torch.Tensor | None,
-    num_tokens: int,
-) -> torch.Tensor | None:
-    if tensor is None or tensor.shape[0] == num_tokens:
-        return tensor
-
-    batch_size = tensor.shape[0]
-    if num_tokens % batch_size != 0:
-        raise ValueError(
-            "Draft sampling metadata must either match the draft logits row "
-            "count or evenly divide it."
-        )
-    return tensor.repeat_interleave(num_tokens // batch_size, dim=0)
-
-
-def _expand_draft_sampling_generators(
-    generators: dict[int, torch.Generator],
-    batch_size: int,
-    num_tokens: int,
-) -> dict[int, torch.Generator]:
-    if not generators or batch_size == num_tokens:
-        return generators
-
-    if num_tokens % batch_size != 0:
-        raise ValueError(
-            "Draft sampling generators must either match the draft logits row "
-            "count or evenly divide it."
-        )
-
-    repeat = num_tokens // batch_size
-    return {
-        req_idx * repeat + offset: generator
-        for req_idx, generator in generators.items()
-        for offset in range(repeat)
-    }

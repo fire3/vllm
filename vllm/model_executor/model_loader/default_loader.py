@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Generator, Iterable
 from typing import cast
 
 import torch
@@ -76,6 +76,11 @@ class DefaultModelLoader(BaseModelLoader):
         self.local_expert_ids: set[int] | None = None
 
         extra_config = load_config.model_loader_extra_config
+        if not isinstance(extra_config, dict):
+            raise ValueError(
+                f"model_loader_extra_config must be a dict for load format "
+                f"{load_config.load_format}, got {type(extra_config).__name__}"
+            )
         allowed_keys = {
             "enable_multithread_load",
             "num_threads",
@@ -90,9 +95,35 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{unexpected_keys}"
             )
 
+        enable_multithread_load = extra_config.get("enable_multithread_load", False)
+        if not isinstance(enable_multithread_load, bool):
+            raise ValueError(
+                f"enable_multithread_load must be a bool, got "
+                f"{type(enable_multithread_load).__name__}"
+            )
+        num_threads = extra_config.get("num_threads")
+        if num_threads is not None and not (
+            isinstance(num_threads, int) and num_threads > 0
+        ):
+            raise ValueError(
+                f"num_threads must be a positive integer, got {num_threads!r}"
+            )
+
         self.enable_weights_track: bool | None = extra_config.get(
             "enable_weights_track", None
         )
+
+        # The multi-thread loader ignores safetensors_load_strategy, so reject
+        # the combination instead of silently dropping the requested strategy.
+        if extra_config.get("enable_multithread_load") and (
+            load_config.safetensors_load_strategy not in (None, "lazy")
+        ):
+            raise ValueError(
+                "enable_multithread_load does not support "
+                "safetensors_load_strategy="
+                f"{load_config.safetensors_load_strategy!r}; the multi-thread "
+                "loader only implements the default lazy strategy."
+            )
 
     def _prepare_weights(
         self,
@@ -152,7 +183,9 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
 
-        if fall_back_to_pt:
+        # Don't fall back to .pt for explicit safetensors formats; otherwise a
+        # .pt file is matched and later opened as safetensors.
+        if fall_back_to_pt and not use_safetensors:
             allow_patterns += ["*.pt"]
 
         if allow_patterns_overrides is not None:
@@ -209,9 +242,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self,
-        source: "Source",
-        weight_name_filter: Callable[[str], bool] | None = None,
+        self, source: "Source"
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -237,8 +268,6 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
-                    local_expert_ids=self.local_expert_ids,
-                    weight_name_filter=weight_name_filter,
                 )
             elif self.load_config.load_format == "instanttensor":
                 weights_iterator = instanttensor_weights_iterator(
@@ -260,7 +289,6 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
-                        weight_name_filter=weight_name_filter,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -295,9 +323,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        weight_name_filter = getattr(model, "skip_weight_name_before_load", None)
-        if not callable(weight_name_filter):
-            weight_name_filter = None
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -305,14 +330,14 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights, weight_name_filter)
+        yield from self._get_weights_iterator(primary_weights)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source, weight_name_filter)
+            yield from self._get_weights_iterator(source)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

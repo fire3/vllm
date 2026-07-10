@@ -1,12 +1,20 @@
 # DeepSeek-V4-Flash on SM89 (Ada / RTX 4090) — vLLM fork
 
-> English version: [`README_EN.md`](README_EN.md)
+<!-- markdownlint-disable MD060 -->
 
-> 本仓库是 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 fork，分支已包含 **PR #41834**(SM120 可移植 Triton 路径)+ **SM89/Ada 适配 commit**。
+> English version: [`README_EN.md`](README_EN.md)
+> 本仓库是 [vllm-project/vllm](https://github.com/vllm-project/vllm) 的 fork，跟进当前上游 `main`，并增加 SM89/Ada 的 FlashInfer sparse MLA 适配。
 
 把 vLLM 的 **DeepSeek-V4-Flash** 推理从 SM90/SM100/SM120 扩展到 **SM89(Ada Lovelace：RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**。已在 **4× RTX 4090 (48GB)** 上完整验证:环境搭建 → 算子测试 → 启动 → 推理 → 性能/工具调用 全部通过。
 
 ## Changelog
+
+### 2026-07-10
+
+- SM89 sparse MLA 的 prefill/decode 路径切换到 **FlashInfer 0.6.14 sparse MLA JIT fork**；release 同时提供匹配的 FlashInfer wheel，运行时会拒绝未包含 SM89 补丁的官方包。
+- 修复 Lightning Indexer 仅按“是否安装 DeepGEMM”生成 scheduler metadata 的问题；现在按当前 GPU 的实际 DeepGEMM 支持能力判断，SM89 无需卸载 DeepGEMM 环境即可避开不支持的 metadata 路径。
+- 本次不更新 `confidence_head`，也不包含 per-request adaptive ℓ；DSpark 继续使用固定 `ℓ=6`。
+- 4× RTX 4090、TP=4、单并发、每组 5 次均 `5/5` 成功。`8K / 32K / 128K -> 1K` 的 Prefill TPS 为 **3515.72 / 4881.18 / 3812.00**，Decode TPS 为 **286.82 / 344.63 / 313.57**。
 
 ### 2026-07-06
 
@@ -43,30 +51,25 @@ SM80/A800 路径已经可以用于 DeepSeek-V4-Flash + DSpark 推测解码自测
 
 ## 1. 背景:为什么需要这个 fork
 
-DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 专家 MoE + mHC。上游默认走 **FlashMLA + DeepGEMM**(只编译 Hopper / 数据中心 Blackwell)。PR #41834 为 **SM120(消费级 Blackwell)** 引入了一套**可移植 Triton 路径**替代这些内核;本 fork 在其之上把这套路径进一步放开到 **SM89**。
+DeepSeek-V4-Flash 使用 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 专家 MoE + mHC。本 fork 将 FlashInfer 的 SM120 sparse MLA JIT 内核移植到 **SM89**，并保留 Ada 所需的 Triton/torch 辅助算子 fallback。
 
 | 子系统 | 上游(SM90/100) | SM89(本 fork) |
 |---|---|---|
-| Sparse MLA attention | FlashMLA sparse | **Triton**(PR #41834 可移植内核) |
-| Lightning Indexer(FP8 MQA logits) | DeepGEMM | **Triton / torch fallback** |
-| o_proj FP8 einsum | DeepGEMM `fp8_einsum` | **Triton**(FP8 dot 加 bf16 upcast) |
+| Sparse MLA attention | FlashMLA / FlashInfer sparse | **FlashInfer 0.6.14 sparse MLA JIT** |
+| Lightning Indexer(FP8 MQA logits) | DeepGEMM | **按硬件能力门控的 DeepGEMM / fallback** |
+| o_proj FP8 einsum | DeepGEMM `fp8_einsum` | **SM89 兼容路径** |
 | mHC pre/post GEMM | DeepGEMM / TileLang | **TileLang TF32** |
 | MoE(FP4 专家) | DeepGEMM / FlashInfer-CUTLASS FP4 | **Marlin WNA16**(FP4→FP16 反量化) |
 | Indexer Q rope+quant / KV dequant | **CuTe-DSL** | **Triton/torch fallback** |
 
 **硬件事实**:Ada 有 FP8 张量核，但**没有 FP4 张量核、没有硬件 microscaling MMA**，所以 FP4 MoE 只能走 Marlin 反量化(比原生 FP4 MMA 慢)。
 
-### SM89 相关改动(相对 PR #41834，10 文件 +294/-26)
+### SM89 相关改动
 
-- `vllm/v1/attention/backends/mla/sparse_mla_env.py` — 中央开关 `is_ada_sm89()`，把 SM89 并入 Triton 稀疏 MLA 路径。
-- `vllm/utils/deep_gemm.py` / `models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py` — MQA logits / HC GEMM fallback dispatch 扩到 SM89。
-- `vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py` — Triton FP8 einsum 扩到 SM89 + FP8 `tl.dot` 的 bf16 upcast。
-- `vllm/model_executor/kernels/mhc/tilelang.py` — mHC TF32 路径扩到 SM89。
-- `vllm/model_executor/layers/sparse_attn_indexer.py` / `v1/attention/backends/mla/indexer.py` — 修复构造期会崩的 `_sparse_indexer_requires_deep_gemm`、内存预算。
-- `vllm/models/deepseek_v4/sparse_mla.py` — `supports_compute_capability` 修准确。
-- **`vllm/utils/import_utils.py` — `has_cutedsl()` 在 SM89 返回 False**。
-
-> 详见 [`SM89_DEEPSEEK_V4_NOTES.md`](SM89_DEEPSEEK_V4_NOTES.md)。
+- `flashinfer-python==0.6.14` 的 sparse MLA JIT 路径开放到精确 capability `8.9`，其它 8.x GPU 仍拒绝。
+- `vllm/v1/attention/backends/mla/indexer.py` 按 `is_deep_gemm_supported()` 生成 scheduler metadata，避免 SM89 误走 DeepGEMM metadata API。
+- `vllm/models/deepseek_v4/compressor.py` 和 `vllm/utils/import_utils.py` 在 SM89 上选择现有 Triton/torch fallback，避开 SM90+ CuTe-DSL 指令。
+- MXFP4 MoE 在 SM89 上继续选择 Marlin，不会误选 Blackwell-only DeepGEMM FP4。
 
 ---
 
@@ -78,7 +81,8 @@ DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 | 驱动 / CUDA toolkit | 595.x / **CUDA 13.0**(nvcc 13.0) |
 | Python | 3.12 |
 | torch | **2.11.0+cu130** |
-| vLLM | 本 fork release wheel = **0.23.1rc1.dev145+g<commit>.cu130**，只为 SM89/Ada 编译 |
+| FlashInfer | **0.6.14 SM89 sparse MLA fork** |
+| vLLM | 本 fork 的 CUDA 13.0 / CPython 3.12 wheel，只为 SM89/Ada 编译 |
 
 ---
 
@@ -88,15 +92,24 @@ DeepSeek-V4-Flash 用了 DeepSeek 稀疏注意力(DSA / Lightning Indexer)+ FP4 
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-pip install \
-  "https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.23.1rc1.dev145-g8c631d45e-cu130-sm89/vllm-0.23.1rc1.dev145%2Bg8c631d45e.cu130-cp312-cp312-linux_x86_64.whl" \
-  --extra-index-url https://download.pytorch.org/whl/cu130
+uv pip install torch==2.11.0 flashinfer-cubin==0.6.13 --torch-backend=cu130
+gh release download --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'flashinfer_python-0.6.14*sm89*.whl' \
+  --pattern 'vllm-*.cu130-cp312-cp312-linux_x86_64.whl' \
+  --dir /tmp/vllm-sm89-release
+uv pip install /tmp/vllm-sm89-release/flashinfer_python-0.6.14*sm89*.whl
+uv pip install /tmp/vllm-sm89-release/vllm-*.cu130-cp312-cp312-linux_x86_64.whl \
+  --torch-backend=cu130
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 ```
 
 **已验证过的环境**:
+
 - **Python 3.12** · Linux x86_64
 - **4× RTX 4090 (SM89/Ada, 48GB)** · 驱动 595.x · CUDA toolkit 13.0
 - **torch 2.11.0+cu130**
+- **FlashInfer 0.6.14 SM89 fork**；官方 0.6.14 不包含本 release 所需的 SM89 sparse MLA JIT 补丁
+- `flashinfer-cubin==0.6.13`；运行前设置 `FLASHINFER_DISABLE_VERSION_CHECK=1`，SM89 sparse MLA 仍由 0.6.14 fork 源码 JIT
 - wheel 使用 `TORCH_CUDA_ARCH_LIST=8.9+PTX` 编译，面向 Ada/SM89
 
 ---
@@ -115,6 +128,8 @@ uv pip install -r requirements/build/cuda.txt --torch-backend=cu130 \
   -i https://pypi.tuna.tsinghua.edu.cn/simple \
   --extra-index-url https://download.pytorch.org/whl/cu130
 ```
+
+运行 SM89 sparse MLA 前，还需按第 3 节安装同一 release 中的 FlashInfer 0.6.14 SM89 wheel。
 
 ### 4.2 Rust 工具链(vLLM 构建需要 Rust frontend)
 
@@ -151,7 +166,7 @@ export MAX_JOBS=16 NVCC_THREADS=2
 uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```
 
-> DeepGEMM **不要**装(Ada 不支持)。
+> Ada 不支持 DeepGEMM kernel，但无需手工卸载 DeepGEMM 包；vLLM 会按硬件能力关闭其 scheduler metadata 路径。
 > 如果要为 SM80/A100/A800 构建 wheel，把 `TORCH_CUDA_ARCH_LIST` 改成 `8.0`。
 > wheel 文件名遵循 release 命名:`vllm-0.23.1rc1.dev145+g<commit>.cu130-cp312-cp312-linux_x86_64.whl`。
 
@@ -162,12 +177,11 @@ uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```python
 import torch
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.mla import sparse_mla_env as e
 print("cap:", current_platform.get_device_capability())          # (8, 9)
-print("is_ada_sm89:", e.is_ada_sm89())                            # True
-print("triton sparse mla:", e.is_triton_sparse_mla_enabled(torch.device("cuda:0")))  # True
-from vllm.model_executor.layers.sparse_attn_indexer import _sparse_indexer_requires_deep_gemm as r
-print("indexer needs deepgemm (fp8 cache):", r(False))           # False ← 关键
+from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm89
+print("flashinfer sparse MLA SM89:", has_flashinfer_sparse_mla_sm89())  # True
+from vllm.v1.attention.backends.mla.indexer import _uses_deep_gemm_scheduler_metadata
+print("DeepGEMM scheduler metadata:", _uses_deep_gemm_scheduler_metadata())  # False
 from vllm.utils.import_utils import has_cutedsl
 print("has_cutedsl:", has_cutedsl())                             # False on SM89
 ```
@@ -179,7 +193,7 @@ print("has_cutedsl:", has_cutedsl())                             # False on SM89
 ### 6.1 源模型
 
 ```bash
-export VLLM_TRITON_MLA_SPARSE=1
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 vllm serve /path/to/DeepSeek-V4-Flash \
   --served-model-name deepseek-v4-flash \
   --tensor-parallel-size 4 \
@@ -188,6 +202,7 @@ vllm serve /path/to/DeepSeek-V4-Flash \
   --max-model-len 262144 \
   --gpu-memory-utilization 0.97 \
   --max-num-seqs 16 \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --reasoning-parser deepseek_v4 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
   --trust-remote-code --port 8000
@@ -196,7 +211,7 @@ vllm serve /path/to/DeepSeek-V4-Flash \
 ### 6.2 DSpark 推测解码模型
 
 ```bash
-export VLLM_TRITON_MLA_SPARSE=1
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
   --served-model-name deepseek-v4-flash-dspark \
   --tensor-parallel-size 4 \
@@ -206,6 +221,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
   --gpu-memory-utilization 0.96 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 2048 \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --reasoning-parser deepseek_v4 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}' \
@@ -219,13 +235,15 @@ vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
 ## 7. 测试结果(4× RTX 4090)
 
 ### 7.1 推理正确性
-```
+
+```text
 Q: 用一句话介绍长城。
 A: 长城是中国古代为抵御北方游牧民族入侵而修筑的、横跨多个朝代、绵延数千公里的
    军事防御工程，也是世界文化遗产中象征中华民族坚韧精神的伟大奇迹。   (finish_reason=stop)
 ```
 
 ### 7.2 最大上下文(KV cache)
+
 | max-model-len | max-num-seqs | GMU | GPU KV cache | 单请求并发 | 启动 |
 |---|---|---|---|---|---|
 | 262,144 (256K) | 16 | 0.97 | 972,374 tok | 3.71x | ✅ |
@@ -237,6 +255,7 @@ A: 长城是中国古代为抵御北方游牧民族入侵而修筑的、横跨�
 输入长度 sweep(256K 配置，均成功):64K(25s)/128K(37s)/200K(74s)/262K(71s)。
 
 ### 7.3 非 DSpark decode 性能(4× RTX 4090，单并发)
+
 | 输入 | Decode |
 |---|---:|
 | 8,192 | **~82 tok/s** |
@@ -245,7 +264,8 @@ A: 长城是中国古代为抵御北方游牧民族入侵而修筑的、横跨�
 Decode 主要受 Marlin MoE 反量化开销影响(Ada 无 FP4 张量核)。
 
 ### 7.4 Tool call(`deepseek_v4` parser)
-```
+
+```text
 Q: 北京今天天气怎么样？请用摄氏度回答。  (tools=[get_weather])
 → finish_reason: tool_calls
 → get_weather  arguments: {"city": "北京", "unit": "celsius"}   ✅
@@ -253,7 +273,7 @@ Q: 北京今天天气怎么样？请用摄氏度回答。  (tools=[get_weather])
 
 ### 7.5 DSpark 推测解码(CUDA 13.x / torch cu130, 单并发)
 
-vLLM 自带 `vllm bench serve`，random dataset 固定长度，`max-concurrency=1`，每组 10 次，输出 1024 token。
+vLLM 自带 `vllm bench serve`，random dataset 固定长度，`max-concurrency=1`，每组 5 次，输出 1024 token。
 
 稳定配置:
 
@@ -272,10 +292,13 @@ vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
   --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
 ```
 
-| 输入 → 输出 | 成功 | Decode | acceptance |
+| 输入 → 输出 | 成功 | Prefill TPS | Decode TPS |
 |---|---:|---:|---:|
-| 8,192 → 1,024 | 10/10 | **355 tok/s** | 92.81% |
-| 32,768 → 1,024 | 10/10 | **336 tok/s** | 89.12% |
+| 8,192 → 1,024 | 5/5 | **3515.72** | **286.82** |
+| 32,768 → 1,024 | 5/5 | **4881.18** | **344.63** |
+| 131,072 → 1,024 | 5/5 | **3812.00** | **313.57** |
+
+折算口径：`Prefill TPS = input_tokens / mean_TTFT`；`Decode TPS = 1000 / mean_TPOT(ms)`。
 
 ## 8. 许可 / 来源
 

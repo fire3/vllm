@@ -1,12 +1,20 @@
 # DeepSeek-V4-Flash on SM89 (Ada / RTX 4090) — vLLM fork
 
-> 中文版见 [`README.md`](README.md)。
+<!-- markdownlint-disable MD060 -->
 
-> This repository is a fork of [vllm-project/vllm](https://github.com/vllm-project/vllm). The branch already contains **PR #41834** (the SM120 portable Triton path) plus the **SM89/Ada enablement commits**.
+> 中文版见 [`README.md`](README.md)。
+> This repository is a fork of [vllm-project/vllm](https://github.com/vllm-project/vllm). It tracks current upstream `main` and adds the FlashInfer sparse MLA adaptation for SM89/Ada.
 
 It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM89 (Ada Lovelace: RTX 4090 / L40 / L40S / L4 / RTX 6000 Ada)**. End-to-end validated on **4× RTX 4090 (48 GB)**: environment setup → operator tests → server startup → inference → performance / tool-calling — all passing.
 
 ## Changelog
+
+### 2026-07-10
+
+- Switched SM89 sparse MLA prefill/decode to the **FlashInfer 0.6.14 sparse MLA JIT fork**. The release includes the matching FlashInfer wheel, and runtime validation rejects an official package without the SM89 patch.
+- Fixed Lightning Indexer scheduler metadata selection to use actual DeepGEMM hardware support instead of package presence. An installed DeepGEMM package no longer makes SM89 call an unsupported metadata API.
+- This release does not update `confidence_head` and does not include per-request adaptive ℓ; DSpark remains fixed at `ℓ=6`.
+- On 4× RTX 4090, TP=4, single concurrency, all five requests per case passed. For `8K / 32K / 128K -> 1K`, Prefill TPS is **3515.72 / 4881.18 / 3812.00** and Decode TPS is **286.82 / 344.63 / 313.57**.
 
 ### 2026-07-06
 
@@ -43,30 +51,25 @@ This table reports decode-side results only; SM80 long-context prefill needs sep
 
 ## 1. Background: why this fork
 
-DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) + FP4-expert MoE + mHC. Upstream defaults to **FlashMLA + DeepGEMM**, which are only built for Hopper / datacenter Blackwell. PR #41834 introduced a **portable Triton path** for **SM120 (consumer Blackwell)** to replace those kernels; this fork opens that path up further to **SM89**.
+DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer), FP4-expert MoE, and mHC. This fork ports FlashInfer's SM120 sparse MLA JIT kernels to **SM89** and keeps the Triton/torch auxiliary fallbacks required on Ada.
 
 | Subsystem | Upstream (SM90/100) | SM89 (this fork) |
 |---|---|---|
-| Sparse MLA attention | FlashMLA sparse | **Triton** (PR #41834 portable kernels) |
-| Lightning Indexer (FP8 MQA logits) | DeepGEMM | **Triton / torch fallback** |
-| o_proj FP8 einsum | DeepGEMM `fp8_einsum` | **Triton** (FP8 dot upcast to bf16) |
+| Sparse MLA attention | FlashMLA / FlashInfer sparse | **FlashInfer 0.6.14 sparse MLA JIT** |
+| Lightning Indexer (FP8 MQA logits) | DeepGEMM | **Hardware-gated DeepGEMM / fallback** |
+| o_proj FP8 einsum | DeepGEMM `fp8_einsum` | **SM89-compatible path** |
 | mHC pre/post GEMM | DeepGEMM / TileLang | **TileLang TF32** |
 | MoE (FP4 experts) | DeepGEMM / FlashInfer-CUTLASS FP4 | **Marlin WNA16** (FP4→FP16 dequant) |
 | Indexer Q rope+quant / KV dequant | **CuTe-DSL** | **Triton/torch fallback** |
 
 **Hardware fact:** Ada has FP8 tensor cores but **no FP4 tensor cores and no hardware microscaling MMA**, so the FP4 MoE must run through Marlin dequantization (slower than native FP4 MMA).
 
-### SM89 changes (relative to PR #41834: 10 files, +294/-26)
+### SM89 changes
 
-- `vllm/v1/attention/backends/mla/sparse_mla_env.py` — central switch `is_ada_sm89()`; folds SM89 into the Triton sparse-MLA path.
-- `vllm/utils/deep_gemm.py` / `models/deepseek_v4/nvidia/ops/sm12x_deep_gemm_fallbacks.py` — MQA-logits / HC-GEMM fallback dispatch extended to SM89.
-- `vllm/models/deepseek_v4/nvidia/ops/fp8_einsum.py` — Triton FP8 einsum extended to SM89 + bf16 upcast of the FP8 `tl.dot`.
-- `vllm/model_executor/kernels/mhc/tilelang.py` — mHC TF32 path extended to SM89.
-- `vllm/model_executor/layers/sparse_attn_indexer.py` / `v1/attention/backends/mla/indexer.py` — fix the init-time crash in `_sparse_indexer_requires_deep_gemm`; memory budget.
-- `vllm/models/deepseek_v4/sparse_mla.py` — `supports_compute_capability` made accurate.
-- **`vllm/utils/import_utils.py` — `has_cutedsl()` returns False on SM89**.
-
-> See [`SM89_DEEPSEEK_V4_NOTES.md`](SM89_DEEPSEEK_V4_NOTES.md) for details.
+- The `flashinfer-python==0.6.14` sparse MLA JIT path admits exact capability `8.9`; other 8.x GPUs remain rejected.
+- `vllm/v1/attention/backends/mla/indexer.py` uses `is_deep_gemm_supported()` for scheduler metadata, preventing SM89 from calling the DeepGEMM metadata API.
+- `vllm/models/deepseek_v4/compressor.py` and `vllm/utils/import_utils.py` select existing Triton/torch fallbacks on SM89 and avoid SM90+ CuTe-DSL instructions.
+- MXFP4 MoE continues to select Marlin on SM89 instead of Blackwell-only DeepGEMM FP4.
 
 ---
 
@@ -78,7 +81,8 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) +
 | Driver / CUDA toolkit | 595.x / **CUDA 13.0** (nvcc 13.0) |
 | Python | 3.12 |
 | torch | **2.11.0+cu130** |
-| vLLM | this fork release wheel = **0.23.1rc1.dev145+g<commit>.cu130**, built for SM89/Ada only |
+| FlashInfer | **0.6.14 SM89 sparse MLA fork** |
+| vLLM | this fork's CUDA 13.0 / CPython 3.12 wheel, built for SM89/Ada only |
 
 ---
 
@@ -88,15 +92,24 @@ DeepSeek-V4-Flash combines DeepSeek Sparse Attention (DSA / Lightning Indexer) +
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-pip install \
-  "https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/download/v0.23.1rc1.dev145-g8c631d45e-cu130-sm89/vllm-0.23.1rc1.dev145%2Bg8c631d45e.cu130-cp312-cp312-linux_x86_64.whl" \
-  --extra-index-url https://download.pytorch.org/whl/cu130
+uv pip install torch==2.11.0 flashinfer-cubin==0.6.13 --torch-backend=cu130
+gh release download --repo yhfgyyf/vllm-deepseek-v4-sm89 \
+  --pattern 'flashinfer_python-0.6.14*sm89*.whl' \
+  --pattern 'vllm-*.cu130-cp312-cp312-linux_x86_64.whl' \
+  --dir /tmp/vllm-sm89-release
+uv pip install /tmp/vllm-sm89-release/flashinfer_python-0.6.14*sm89*.whl
+uv pip install /tmp/vllm-sm89-release/vllm-*.cu130-cp312-cp312-linux_x86_64.whl \
+  --torch-backend=cu130
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 ```
 
 **Validated environment:**
+
 - **Python 3.12**, Linux x86_64
 - **4× RTX 4090 (SM89/Ada, 48 GB)**, 595.x driver, CUDA toolkit 13.0
 - **torch 2.11.0+cu130**
+- **FlashInfer 0.6.14 SM89 fork**; official 0.6.14 does not contain the sparse MLA SM89 JIT patch required by this release
+- `flashinfer-cubin==0.6.13`; set `FLASHINFER_DISABLE_VERSION_CHECK=1` before running because the SM89 sparse MLA kernel is JIT-compiled from the 0.6.14 fork source
 - Wheel built with `TORCH_CUDA_ARCH_LIST=8.9+PTX`, targeting Ada/SM89
 
 ---
@@ -115,6 +128,8 @@ uv pip install -r requirements/build/cuda.txt --torch-backend=cu130 \
   -i https://pypi.tuna.tsinghua.edu.cn/simple \
   --extra-index-url https://download.pytorch.org/whl/cu130
 ```
+
+Before running sparse MLA on SM89, also install the FlashInfer 0.6.14 SM89 wheel from the same release as shown in section 3.
 
 ### 4.2 Rust toolchain (vLLM builds the Rust frontend)
 
@@ -145,7 +160,7 @@ export MAX_JOBS=16 NVCC_THREADS=2
 uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```
 
-> Do **not** install DeepGEMM (unsupported on Ada).
+> Ada does not support DeepGEMM kernels, but the package does not need to be manually removed; vLLM disables its scheduler metadata path using the hardware capability gate.
 > To build an SM80/A100/A800 wheel, set `TORCH_CUDA_ARCH_LIST` to `8.0`.
 > Wheel names follow the release convention: `vllm-0.23.1rc1.dev145+g<commit>.cu130-cp312-cp312-linux_x86_64.whl`.
 
@@ -156,12 +171,11 @@ uv pip install --force-reinstall --no-deps dist/vllm-*.cu130-*.whl
 ```python
 import torch
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.mla import sparse_mla_env as e
 print("cap:", current_platform.get_device_capability())          # (8, 9)
-print("is_ada_sm89:", e.is_ada_sm89())                            # True
-print("triton sparse mla:", e.is_triton_sparse_mla_enabled(torch.device("cuda:0")))  # True
-from vllm.model_executor.layers.sparse_attn_indexer import _sparse_indexer_requires_deep_gemm as r
-print("indexer needs deepgemm (fp8 cache):", r(False))           # False  <- key fix
+from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm89
+print("flashinfer sparse MLA SM89:", has_flashinfer_sparse_mla_sm89())  # True
+from vllm.v1.attention.backends.mla.indexer import _uses_deep_gemm_scheduler_metadata
+print("DeepGEMM scheduler metadata:", _uses_deep_gemm_scheduler_metadata())  # False
 from vllm.utils.import_utils import has_cutedsl
 print("has_cutedsl:", has_cutedsl())                             # False on SM89
 ```
@@ -173,7 +187,7 @@ print("has_cutedsl:", has_cutedsl())                             # False on SM89
 ### 6.1 Source model
 
 ```bash
-export VLLM_TRITON_MLA_SPARSE=1
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 vllm serve /path/to/DeepSeek-V4-Flash \
   --served-model-name deepseek-v4-flash \
   --tensor-parallel-size 4 \
@@ -182,6 +196,7 @@ vllm serve /path/to/DeepSeek-V4-Flash \
   --max-model-len 262144 \
   --gpu-memory-utilization 0.97 \
   --max-num-seqs 16 \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --reasoning-parser deepseek_v4 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
   --trust-remote-code --port 8000
@@ -190,7 +205,7 @@ vllm serve /path/to/DeepSeek-V4-Flash \
 ### 6.2 DSpark speculative decoding model
 
 ```bash
-export VLLM_TRITON_MLA_SPARSE=1
+export FLASHINFER_DISABLE_VERSION_CHECK=1
 vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
   --served-model-name deepseek-v4-flash-dspark \
   --tensor-parallel-size 4 \
@@ -200,6 +215,7 @@ vllm serve /path/to/DeepSeek-V4-Flash-DSpark \
   --gpu-memory-utilization 0.96 \
   --max-num-seqs 4 \
   --max-num-batched-tokens 2048 \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --reasoning-parser deepseek_v4 \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
   --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}' \
@@ -213,12 +229,14 @@ Startup success markers: `Application startup complete.`, and the log shows `Usi
 ## 7. Test results (4× RTX 4090)
 
 ### 7.1 Inference correctness
-```
+
+```text
 Q: Introduce the Great Wall in one sentence. (in Chinese)
 A: A coherent, accurate one-sentence answer is returned, finish_reason=stop.
 ```
 
 ### 7.2 Max context (KV cache)
+
 | max-model-len | max-num-seqs | GMU | GPU KV cache | per-request concurrency | startup |
 |---|---|---|---|---|---|
 | 262,144 (256K) | 16 | 0.97 | 972,374 tok | 3.71x | ✅ |
@@ -230,6 +248,7 @@ Longest input that completed: **768K (786,000 tokens, prefill ~147 s)**. 1M star
 Input-length sweep (256K config, all succeeded): 64K (25 s) / 128K (37 s) / 200K (74 s) / 262K (71 s).
 
 ### 7.3 Non-DSpark decode performance (4× RTX 4090, single concurrency)
+
 | input | decode |
 |---|---:|
 | 8,192 | **~82 tok/s** |
@@ -238,7 +257,8 @@ Input-length sweep (256K config, all succeeded): 64K (25 s) / 128K (37 s) / 200K
 Decode is mainly bounded by Marlin MoE dequantization overhead (no FP4 tensor cores on Ada).
 
 ### 7.4 Tool call (`deepseek_v4` parser)
-```
+
+```text
 Q: What's Beijing's weather today? Answer in Celsius. (tools=[get_weather])
 → finish_reason: tool_calls
 → get_weather  arguments: {"city": "北京", "unit": "celsius"}   ✅
@@ -246,7 +266,7 @@ Q: What's Beijing's weather today? Answer in Celsius. (tools=[get_weather])
 
 ### 7.5 DSpark speculative decoding (CUDA 13.x / torch cu130, single concurrency)
 
-Measured with vLLM's built-in `vllm bench serve`, random dataset with fixed lengths, `max-concurrency=1`, 10 requests per case, 1024 output tokens.
+Measured with vLLM's built-in `vllm bench serve`, random dataset with fixed lengths, `max-concurrency=1`, 5 requests per case, 1024 output tokens.
 
 Stable config:
 
@@ -265,10 +285,13 @@ vllm serve /root/autodl-tmp/DeepSeek-V4-Flash-DSpark \
   --speculative-config '{"method":"dspark","num_speculative_tokens":6,"draft_sample_method":"greedy"}'
 ```
 
-| Input → output | Success | Decode | acceptance |
+| Input -> output | Success | Prefill TPS | Decode TPS |
 |---|---:|---:|---:|
-| 8,192 → 1,024 | 10/10 | **355 tok/s** | 92.81% |
-| 32,768 → 1,024 | 10/10 | **336 tok/s** | 89.12% |
+| 8,192 -> 1,024 | 5/5 | **3515.72** | **286.82** |
+| 32,768 -> 1,024 | 5/5 | **4881.18** | **344.63** |
+| 131,072 -> 1,024 | 5/5 | **3812.00** | **313.57** |
+
+Conversion: `Prefill TPS = input_tokens / mean_TTFT`; `Decode TPS = 1000 / mean_TPOT(ms)`.
 
 ## 8. License / provenance
 

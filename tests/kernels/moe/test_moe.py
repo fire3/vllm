@@ -406,7 +406,7 @@ def test_fused_moe_int64_overflow(workspace_init):
     Reproduces the scenario from PR #34279.
     """
     # ~12 GB GPU memory needed for intermediate caches
-    free_mem = torch.cuda.mem_get_info()[0]
+    free_mem = torch.accelerator.get_memory_info()[0]
     if free_mem < 12 * 1024**3:
         pytest.skip("Insufficient GPU memory for overflow test")
 
@@ -1009,119 +1009,6 @@ def test_fused_marlin_moe(
     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
 
 
-@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
-def test_fused_marlin_moe_cuda_graph():
-    """Test that GPTQ Marlin MoE works correctly with CUDA graphs.
-
-    Regression test for https://github.com/vllm-project/vllm/issues/36811
-    The bug was caused by:
-    1. cudaFuncSetAttribute(MaxDynamicSharedMemorySize) being overwritten
-       by later CUDA graph captures with different blocks_per_sm values.
-    2. Batch-dependent c_tmp buffer sizing via sorted_token_ids.size(0).
-    """
-    torch.cuda.manual_seed(42)
-
-    # Use 64 experts like Qwen3.5-35B-A3B to trigger the bug
-    e, topk = 64, 8
-    n, k = 1024, 1024
-    group_size = 128
-    quant_type = scalar_types.uint4b8
-    dtype = torch.half
-
-    # Batch sizes matching vLLM's CUDA graph capture sizes
-    batch_sizes = [1, 2, 4, 8, 16, 24, 32]
-
-    # Create weights (shared across all batch sizes)
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
-    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
-
-    w1_data = MarlinMoEWeightData.make(
-        w=w1,
-        quant_type=quant_type,
-        group_size=group_size,
-        act_order=False,
-    )
-    w2_data = MarlinMoEWeightData.make(
-        w=w2,
-        quant_type=quant_type,
-        group_size=group_size,
-        act_order=False,
-    )
-
-    # Capture a CUDA graph for each batch size
-    graphs = {}
-    static_inputs = {}
-    static_outputs = {}
-
-    for m in batch_sizes:
-        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-        score = torch.randn((m, e), device="cuda", dtype=dtype)
-        topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
-
-        # Static input tensors for graph replay
-        a_static = a.clone()
-        topk_weights_static = topk_weights.clone()
-        topk_ids_static = topk_ids.clone()
-
-        stream = torch.cuda.Stream()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.stream(stream), torch.cuda.graph(graph):
-            out = fused_marlin_moe(
-                a_static,
-                w1_data.qweight,
-                w2_data.qweight,
-                None,
-                None,
-                w1_data.scales,
-                w2_data.scales,
-                topk_weights_static,
-                topk_ids_static,
-                global_num_experts=e,
-                quant_type_id=quant_type.id,
-                is_k_full=True,
-            )
-
-        graphs[m] = graph
-        static_inputs[m] = (a_static, topk_weights_static, topk_ids_static)
-        static_outputs[m] = out
-
-    torch.accelerator.synchronize()
-
-    # Replay each graph and compare against eager mode.
-    # The bug manifested when replaying small batch size graphs (e.g., M=1)
-    # after larger batch sizes had overwritten cudaFuncSetAttribute.
-    for m in batch_sizes:
-        a_static, topk_weights_static, topk_ids_static = static_inputs[m]
-
-        # Compute eager reference with the same inputs
-        eager_out = fused_marlin_moe(
-            a_static,
-            w1_data.qweight,
-            w2_data.qweight,
-            None,
-            None,
-            w1_data.scales,
-            w2_data.scales,
-            topk_weights_static,
-            topk_ids_static,
-            global_num_experts=e,
-            quant_type_id=quant_type.id,
-            is_k_full=True,
-        )
-
-        # Replay the captured graph
-        static_outputs[m].zero_()
-        graphs[m].replay()
-        torch.accelerator.synchronize()
-
-        torch.testing.assert_close(
-            static_outputs[m],
-            eager_out,
-            atol=1e-2,
-            rtol=1e-2,
-        )
-
-
 @pytest.mark.flaky(reruns=2)
 @pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
 @pytest.mark.usefixtures("default_vllm_config")
@@ -1356,15 +1243,27 @@ def test_batched_moe_align_block_size_opcheck():
     )
 
 
+# topk=8 covers topk > 4; k=511 covers the non-vectorized scalar path. The
+# layouts exercise contiguous input plus the two non-contiguous cases: a
+# transpose (strided hidden -> scalar gather) and a topk-slice (hidden still
+# contiguous -> vectorized).
 @pytest.mark.parametrize("m", [1, 33, 222])
-@pytest.mark.parametrize("topk", TOP_KS)
+@pytest.mark.parametrize("topk", [*TOP_KS, 8])
 @pytest.mark.parametrize("k", [128, 511, 1024])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
-    input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
+@pytest.mark.parametrize("layout", ["contig", "transpose", "slice"])
+def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype, layout: str):
+    if layout == "transpose":
+        input = torch.randn((m, k, topk), device="cuda", dtype=dtype).transpose(1, 2)
+    elif layout == "slice":
+        input = torch.randn((m, 2 * topk, k), device="cuda", dtype=dtype)[:, ::2, :]
+    else:
+        input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
+    assert input.is_contiguous() == (layout == "contig")
     actual = torch.empty((m, k), device="cuda", dtype=dtype)
 
-    expected = input.sum(dim=1)
+    # Reduction accumulates in fp32.
+    expected = input.float().sum(dim=1).to(dtype)
     torch.ops._moe_C.moe_sum(input, actual)
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)

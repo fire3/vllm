@@ -37,14 +37,6 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 logger = init_logger(__name__)
 
 
-def _clear_mxfp4_moe_weight_loading_cache() -> None:
-    # WORKAROUND: SM12x/GB10 can hit driver instability while loading MXFP4
-    # MoE weights under tight VRAM pressure. Release PyTorch's staging cache
-    # after the backend kernel has taken ownership of the converted weights.
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
 
@@ -397,22 +389,23 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
-        del w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
-        _clear_mxfp4_moe_weight_loading_cache()
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
     ) -> FusedMoEQuantConfig | None:
-        w1_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
         w1_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
         if self.mxfp4_backend in TRITON_BACKENDS:
+            # TRITON backends free w13/w2_weight_scale after swizzling; the
+            # swizzled scales live inside the precision configs instead.
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
             w1_scale = self.w13_precision_config
             w2_scale = self.w2_precision_config
+        else:
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
 
         return make_mxfp4_moe_quant_config(
             mxfp4_backend=self.mxfp4_backend,
@@ -743,24 +736,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
-        del w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
-        _clear_mxfp4_moe_weight_loading_cache()
 
     def get_fused_moe_quant_config(
         self,
         layer: RoutedExperts,
     ) -> FusedMoEQuantConfig | None:
-        w1_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
         w1_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
         swiglu_limit = getattr(layer, "swiglu_limit", None)
 
         if self.mxfp4_backend in TRITON_BACKENDS:
+            # TRITON backends free w13/w2_weight_scale after swizzling; the
+            # swizzled scales live inside the precision configs instead.
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
             w1_scale = self.w13_precision_config
             w2_scale = self.w2_precision_config
+        else:
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
 
         return make_mxfp4_moe_quant_config(
             mxfp4_backend=self.mxfp4_backend,

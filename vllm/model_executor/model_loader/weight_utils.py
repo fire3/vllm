@@ -55,10 +55,9 @@ except ImportError:
     SafetensorsStreamer = runai_model_streamer.placeholder_attr("SafetensorsStreamer")
 
 try:
-    from fastsafetensors import SafeTensorsFileLoader, SingleGroup
+    from fastsafetensors import SingleGroup
 except ImportError:
     fastsafetensors = PlaceholderModule("fastsafetensors")
-    SafeTensorsFileLoader = fastsafetensors.placeholder_attr("SafeTensorsFileLoader")
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
@@ -818,22 +817,11 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
-def _should_skip_safetensors_weight(
-    weight_name: str,
-    local_expert_ids: set[int] | None,
-    weight_name_filter: Callable[[str], bool] | None,
-) -> bool:
-    if should_skip_weight(weight_name, local_expert_ids):
-        return True
-    return weight_name_filter is not None and weight_name_filter(weight_name)
-
-
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     safetensors_load_strategy: str | None = None,
     local_expert_ids: set[int] | None = None,
-    weight_name_filter: Callable[[str], bool] | None = None,
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
@@ -843,9 +831,6 @@ def safetensors_weights_iterator(
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
-
-    When *weight_name_filter* is provided, names for which the callback returns
-    ``True`` are also skipped before tensor materialization.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -928,9 +913,7 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not _should_skip_safetensors_weight(
-                    name, local_expert_ids, weight_name_filter
-                ):
+                if not should_skip_weight(name, local_expert_ids):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
@@ -947,9 +930,7 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if _should_skip_safetensors_weight(
-                        name, local_expert_ids, weight_name_filter
-                    ):
+                    if should_skip_weight(name, local_expert_ids):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -967,9 +948,7 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if _should_skip_safetensors_weight(
-                        name, local_expert_ids, weight_name_filter
-                    ):
+                    if should_skip_weight(name, local_expert_ids):
                         continue
                     param = f.get_tensor(name)
                     yield name, param
@@ -1042,27 +1021,19 @@ def runai_safetensors_weights_iterator(
             yield name, tensor.clone()
 
 
-def _init_fastsafetensors_loader(
-    pg: "torch.distributed.ProcessGroup",
-    device: torch.device,
-    f_list: list[str],
-    *,
-    nogds: bool = False,
-):
-    loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
-    rank_file_map = {i: [f] for i, f in enumerate(f_list)}
-    loader.add_filenames(rank_file_map)
-    return loader
-
-
 def fastsafetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
-    local_expert_ids: set[int] | None = None,
-    weight_name_filter: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
-    using fastsafetensor library."""
+    using fastsafetensor library.
+
+    Uses ParallelLoader for pipelined loading: the producer thread
+    prepares metadata for the next shard while the consumer yields
+    tensors from the current shard.
+    """
+    from fastsafetensors.parallel_loader import ParallelLoader
+
     if torch.distributed.is_initialized():
         pg = torch.distributed.group.WORLD
     else:
@@ -1070,54 +1041,53 @@ def fastsafetensors_weights_iterator(
 
     device = torch.device(f"cuda:{current_platform.current_device()}")
     hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
-    weight_files_sub_lists = [
-        hf_weights_files[i : i + pg.size()]
-        for i in range(0, len(hf_weights_files), pg.size())
-    ]
 
     # Use nogds=True for TP > 1 to avoid cuFileDriverOpen() which
     # initializes the GDS DMA subsystem for all visible GPUs, creating
     # unwanted CUDA contexts on every device.
     nogds = pg.size() > 1
 
-    for f_list in tqdm(
-        weight_files_sub_lists,
-        desc="Loading safetensors using Fastsafetensor loader",
-        disable=not enable_tqdm(use_tqdm_on_load),
-        bar_format=_BAR_FORMAT,
-    ):
-        loader = _init_fastsafetensors_loader(pg, device, f_list, nogds=nogds)
+    queue_size = envs.VLLM_FASTSAFETENSORS_QUEUE_SIZE
+    tqdm_enabled = enable_tqdm(use_tqdm_on_load)
+
+    def _make_loader(nogds: bool) -> "ParallelLoader":
+        return ParallelLoader(
+            pg=pg,
+            hf_weights_files=hf_weights_files,
+            queue_size=queue_size,
+            use_tqdm_on_load=tqdm_enabled,
+            device=str(device),
+            nogds=nogds,
+        )
+
+    # GDS can fail either at construction or lazily inside the producer
+    # thread during iteration (e.g. cuFileHandleRegister returning
+    # CU_FILE_HANDLE_NOT_REGISTERED on a filesystem without GDS support).
+    # Catch both and fall back to nogds, but only before yielding any
+    # tensor -- restarting mid-stream would reload earlier shards.
+    pl = None
+    yielded = False
+    try:
         try:
-            try:
-                fb = loader.copy_files_to_device()
-            except RuntimeError as e:
-                if "gds" not in str(e):
-                    raise
-
-                loader.close()
-                nogds = True
-                logger.warning_once(
-                    "GDS not enabled, setting `nogds=True`.\n"
-                    "For more information, see: https://github.com/foundation-model-stack/fastsafetensors?tab=readme-ov-file#basic-api-usages"
-                )
-                loader = _init_fastsafetensors_loader(pg, device, f_list, nogds=nogds)
-                fb = loader.copy_files_to_device()
-
-            try:
-                keys = list(fb.key_to_rank_lidx.keys())
-                for k in keys:
-                    if _should_skip_safetensors_weight(
-                        k,
-                        local_expert_ids,
-                        weight_name_filter,
-                    ):
-                        continue
-                    t = fb.get_tensor(k)
-                    yield k, t
-            finally:
-                fb.close()
-        finally:
-            loader.close()
+            pl = _make_loader(nogds)
+            for name, tensor in pl.iterate_weights():
+                yielded = True
+                yield name, tensor
+        except RuntimeError as e:
+            if nogds or yielded or "gds" not in str(e):
+                raise
+            logger.warning_once(
+                "GDS not enabled, setting `nogds=True`.\n"
+                "For more information, see: https://github.com/foundation-model-stack/"
+                "fastsafetensors?tab=readme-ov-file#basic-api-usages"
+            )
+            if pl is not None:
+                pl.close()
+            pl = _make_loader(nogds=True)
+            yield from pl.iterate_weights()
+    finally:
+        if pl is not None:
+            pl.close()
 
 
 def instanttensor_weights_iterator(

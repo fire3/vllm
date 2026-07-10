@@ -5,7 +5,6 @@
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -46,7 +45,6 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
-        "bfloat16",
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
     ]
@@ -87,13 +85,12 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_sink(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # SM90/SM100 run FlashMLA; SM12x (Blackwell client) and SM89 (Ada) run
-        # the portable Triton DeepSeek-V4 path. SM89 is the only supported 8.x
-        # arch (it has FP8 tensor cores; Ampere 8.0/8.6 do not).
-        if capability.major in [9, 10, 12]:
-            return True
-        return (capability.major, capability.minor) == (8, 9)
+        return capability.major in [9, 10]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -204,18 +201,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
         fast_build: bool = False,
     ) -> DeepseekV4FlashMLAMetadata:
         cm = common_attn_metadata
-        num_tokens = cm.num_actual_tokens
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
-        )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        req_id_per_token = cm.token_to_req_indices(self.req_id_per_token_buffer)
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:
@@ -325,31 +311,11 @@ def build_c128a_topk_metadata(
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
 
-    if num_tokens == 0:
-        global_decode = global_decode_buffer[:num_decode_tokens, :0]
-        decode_lens = decode_lens_buffer[:num_decode_tokens]
-        prefill_local = prefill_buffer[:num_prefill_tokens, :0]
-        return global_decode, decode_lens, prefill_local
-
-    KERNEL_BLOCK_SIZE = 1024
-    effective_topk = _c128a_effective_topk_width(
-        positions=positions,
-        compress_ratio=compress_ratio,
-        max_compressed_tokens=max_compressed_tokens,
-        alignment=_C128A_TOPK_ALIGNMENT,
-    )
-
-    global_decode = global_decode_buffer[:num_decode_tokens, :effective_topk]
+    global_decode = global_decode_buffer[:num_decode_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
-    prefill_local = prefill_buffer[:num_prefill_tokens, :effective_topk]
+    prefill_local = prefill_buffer[:num_prefill_tokens]
 
-    if num_decode_tokens > 0:
-        global_decode.fill_(-1)
-        decode_lens.zero_()
-    if num_prefill_tokens > 0:
-        prefill_local.fill_(-1)
-
-    if effective_topk == 0:
+    if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
 
     _build_c128a_topk_metadata_kernel[(num_tokens,)](
@@ -360,39 +326,16 @@ def build_c128a_topk_metadata(
         prefill_buffer.stride(0),
         positions,
         compress_ratio,
-        effective_topk,
+        max_compressed_tokens,
         num_decode_tokens,
         token_to_req_indices,
         block_table,
         block_table.stride(0),
         block_size,
         slot_mapping,
-        BLOCK_SIZE=KERNEL_BLOCK_SIZE,
+        BLOCK_SIZE=1024,
     )
     return global_decode, decode_lens, prefill_local
-
-
-def _c128a_effective_topk_width(
-    *,
-    positions: torch.Tensor,
-    compress_ratio: int,
-    max_compressed_tokens: int,
-    alignment: int,
-) -> int:
-    """Return the aligned C128A top-k width needed by current tokens."""
-    if positions.numel() == 0:
-        return 0
-    max_pos = int(positions.max().item())
-    max_num_compressed = min(
-        max((max_pos + 1) // int(compress_ratio), 0),
-        int(max_compressed_tokens),
-    )
-    if max_num_compressed == 0:
-        return min(int(max_compressed_tokens), int(alignment))
-    return min(
-        int(max_compressed_tokens),
-        cdiv(max_num_compressed, int(alignment)) * int(alignment),
-    )
 
 
 @triton.jit
@@ -407,7 +350,7 @@ def _build_c128a_topk_metadata_kernel(
     # Inputs
     positions_ptr,
     compress_ratio,
-    effective_topk,
+    max_compressed_tokens,
     num_decode_tokens,
     token_to_req_indices_ptr,
     block_table_ptr,
@@ -419,7 +362,7 @@ def _build_c128a_topk_metadata_kernel(
     token_idx = tl.program_id(0)
     position = tl.load(positions_ptr + token_idx)
     num_compressed = (position + 1) // compress_ratio
-    num_compressed = tl.minimum(num_compressed, effective_topk)
+    num_compressed = tl.minimum(num_compressed, max_compressed_tokens)
     is_decode = token_idx < num_decode_tokens
 
     if is_decode:
@@ -427,9 +370,9 @@ def _build_c128a_topk_metadata_kernel(
         is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
         req_idx = tl.load(token_to_req_indices_ptr + token_idx)
         count = tl.zeros((), dtype=tl.int32)
-        for i in range(0, effective_topk, BLOCK_SIZE):
+        for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
-            mask = offset < effective_topk
+            mask = offset < max_compressed_tokens
             is_valid = offset < num_compressed
 
             block_indices = offset // block_size
@@ -454,9 +397,9 @@ def _build_c128a_topk_metadata_kernel(
     else:
         # --- Prefill: write local indices ---
         pfx_idx = token_idx - num_decode_tokens
-        for i in range(0, effective_topk, BLOCK_SIZE):
+        for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
-            mask = offset < effective_topk
+            mask = offset < max_compressed_tokens
             tl.store(
                 prefill_local_ptr + pfx_idx * prefill_local_stride + offset,
                 tl.where(offset < num_compressed, offset, -1),

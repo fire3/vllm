@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSpark draft model for DeepSeek-V4 (semi-autoregressive speculative decoding).
 
-This module is specialized to the DeepSeek-V4 DSpark checkpoint, which reuses
-the target model architecture similarly to MTP.
+See: qwen3_dspark.py for base architecture. This one is specialized to the DSV4 DSpark,
+which reuses the target model's architecture similarly to MTP.
 
 To implement non-causal attention, we leverage the sparse attention implementation to
 include the future query tokens in the top-k indices for each query token.
@@ -36,6 +36,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.qwen3_dspark import (
+    DSparkMarkovHead,
+)
 from vllm.model_executor.models.utils import maybe_prefix
 
 from .model import (
@@ -48,48 +51,6 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
-
-
-class DSparkMarkovHead(nn.Module):
-    """Sequential transition-bias head (low-rank V x r, r x V)."""
-
-    def __init__(self, vocab_size: int, markov_rank: int, prefix: str) -> None:
-        super().__init__()
-        self.markov_w1 = VocabParallelEmbedding(
-            vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
-        )
-        self.markov_w2 = ParallelLMHead(
-            vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w2")
-        )
-
-    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.markov_w1(token_ids)
-
-    def bias(
-        self,
-        markov_embed: torch.Tensor,
-        logits_processor: LogitsProcessor,
-    ) -> torch.Tensor:
-        return logits_processor(self.markov_w2, markov_embed)
-
-
-class DSparkConfidenceHead(nn.Module):
-    """Per-position acceptance score head for DeepSeek-V4 DSpark."""
-
-    def __init__(self, input_dim: int, prefix: str) -> None:
-        super().__init__()
-        self.proj = ReplicatedLinear(
-            input_dim,
-            1,
-            bias=False,
-            return_bias=False,
-            params_dtype=torch.float32,
-            prefix=maybe_prefix(prefix, "proj"),
-        )
-
-    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([hidden, markov_embed], dim=-1).float()
-        return self.proj(x).squeeze(-1)
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -135,7 +96,7 @@ class DSparkDeepseekV4Model(nn.Module):
             ]
         )
 
-        # Heads: final norm + hc_head, and the Markov + confidence heads
+        # Heads: final norm + hc_head, and the Markov head
         # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         hc_dim = self.hc_mult * config.hidden_size
@@ -149,14 +110,14 @@ class DSparkDeepseekV4Model(nn.Module):
         self.hc_head_scale = nn.Parameter(
             torch.empty(1, dtype=torch.float32), requires_grad=False
         )
+        draft_vocab_size = (
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
         self.markov_head = DSparkMarkovHead(
             config.vocab_size,
+            draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
-        )
-        self.confidence_head = DSparkConfidenceHead(
-            config.hidden_size + config.dspark_markov_rank,
-            prefix=maybe_prefix(prefix, "confidence_head"),
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -304,8 +265,12 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
-    # Draft weights ship in the target checkpoint (mtp.*); see load_dspark_model
-    dspark_shares_target_embeddings = True
+    # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
+    # load_dspark_model always aliases the target's.
+    has_own_embed_tokens = False
+    has_own_lm_head = False
+    # Full-vocab draft: draft ids are target ids, no remapping needed.
+    draft_id_to_target_id = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -359,16 +324,18 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         """Base logits U_k = lm_head(norm(head_hidden))."""
         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
+    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Full-vocab draft: base logits, no d2t scatter.
+        return self.compute_logits(hidden_states)
+
+    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        return draft_ids  # full-vocab: draft ids are target ids
+
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.embed(token_ids)
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
-
-    def compute_confidence(
-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
-    ) -> torch.Tensor:
-        return self.model.confidence_head(head_hidden, markov_embed)
 
     # --- Weight loading ----------------------------------------------------
 
@@ -456,8 +423,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 continue
 
             # Stacked rules only apply to decoder-layer weights. Head-stack params
-            # (main_proj/norm/hc_head/markov_head/confidence_head) load directly —
-            # otherwise e.g. "markov_w1" would collide with the "w1" shard rule.
+            # (main_proj/norm/hc_head/markov_head) load directly — otherwise e.g.
+            # "markov_w1" would collide with the "w1" shard rule.
             is_layer_param = name.startswith("model.layers.")
             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
                 if not is_layer_param or weight_name not in name:
@@ -504,6 +471,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(m.group(1))
         rest = m.group(2)
+        # The confidence head is not wired into inference yet; drop its weights.
+        if rest.startswith("confidence_head."):
+            return None
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.
         head_prefixes = (
@@ -512,7 +482,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             "hc_head_base",
             "hc_head_scale",
             "markov_head.",
-            "confidence_head.",
         )
         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
             head_prefixes

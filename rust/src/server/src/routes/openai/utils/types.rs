@@ -311,7 +311,9 @@ pub enum MessageContent {
 // ============================================================================
 
 /// Mirrors the Python vLLM `UsageInfo` class.
-#[serde_with::skip_serializing_none]
+///
+/// Do not skip serializing `None` fields here: non-streaming response types
+/// should serialize `None` as explicit `null`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
@@ -402,14 +404,12 @@ pub struct LogProbs {
 }
 
 /// Mirrors the Python vLLM `ChatCompletionLogProbs` class.
-#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatLogProbs {
     pub content: Option<Vec<ChatLogProbsContent>>,
 }
 
 /// Mirrors the Python vLLM `ChatCompletionLogProbsContent` class.
-#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatLogProbsContent {
     pub token: String,
@@ -419,7 +419,6 @@ pub struct ChatLogProbsContent {
 }
 
 /// Mirrors the Python vLLM `ChatCompletionLogProb` class.
-#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct TopLogProb {
     pub token: String,
@@ -436,7 +435,6 @@ pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
-#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ErrorDetail {
     pub message: String,
@@ -457,6 +455,12 @@ pub struct ModelObject {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    /// Backend model path (base cards) or adapter path (LoRA cards).
+    pub root: Option<String>,
+    /// Base model a LoRA adapter derives from; `null` for base models.
+    pub parent: Option<String>,
+    /// Maximum context length; `null` for LoRA adapter cards.
+    pub max_model_len: Option<u32>,
 }
 
 /// Response body for `GET /v1/models`.

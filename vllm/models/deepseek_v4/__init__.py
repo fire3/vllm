@@ -11,14 +11,6 @@ from vllm.platforms import current_platform
 
 from .quant_config import DeepseekV4FP8Config
 
-
-class _UnsupportedDSparkDeepseekV4ForCausalLM:
-    def __init__(self, *args, **kwargs) -> None:
-        raise NotImplementedError(
-            "DeepSeek-V4 DSpark is only supported on NVIDIA CUDA platforms."
-        )
-
-
 # Pick the per-platform implementation. The NVIDIA branch is the static
 # default that mypy sees; the ROCm/XPU branches override at runtime and are
 # kept type-compatible via ``# type: ignore[assignment]``.
@@ -26,12 +18,13 @@ if current_platform.is_rocm():
     from .amd.model import DeepseekV4ForCausalLM
     from .amd.mtp import DeepSeekV4MTP
 
-    DSparkDeepseekV4ForCausalLM = _UnsupportedDSparkDeepseekV4ForCausalLM
+    # DSpark is NVIDIA-only for now.
+    DSparkDeepseekV4ForCausalLM = None  # type: ignore[assignment]
 elif current_platform.is_xpu():
     from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
     from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 
-    DSparkDeepseekV4ForCausalLM = _UnsupportedDSparkDeepseekV4ForCausalLM
+    DSparkDeepseekV4ForCausalLM = None  # type: ignore[assignment]
 else:
     from .nvidia.dspark import (  # type: ignore[assignment]
         DSparkDeepseekV4ForCausalLM,
@@ -40,8 +33,8 @@ else:
     from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 
 __all__ = [
+    "DSparkDeepseekV4ForCausalLM",
     "DeepSeekV4MTP",
     "DeepseekV4FP8Config",
     "DeepseekV4ForCausalLM",
-    "DSparkDeepseekV4ForCausalLM",
 ]

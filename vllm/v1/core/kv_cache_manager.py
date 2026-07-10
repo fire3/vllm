@@ -121,7 +121,6 @@ class KVCacheManager:
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
-        max_num_seqs: int | None = None,
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
     ) -> None:
@@ -152,7 +151,6 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
-            max_num_seqs=max_num_seqs,
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
@@ -201,18 +199,12 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
-    def get_computed_blocks(
-        self,
-        request: Request,
-        *,
-        record_stats: bool = True,
-    ) -> tuple[KVCacheBlocks, int]:
+    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
         Args:
             request: The request to get the computed blocks.
-            record_stats: Whether to record prefix-cache stats for this lookup.
 
         Returns:
             A tuple containing:
@@ -239,7 +231,7 @@ class KVCacheManager:
             )
         )
 
-        if self.log_stats and record_stats:
+        if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.record(
                 num_tokens=request.num_tokens,
@@ -367,9 +359,6 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
-        block_ids_to_skip_releasing = self._block_ids_to_skip_releasing(
-            new_computed_block_list
-        )
 
         watermark_blocks = 0
         # The watermark is applied to waiting/preempted requests only, and only
@@ -393,11 +382,8 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if not self._has_enough_free_blocks(
-                num_blocks_to_allocate,
-                block_ids_to_skip_releasing,
-                watermark_blocks=watermark_blocks,
-            ):
+            required_blocks = num_blocks_to_allocate + watermark_blocks
+            if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -412,7 +398,9 @@ class KVCacheManager:
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
         self.coordinator.remove_skipped_blocks(
-            request.request_id, total_computed_tokens
+            request.request_id,
+            total_computed_tokens,
+            num_prompt_tokens=request.num_prompt_tokens,
         )
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -425,12 +413,11 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if not self._has_enough_free_blocks(
-            num_blocks_to_allocate,
-            block_ids_to_skip_releasing,
-            reserved_blocks=reserved_blocks,
-            watermark_blocks=watermark_blocks,
-        ):
+        # Keep `reserved_blocks` free for other in-flight sequences, and an
+        # additional watermark of headroom for waiting/preempted admissions.
+        available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+        required_blocks = num_blocks_to_allocate + watermark_blocks
+        if required_blocks > available_blocks:
             # Cannot allocate new blocks
             return None
 
@@ -483,7 +470,10 @@ class KVCacheManager:
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
-        self, request_id: str, total_computed_tokens: int
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+        num_prompt_tokens: int | None = None,
     ) -> None:
         """Remove the blocks that are no longer needed from `blocks` and replace
         the removed blocks with null_block.
@@ -492,8 +482,24 @@ class KVCacheManager:
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
+            num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
         """
-        self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
+        self.coordinator.remove_skipped_blocks(
+            request_id, total_computed_tokens, num_prompt_tokens
+        )
+
+    def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
+        """Pop the request's bookkeeping and return its blocks without
+        returning them to the block pool. The caller must eventually free
+        them in reverse order (so that tail blocks are evicted first).
+
+        Args:
+            request: The request to pop the blocks for.
+
+        Returns:
+            The request's blocks in allocation order.
+        """
+        return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -502,32 +508,6 @@ class KVCacheManager:
             block_ids: Set of block IDs to evict from cache.
         """
         self.block_pool.evict_blocks(block_ids)
-
-    @staticmethod
-    def _block_ids_to_skip_releasing(
-        blocks: tuple[Sequence[KVCacheBlock], ...],
-    ) -> set[int]:
-        return {
-            block.block_id
-            for group_blocks in blocks
-            for block in group_blocks
-            if not block.is_null
-        }
-
-    def _has_enough_free_blocks(
-        self,
-        num_blocks: int,
-        block_ids_to_skip_releasing: set[int] | None = None,
-        reserved_blocks: int = 0,
-        watermark_blocks: int = 0,
-    ) -> bool:
-        required_free_blocks = num_blocks + reserved_blocks + watermark_blocks
-        if required_free_blocks <= self.block_pool.get_num_free_blocks():
-            return True
-        self.coordinator.release_protected_prompt_blocks(
-            required_free_blocks, block_ids_to_skip_releasing
-        )
-        return required_free_blocks <= self.block_pool.get_num_free_blocks()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -538,7 +518,6 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        self.coordinator.release_protected_prompt_blocks()
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
