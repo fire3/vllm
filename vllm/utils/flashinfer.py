@@ -9,6 +9,7 @@ import contextlib
 import functools
 import importlib
 import importlib.util
+import inspect
 import os
 import shutil
 from collections.abc import Callable
@@ -223,13 +224,32 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
             trtllm_batch_decode_sparse_mla_dsv4,
             trtllm_batch_decode_with_kv_cache_mla,
         )
-    except ImportError:
+
+        mla_parameters = inspect.signature(
+            trtllm_batch_decode_with_kv_cache_mla
+        ).parameters
+    except (ImportError, RuntimeError, TypeError, ValueError):
         return False
     return (
         callable(trtllm_batch_decode_sparse_mla_dsv4)
         and callable(trtllm_batch_decode_with_kv_cache_mla)
         and callable(autotune)
+        and "kv_scale_format" in mla_parameters
     )
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm89() -> bool:
+    """Return whether the installed FlashInfer enables sparse MLA on SM89."""
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    try:
+        from flashinfer.mla._core import _resolve_dsv4_sparse_mla_backend
+
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        return _resolve_dsv4_sparse_mla_backend(device) == "sparse"
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 @functools.cache

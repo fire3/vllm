@@ -10,8 +10,9 @@ torchaudio==2.11.0
 torchvision==0.26.0 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
 torchcodec >= 0.14
 PyNvVideoCodec==2.1.0
-# FlashInfer should be updated together with the Dockerfile
-flashinfer-python==0.6.13
+# FlashInfer Python 0.6.14 provides the sparse MLA API used below. The latest
+# published cubin remains 0.6.13; the SM89 release JITs its sparse MLA kernel.
+flashinfer-python==0.6.14
 flashinfer-cubin==0.6.13
 apache-tvm-ffi==0.1.9
 tilelang==0.1.9

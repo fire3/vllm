@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
@@ -27,7 +28,7 @@ def _fake_vllm_config(model_type: str = "deepseek_v4") -> SimpleNamespace:
 
 
 def test_sm89_capability_accepted(monkeypatch) -> None:
-    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: True)
 
     with set_current_vllm_config(_fake_vllm_config()):
         invalid_reasons = FlashInferMLASparseSM120Backend.validate_configuration(
@@ -74,9 +75,23 @@ def test_sm89_dsv4_defaults_to_ported_sm120_attention(monkeypatch) -> None:
         "get_device_capability",
         lambda: DeviceCapability(8, 9),
     )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: True)
     vllm_config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
 
     assert (
         dsv4_model._select_dsv4_attn_cls(vllm_config)
         is DeepseekV4FlashInferSM120Attention
     )
+
+
+def test_sm89_dsv4_rejects_unpatched_flashinfer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dsv4_model.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(8, 9),
+    )
+    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm89", lambda: False)
+    vllm_config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
+
+    with pytest.raises(RuntimeError, match="sparse MLA SM89 JIT patch"):
+        dsv4_model._select_dsv4_attn_cls(vllm_config)

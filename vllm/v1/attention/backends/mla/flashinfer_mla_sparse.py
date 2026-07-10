@@ -171,9 +171,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 12 or (
-            capability.major == 8 and capability.minor == 9
-        )
+        return capability.major == 12 or capability == DeviceCapability(8, 9)
 
     @classmethod
     def supports_combination(
@@ -189,12 +187,21 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
         device_capability: DeviceCapability,
     ) -> str | None:
         from vllm.config import get_current_vllm_config
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+        from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm89,
+            has_flashinfer_sparse_mla_sm120,
+        )
 
-        if not has_flashinfer_sparse_mla_sm120():
+        is_sm89 = (device_capability.major, device_capability.minor) == (8, 9)
+        has_sparse_mla = (
+            has_flashinfer_sparse_mla_sm89()
+            if is_sm89
+            else has_flashinfer_sparse_mla_sm120()
+        )
+        if not has_sparse_mla:
             return (
-                "FLASHINFER_MLA_SPARSE_SM120 requires FlashInfer's "
-                "sparse MLA decode API"
+                "FLASHINFER_MLA_SPARSE_SM120 requires a FlashInfer sparse MLA "
+                "build compatible with the current GPU"
             )
         if dtype != torch.bfloat16:
             return "dtype not supported"

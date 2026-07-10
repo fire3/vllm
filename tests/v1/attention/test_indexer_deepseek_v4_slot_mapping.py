@@ -6,8 +6,23 @@ import torch
 
 from tests.v1.attention.utils import create_vllm_config
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backends.mla import indexer as indexer_module
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadataBuilder
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+def test_deep_gemm_scheduler_metadata_requires_platform_support(monkeypatch):
+    monkeypatch.setattr(indexer_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(indexer_module, "is_deep_gemm_supported", lambda: False)
+
+    assert not indexer_module._uses_deep_gemm_scheduler_metadata()
+
+
+def test_deep_gemm_scheduler_metadata_enabled_on_supported_cuda(monkeypatch):
+    monkeypatch.setattr(indexer_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(indexer_module, "is_deep_gemm_supported", lambda: True)
+
+    assert indexer_module._uses_deep_gemm_scheduler_metadata()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

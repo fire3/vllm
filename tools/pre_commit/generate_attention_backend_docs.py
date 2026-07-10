@@ -664,6 +664,7 @@ def parse_compute_capability(node: ast.ClassDef) -> str:
     min_cap: tuple[int, int] | None = None
     max_cap: tuple[int, int] | None = None
     major_list: list[int] = []
+    exact_caps: list[tuple[int, int]] = []
 
     for n in ast.walk(method):
         if not isinstance(n, ast.Compare):
@@ -687,6 +688,8 @@ def parse_compute_capability(node: ast.ClassDef) -> str:
                 min_cap = (major, minor)
             elif isinstance(op, ast.LtE):
                 max_cap = (major, minor)
+            elif isinstance(op, ast.Eq):
+                exact_caps.append((major, minor))
 
         # Handle `capability.major == N` or `capability.major in [N, M]`
         if (
@@ -705,13 +708,18 @@ def parse_compute_capability(node: ast.ClassDef) -> str:
                     if isinstance(e, ast.Constant) and isinstance(e.value, int)
                 )
 
-    if major_list:
+    if major_list or exact_caps:
         major_list.sort()
+        parts = [f"{major}.{minor}" for major, minor in sorted(set(exact_caps))]
+        if not major_list:
+            return ", ".join(parts)
         if len(major_list) == 1:
-            return f"{major_list[0]}.x"
-        if major_list == list(range(major_list[0], major_list[-1] + 1)):
-            return f"{major_list[0]}.x-{major_list[-1]}.x"
-        return ", ".join(f"{major}.x" for major in major_list)
+            parts.append(f"{major_list[0]}.x")
+        elif major_list == list(range(major_list[0], major_list[-1] + 1)):
+            parts.append(f"{major_list[0]}.x-{major_list[-1]}.x")
+        else:
+            parts.extend(f"{major}.x" for major in major_list)
+        return ", ".join(parts)
 
     if min_cap:
         if max_cap:
@@ -1715,8 +1723,9 @@ def generate_mla_section(
                 "`--attention-backend=<BACKEND>` (e.g., `FLASHMLA_SPARSE_DSV4`,",
                 "`FLASHINFER_MLA_SPARSE_DSV4`). They share the V4 sparse-index",
                 "pipeline (compressor + SWA + indexer, 256-token blocks, head 512);",
-                "default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and",
-                "`FLASHMLA_SPARSE_DSV4` on other supported CUDA architectures.",
+                "default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on",
+                "SM89/SM12x and `FLASHMLA_SPARSE_DSV4` on other supported CUDA",
+                "architectures.",
                 "",
             ]
         )
