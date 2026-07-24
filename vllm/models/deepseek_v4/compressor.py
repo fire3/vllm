@@ -34,6 +34,31 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 
+_INDEXER_CUTEDSL_FP8_MIN_TOKENS = 8192
+_INDEXER_CUTEDSL_MXFP4_MIN_TOKENS = 8192
+
+
+def _can_use_indexer_compress_cutedsl(
+    *,
+    head_dim: int,
+    compress_ratio: int,
+    use_fp4_cache: bool,
+    num_tokens: int,
+) -> bool:
+    min_tokens = (
+        _INDEXER_CUTEDSL_MXFP4_MIN_TOKENS
+        if use_fp4_cache
+        else _INDEXER_CUTEDSL_FP8_MIN_TOKENS
+    )
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and head_dim == 128
+        and compress_ratio == 4
+        and num_tokens >= min_tokens
+        and has_cutedsl()
+    )
+
 
 class CompressorBackend(AttentionBackend):
     def __init__(self):
@@ -177,10 +202,9 @@ class DeepseekCompressor(nn.Module):
 
     Owns the linear / norm / state-cache / ape state and the shared forward
     prologue (kv/score split, save_partial_states launch). The
-    compress → norm → RoPE → store step is dispatched to a triton kernel
-    (``compress_norm_rope_store_triton``) by default, except for the NVIDIA
-    head_dim=128 indexer path which uses the cutedsl kernel
-    (``compress_norm_rope_store_cutedsl``) for better performance.
+    compress → norm → RoPE → store step is dispatched to a Triton kernel
+    by default. NVIDIA head_dim=512 uses CuTe DSL, and the SM120 C4 FP8
+    indexer uses its dedicated CuTe DSL kernel for large prefill batches.
     """
 
     def __init__(
@@ -365,6 +389,18 @@ class DeepseekCompressor(nn.Module):
                 store_full_fp8=store_full_fp8,
                 fp8_scale=fp8_scale,
             )
+        elif _can_use_indexer_compress_cutedsl(
+            head_dim=self.head_dim,
+            compress_ratio=self.compress_ratio,
+            use_fp4_cache=self.use_fp4_cache,
+            num_tokens=num_actual,
+        ):
+            from .nvidia.ops.indexer_compress_cutedsl import (
+                compress_norm_rope_store_indexer_cutedsl,
+            )
+
+            compress_norm_rope_store_fn = compress_norm_rope_store_indexer_cutedsl
+            extra_kwargs = {}
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
             compress_norm_rope_store_fn = compress_norm_rope_store_triton

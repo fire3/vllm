@@ -50,6 +50,7 @@ torch::stable::Tensor permute_cols(torch::stable::Tensor const& A,
 bool cutlass_scaled_mm_supports_fp8(int64_t cuda_device_capability);
 bool cutlass_scaled_mm_supports_block_fp8(int64_t cuda_device_capability);
 bool cutlass_group_gemm_supported(int64_t cuda_device_capability);
+bool deepseek_v4_fp8_bmm_sm120_supported(int64_t cuda_device_capability);
 
 void cutlass_scaled_mm(torch::stable::Tensor& out,
                        torch::stable::Tensor const& a,
@@ -57,6 +58,12 @@ void cutlass_scaled_mm(torch::stable::Tensor& out,
                        torch::stable::Tensor const& a_scales,
                        torch::stable::Tensor const& b_scales,
                        std::optional<torch::stable::Tensor> const& bias);
+
+void deepseek_v4_fp8_bmm_sm120(torch::stable::Tensor& out,
+                               torch::stable::Tensor const& a,
+                               torch::stable::Tensor const& b,
+                               torch::stable::Tensor const& a_scales,
+                               torch::stable::Tensor const& b_scales);
 
 void cutlass_moe_mm(torch::stable::Tensor& out_tensors,
                     torch::stable::Tensor const& a_tensors,

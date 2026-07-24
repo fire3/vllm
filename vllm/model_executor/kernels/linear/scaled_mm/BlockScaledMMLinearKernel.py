@@ -94,6 +94,9 @@ class Fp8BlockScaledMMLinearKernel(
         replace_parameter(layer, params.WEIGHT, new_weight.data)
         replace_parameter(layer, scale_attr_name, new_weight_scale.data)
 
+    def _get_logical_output_size(self, weight: torch.Tensor) -> int:
+        return weight.shape[0]
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -114,7 +117,7 @@ class Fp8BlockScaledMMLinearKernel(
 
         # View input as 2D matrix for fp8 methods
         input_2d = x.view(-1, x.shape[-1])
-        output_shape = [*x.shape[:-1], weight.shape[0]]
+        output_shape = [*x.shape[:-1], self._get_logical_output_size(weight)]
 
         if self.apply_input_quant:
             q_input, input_scale = self.quant_fp8(

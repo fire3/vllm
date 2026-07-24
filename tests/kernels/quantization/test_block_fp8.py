@@ -3,6 +3,7 @@
 
 # Adapted from https://github.com/sgl-project/sglang/pull/2575
 import itertools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,10 +14,23 @@ from tests.kernels.quant_utils import (
 )
 from tests.kernels.utils import fp8_ulp_distance
 from vllm.config import VllmConfig
-from vllm.model_executor.kernels.linear.scaled_mm.cutlass import cutlass_scaled_mm
+from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+    CutlassFp8BlockScaledMMKernel,
+    _use_triton_for_sm12x_block_fp8,
+    cutlass_scaled_mm,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearLayerConfig,
+)
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
     w8a8_triton_block_scaled_mm,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    create_fp8_quant_key,
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
@@ -30,6 +44,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_fp8_blockscale_gemm,
 )
 from vllm.utils.import_utils import has_deep_gemm
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 if current_platform.get_device_capability() < (9, 0):
     pytest.skip("FP8 Triton requires CUDA 9.0 or higher", allow_module_level=True)
@@ -194,6 +209,10 @@ def test_w8a8_block_fp8_matmul_e8m0_scales():
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="CUTLASS only supported on CUDA platform."
 )
+@pytest.mark.skipif(
+    current_platform.get_device_capability().major == 12,
+    reason="SM12x requires the linear kernel's load-time N padding.",
+)
 @torch.inference_mode()
 def test_w8a8_block_fp8_cutlass_matmul():
     # Test simple case where weight.shape % 128 != 0,
@@ -236,6 +255,173 @@ def test_w8a8_block_fp8_cutlass_matmul():
         torch.abs(out.to(torch.float32) - ref_out.to(torch.float32))
     ) / torch.mean(torch.abs(ref_out.to(torch.float32)))
     assert rel_diff < 0.001
+
+
+@pytest.mark.skipif(
+    current_platform.get_device_capability().major != 12,
+    reason="SM12x-specific CUTLASS output-block padding regression.",
+)
+@torch.inference_mode()
+def test_w8a8_block_fp8_cutlass_sm12x_pads_output_block(
+    default_vllm_config,
+):
+    m, n, k = 32, 576, 7168
+    block_size = [128, 128]
+    torch.manual_seed(0)
+    input_bf16 = torch.randn((m, k), dtype=torch.bfloat16)
+    weight_bf16 = torch.randn((n, k), dtype=torch.bfloat16)
+    bias = torch.randn((n,), dtype=torch.bfloat16)
+    weight, weight_scale = per_block_cast_to_fp8(weight_bf16, block_size)
+    config = FP8ScaledMMLinearLayerConfig(
+        weight_quant_key=create_fp8_quant_key(
+            static=True,
+            group_shape=GroupShape(*block_size),
+        ),
+        activation_quant_key=create_fp8_quant_key(
+            static=False,
+            group_shape=GroupShape(1, block_size[1]),
+        ),
+        weight_shape=(n, k),
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+    )
+    kernel = CutlassFp8BlockScaledMMKernel(config)
+    activation, activation_scale = kernel.quant_fp8(input_bf16)
+    reference = w8a8_triton_block_scaled_mm(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        block_size,
+        torch.bfloat16,
+    )
+    reference += bias
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight",
+        torch.nn.Parameter(weight, requires_grad=False),
+    )
+    layer.register_parameter(
+        "weight_scale_inv",
+        torch.nn.Parameter(weight_scale, requires_grad=False),
+    )
+
+    kernel.process_weights_after_loading(layer)
+    output = kernel.apply_weights(layer, input_bf16, bias=bias)
+
+    current_stream = torch.cuda.current_stream()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(current_stream)
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            kernel.apply_weights(layer, input_bf16, bias=bias)
+    current_stream.wait_stream(capture_stream)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        graph_output = kernel.apply_weights(layer, input_bf16, bias=bias)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    assert layer.weight.shape == (640, k)
+    assert output.shape == (m, n)
+    assert torch.equal(graph_output, output)
+    relative_difference = (output.float() - reference.float()).abs().mean()
+    relative_difference /= reference.float().abs().mean()
+    assert relative_difference < 0.001
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "expected"),
+    [
+        (32, 24576, 7168, True),
+        (64, 24576, 1536, True),
+        (64, 32768, 512, True),
+        (64, 36864, 7168, True),
+        (1, 24576, 7168, False),
+        (128, 24576, 7168, False),
+        (64, 12288, 7168, False),
+    ],
+)
+def test_sm12x_block_fp8_dispatch_policy(m, n, k, expected):
+    assert _use_triton_for_sm12x_block_fp8(m, n, k) is expected
+
+
+@pytest.mark.skipif(
+    current_platform.get_device_capability().major != 12,
+    reason="SM12x-specific merged linear output-block padding regression.",
+)
+@pytest.mark.parametrize("skip_bias_add", [False, True])
+@torch.inference_mode()
+def test_w8a8_block_fp8_cutlass_sm12x_merged_linear(
+    default_vllm_config,
+    dist_init,
+    monkeypatch,
+    skip_bias_add,
+):
+    m, n, k = 7, 576, 128
+    block_size = [128, 128]
+    default_vllm_config.model_config = SimpleNamespace(
+        dtype=torch.bfloat16, hf_text_config=SimpleNamespace(model_type="deepseek_v4")
+    )
+    quant_config = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        weight_block_size=block_size,
+    )
+    monkeypatch.setattr(
+        "vllm.envs.VLLM_DISABLED_KERNELS",
+        ["DeepGemmFp8BlockScaledMMKernel"],
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        layer = MergedColumnParallelLinear(
+            input_size=k,
+            output_sizes=[256, 320],
+            bias=True,
+            skip_bias_add=skip_bias_add,
+            params_dtype=torch.bfloat16,
+            quant_config=quant_config,
+            disable_tp=True,
+        )
+    assert isinstance(
+        layer.quant_method.fp8_linear,
+        CutlassFp8BlockScaledMMKernel,
+    )
+
+    torch.manual_seed(1)
+    input_bf16 = torch.randn((m, k), dtype=torch.bfloat16)
+    weight_bf16 = torch.randn((n, k), dtype=torch.bfloat16)
+    bias = torch.randn((n,), dtype=torch.bfloat16)
+    weight, weight_scale = per_block_cast_to_fp8(weight_bf16, block_size)
+    layer.weight.copy_(weight)
+    layer.weight_scale_inv.copy_(weight_scale)
+    layer.bias.copy_(bias)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    activation, activation_scale = layer.quant_method.fp8_linear.quant_fp8(input_bf16)
+    reference = w8a8_triton_block_scaled_mm(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        block_size,
+        torch.bfloat16,
+    )
+    if not skip_bias_add:
+        reference += bias
+
+    output, output_bias = layer(input_bf16)
+
+    assert layer.output_partition_sizes == [256, 320]
+    assert layer.weight.shape == (640, k)
+    assert output.shape == (m, n)
+    assert output.is_contiguous()
+    if skip_bias_add:
+        assert torch.equal(output_bias, bias)
+    else:
+        assert output_bias is None
+    relative_difference = (output.float() - reference.float()).abs().mean()
+    relative_difference /= reference.float().abs().mean()
+    assert relative_difference < 0.001
 
 
 @pytest.mark.skipif(

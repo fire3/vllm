@@ -287,7 +287,7 @@ def _apply_write_kernel(
     row_idx = tl.load(write_indices_ptr + pid)
     start_idx = tl.load(write_starts_ptr + pid)
 
-    cu_start = tl.load(write_cu_lens_ptr + pid - 1) if pid > 0 else 0
+    cu_start = tl.load(write_cu_lens_ptr + pid - 1, mask=pid > 0, other=0)
     cu_end = tl.load(write_cu_lens_ptr + pid)
     content_len = cu_end - cu_start
 

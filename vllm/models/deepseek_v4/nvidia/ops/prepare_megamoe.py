@@ -7,9 +7,17 @@ routing top-k tensors into the int64/float32 layout that the DeepGEMM
 MegaMoE kernels consume.
 """
 
+from functools import cache
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+
+@cache
+def _prepare_megamoe_num_warps() -> int:
+    return 2 if current_platform.is_device_capability(120) else 4
 
 
 @triton.jit
@@ -180,5 +188,5 @@ def prepare_megamoe_inputs(
         BLOCK_K=block_k,
         GROUP_K=32,
         BLOCK_TOPK=block_topk,
-        num_warps=4,
+        num_warps=_prepare_megamoe_num_warps(),
     )

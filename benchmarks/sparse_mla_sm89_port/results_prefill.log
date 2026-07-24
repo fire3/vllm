@@ -1,0 +1,4 @@
+{'num_tokens': 256, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.013409123755991459, 'flashinfer_ms': 0.048467200994491574, 'triton_ms': 0.48000640869140626, 'speedup_triton_over_flashinfer': 9.903736936365693}
+{'num_tokens': 1024, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.013316435739398003, 'flashinfer_ms': 0.2633903980255127, 'triton_ms': 1.9665760040283202, 'speedup_triton_over_flashinfer': 7.466392164523145}
+{'num_tokens': 4096, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.014373564161360264, 'flashinfer_ms': 1.1800399780273438, 'triton_ms': 7.798719787597657, 'speedup_triton_over_flashinfer': 6.608860659648723}
+{'num_tokens': 8192, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.012571821920573711, 'flashinfer_ms': 2.2429359436035154, 'triton_ms': 16.08240509033203, 'speedup_triton_over_flashinfer': 7.170247164746906}

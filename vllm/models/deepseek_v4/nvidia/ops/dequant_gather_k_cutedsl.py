@@ -12,6 +12,17 @@ from cutlass.cute.nvgpu import cpasync
 from quack.compile_utils import make_fake_tensor
 
 from vllm.cute_utils import _bf16x2_mul, cvt
+from vllm.platforms import current_platform
+
+_MAX_WORKER_CTAS_PER_REQUEST = 1024
+
+
+def _select_worker_ctas(max_gather_tokens: int, num_reqs: int) -> int:
+    if num_reqs <= 1:
+        return _MAX_WORKER_CTAS_PER_REQUEST
+    required = max(1, (max_gather_tokens + 3) // 4)
+    bucket = 1 << (required - 1).bit_length()
+    return min(bucket, _MAX_WORKER_CTAS_PER_REQUEST)
 
 
 def dequantize_and_gather_k_cache_cutedsl(
@@ -22,10 +33,20 @@ def dequantize_and_gather_k_cache_cutedsl(
     block_table: torch.Tensor,
     block_size: int,
     offset: int,
+    max_gather_tokens: int | None = None,
 ) -> None:
+    output_capacity = out.shape[1] - offset
+    if max_gather_tokens is None:
+        max_gather_tokens = output_capacity
+    if not 0 <= max_gather_tokens <= output_capacity:
+        raise ValueError("max_gather_tokens must fit in the output capacity")
+    num_worker_ctas = _MAX_WORKER_CTAS_PER_REQUEST
+    if current_platform.is_device_capability_family(120):
+        num_worker_ctas = _select_worker_ctas(max_gather_tokens, out.shape[0])
     DequantGatherKCacheKernel.compile(
         block_size=block_size,
         has_gather_lens=gather_lens is not None,
+        num_worker_ctas=num_worker_ctas,
     )(out, k_cache, seq_lens, gather_lens, block_table, offset)
 
 
@@ -34,11 +55,17 @@ class DequantGatherKCacheKernel:
     head_dim = 512
     group_size = 64  # 1 scale per 64 elems
 
-    def __init__(self, fp8_dim: int = 448, block_size: int = 64):
+    def __init__(
+        self,
+        fp8_dim: int = 448,
+        block_size: int = 64,
+        num_worker_ctas: int = _MAX_WORKER_CTAS_PER_REQUEST,
+    ):
         self.fp8_dim = fp8_dim
         self.bf16_dim = self.head_dim - fp8_dim
         self.data_dim = fp8_dim + self.bf16_dim * 2
         self.block_size = block_size
+        self.num_worker_ctas = num_worker_ctas
 
         self.num_warps = 4
         self.tb_size = self.num_warps * 32
@@ -73,7 +100,7 @@ class DequantGatherKCacheKernel:
             ),
         )
 
-        grid = (out.shape[0], 1024, 1)
+        grid = (out.shape[0], self.num_worker_ctas, 1)
         self.kernel(
             out,
             k_data,
@@ -300,6 +327,7 @@ class DequantGatherKCacheKernel:
         fp8_dim: int = 448,
         block_size: int = 64,
         has_gather_lens: bool = True,
+        num_worker_ctas: int = _MAX_WORKER_CTAS_PER_REQUEST,
     ):
         num_reqs = cute.sym_int()
         head_dim = DequantGatherKCacheKernel.head_dim
@@ -316,7 +344,7 @@ class DequantGatherKCacheKernel:
         gather_lens = make_fake_tensor(Int32, (num_reqs,)) if has_gather_lens else None
         block_table = make_fake_tensor(Int32, (num_reqs, cute.sym_int()))
 
-        kernel = DequantGatherKCacheKernel(fp8_dim, block_size)
+        kernel = DequantGatherKCacheKernel(fp8_dim, block_size, num_worker_ctas)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
             kernel,

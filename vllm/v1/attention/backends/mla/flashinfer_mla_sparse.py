@@ -171,7 +171,9 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 12 or capability == DeviceCapability(8, 9)
+        return capability.major == 12 or (
+            capability.major == 8 and capability.minor == 9
+        )
 
     @classmethod
     def supports_combination(

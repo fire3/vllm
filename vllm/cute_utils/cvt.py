@@ -37,7 +37,7 @@ def bf16x2_to_fp32x2(data, *, loc=None, ip=None) -> tuple[Float32, Float32]:
             Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
         )
 
-    elif isinstance(data, (cute.Tensor, cute.TensorSSA)):
+    elif isinstance(data, cute.Tensor | cute.TensorSSA):
         # NOTE: the output is always 1D
         size = cute.size(data.shape)
         out = cute.make_rmem_tensor(size * 2, Float32)
@@ -109,6 +109,40 @@ def fp32x4_to_fp8x4(
         "cvt.rn.satfinite.e4m3x2.f32 t0, $2, $1;\n\t"
         "cvt.rn.satfinite.e4m3x2.f32 t1, $4, $3;\n\t"
         "mov.b32 $0, {t0, t1};\n\t"
+        "}\n",
+        "=r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+    )
+    return Uint32(out)
+
+
+@dsl_user_op
+def fp32x4_to_fp4x4(
+    a0: Float32,
+    a1: Float32,
+    a2: Float32,
+    a3: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    # Pack four FP32 values into the low 16 bits as four E2M1 nibbles.
+    out = llvm.inline_asm(
+        T.i32(),
+        [
+            a0.ir_value(loc=loc, ip=ip),
+            a1.ir_value(loc=loc, ip=ip),
+            a2.ir_value(loc=loc, ip=ip),
+            a3.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b8 t0, t1;\n\t"
+        ".reg .b16 packed;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 t0, $2, $1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 t1, $4, $3;\n\t"
+        "mov.b16 packed, {t0, t1};\n\t"
+        "cvt.u32.u16 $0, packed;\n\t"
         "}\n",
         "=r,f,f,f,f",
         has_side_effects=False,

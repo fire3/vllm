@@ -1,0 +1,6 @@
+{'num_tokens': 1, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.031433992087841034, 'flashinfer_ms': 0.0827347183227539, 'triton_ms': 0.053982720375061036, 'speedup_triton_over_flashinfer': 0.6524796538796528}
+{'num_tokens': 8, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.028259331360459328, 'flashinfer_ms': 0.0809324836730957, 'triton_ms': 0.06154047966003418, 'speedup_triton_over_flashinfer': 0.7603928221035433}
+{'num_tokens': 32, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.0446372926235199, 'flashinfer_ms': 0.08001407623291015, 'triton_ms': 0.07916863918304444, 'speedup_triton_over_flashinfer': 0.9894338960134369}
+{'num_tokens': 64, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.0446372926235199, 'flashinfer_ms': 0.08112192153930664, 'triton_ms': 0.1579526424407959, 'speedup_triton_over_flashinfer': 1.9471018368846438}
+{'num_tokens': 128, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.012964191846549511, 'flashinfer_ms': 0.0316812801361084, 'triton_ms': 0.24585535049438476, 'speedup_triton_over_flashinfer': 7.760271978851439}
+{'num_tokens': 256, 'num_heads': 64, 'topk': 128, 'rel_diff': 0.014911080710589886, 'flashinfer_ms': 0.047260799407958985, 'triton_ms': 0.45581119537353515, 'speedup_triton_over_flashinfer': 9.6445934280319}

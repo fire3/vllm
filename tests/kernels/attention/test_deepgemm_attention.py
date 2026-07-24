@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import random
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,6 +18,678 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
+
+
+@pytest.mark.parametrize(
+    ("has_extension", "capability", "expected"),
+    [
+        (False, (8, 9), True),
+        (False, (9, 0), False),
+        (False, (12, 0), True),
+        (True, (9, 0), True),
+    ],
+)
+def test_mqa_backend_availability(
+    monkeypatch: pytest.MonkeyPatch,
+    has_extension: bool,
+    capability: tuple[int, int],
+    expected: bool,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "has_deep_gemm", lambda: has_extension)
+    monkeypatch.setattr(
+        deep_gemm,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability_family=lambda family: capability[0] == family // 10,
+            is_device_capability=lambda requested: capability == requested,
+        ),
+    )
+
+    assert deep_gemm.is_mqa_backend_available() is expected
+
+
+def test_sm89_sparse_indexer_allows_mqa_fallback_without_deepgemm(
+    monkeypatch: pytest.MonkeyPatch,
+    default_vllm_config,
+):
+    import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+    import vllm.utils.deep_gemm as deep_gemm
+
+    sm89 = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability_family=lambda _: False,
+        is_device_capability=lambda capability: capability == (8, 9),
+    )
+    default_vllm_config.parallel_config.decode_context_parallel_size = 1
+    default_vllm_config.parallel_config.cp_kv_cache_interleave_size = 1
+    monkeypatch.setattr(deep_gemm, "current_platform", sm89)
+    monkeypatch.setattr(deep_gemm, "has_deep_gemm", lambda: False)
+    monkeypatch.setattr(sparse_indexer, "current_platform", sm89)
+
+    sparse_indexer.SparseAttnIndexer(
+        k_cache=torch.empty(0),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty(0, dtype=torch.int32),
+    )
+
+
+def test_sm12x_direct_mqa_topk_dispatch(monkeypatch: pytest.MonkeyPatch):
+    import vllm.utils.deep_gemm as deep_gemm
+    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+    monkeypatch.setattr(
+        deep_gemm,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True,
+            is_device_capability_family=lambda _: False,
+            is_device_capability=lambda capability: capability == (8, 9),
+        ),
+    )
+    backend = Mock(return_value=True)
+    monkeypatch.setattr(sm12x_deep_gemm_fallbacks, "fp8_fp4_mqa_topk_indices", backend)
+
+    q = (torch.empty(0), None)
+    kv = (torch.empty(0), torch.empty(0))
+    weights = torch.empty(0)
+    cu_seqlen_ks = torch.empty(0, dtype=torch.int32)
+    cu_seqlen_ke = torch.empty(0, dtype=torch.int32)
+    topk_indices = torch.empty(0, dtype=torch.int32)
+
+    assert deep_gemm.fp8_fp4_mqa_topk_indices(
+        q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices
+    )
+    backend.assert_called_once_with(
+        q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices
+    )
+
+
+def test_sm120_deepgemm_mqa_skips_portable_direct_topk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    monkeypatch.setattr(
+        deep_gemm, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(deep_gemm, "_use_sm12x_mqa_fallback", lambda: True)
+    monkeypatch.setattr(deep_gemm, "_can_use_sm120_deep_gemm_mqa", lambda *args: True)
+
+    q = (torch.empty(0), None)
+    kv = (torch.empty(0), torch.empty(0))
+    weights = torch.empty(0)
+    cu_seqlen_ks = torch.empty(0, dtype=torch.int32)
+    cu_seqlen_ke = torch.empty(0, dtype=torch.int32)
+    topk_indices = torch.empty(0, dtype=torch.int32)
+
+    assert not deep_gemm.fp8_fp4_mqa_topk_indices(
+        q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices
+    )
+
+
+@pytest.mark.parametrize("clean_logits", [False, True])
+def test_sm120_deepgemm_mqa_logits_uses_vendored_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_logits: bool,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "_can_use_sm120_deep_gemm_mqa", lambda *args: True)
+    backend_output = torch.empty(0)
+    vendored_backend = Mock(return_value=backend_output)
+    external_backend = Mock()
+    monkeypatch.setattr(
+        deep_gemm,
+        "_get_vendored_sm120_mqa_logits_impl",
+        lambda: vendored_backend,
+    )
+    monkeypatch.setattr(deep_gemm, "_fp8_fp4_mqa_logits_impl", external_backend)
+
+    q = (torch.empty(0), None)
+    kv = (torch.empty(0), torch.empty(0))
+    weights = torch.empty(0)
+    cu_seqlen_ks = torch.empty(0, dtype=torch.int32)
+    cu_seqlen_ke = torch.empty(0, dtype=torch.int32)
+
+    output = deep_gemm.fp8_fp4_mqa_logits(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=clean_logits,
+    )
+
+    assert output is backend_output
+    vendored_backend.assert_called_once_with(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=clean_logits,
+    )
+    external_backend.assert_not_called()
+
+
+def test_sm120_mqa_resolver_imports_vendored_directly(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    vendored_backend = Mock()
+    vendored = SimpleNamespace(fp8_fp4_mqa_logits=vendored_backend)
+    imported: list[str] = []
+
+    def import_module(name: str):
+        imported.append(name)
+        assert name == "vllm.third_party.deep_gemm"
+        return vendored
+
+    monkeypatch.setattr(deep_gemm.importlib, "import_module", import_module)
+    monkeypatch.setattr(
+        deep_gemm,
+        "current_platform",
+        SimpleNamespace(is_arch_support_pdl=lambda: False),
+    )
+    deep_gemm._get_vendored_sm120_mqa_logits_impl.cache_clear()
+    try:
+        assert deep_gemm._get_vendored_sm120_mqa_logits_impl() is vendored_backend
+        assert imported == ["vllm.third_party.deep_gemm"]
+    finally:
+        deep_gemm._get_vendored_sm120_mqa_logits_impl.cache_clear()
+
+
+def test_sm120_mqa_resolver_propagates_vendored_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    def import_module(name: str):
+        assert name == "vllm.third_party.deep_gemm"
+        raise RuntimeError("broken vendored extension")
+
+    monkeypatch.setattr(deep_gemm.importlib, "import_module", import_module)
+    deep_gemm._get_vendored_sm120_mqa_logits_impl.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="broken vendored extension"):
+            deep_gemm._get_vendored_sm120_mqa_logits_impl()
+    finally:
+        deep_gemm._get_vendored_sm120_mqa_logits_impl.cache_clear()
+
+
+def test_sm120_paged_mqa_resolver_imports_vendored_directly(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    metadata_backend = Mock()
+    logits_backend = Mock()
+    vendored = SimpleNamespace(
+        get_paged_mqa_logits_metadata=metadata_backend,
+        fp8_fp4_paged_mqa_logits=logits_backend,
+    )
+    imported: list[str] = []
+
+    def import_module(name: str):
+        imported.append(name)
+        assert name == "vllm.third_party.deep_gemm"
+        return vendored
+
+    monkeypatch.setattr(deep_gemm.importlib, "import_module", import_module)
+    monkeypatch.setattr(
+        deep_gemm,
+        "current_platform",
+        SimpleNamespace(is_arch_support_pdl=lambda: False),
+    )
+    deep_gemm._get_vendored_sm120_paged_mqa_impls.cache_clear()
+    try:
+        assert deep_gemm._get_vendored_sm120_paged_mqa_impls() == (
+            metadata_backend,
+            logits_backend,
+        )
+        assert imported == ["vllm.third_party.deep_gemm"]
+    finally:
+        deep_gemm._get_vendored_sm120_paged_mqa_impls.cache_clear()
+
+
+def test_sm120_paged_mqa_logits_uses_vendored_backend(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    backend_output = torch.empty(0)
+    vendored_backend = Mock(return_value=backend_output)
+    external_backend = Mock()
+    fallback = Mock()
+    monkeypatch.setattr(
+        deep_gemm,
+        "_can_use_sm120_deep_gemm_paged_mqa",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        deep_gemm,
+        "_get_vendored_sm120_paged_mqa_impls",
+        lambda: (Mock(), vendored_backend),
+    )
+    monkeypatch.setattr(deep_gemm, "_fp8_fp4_paged_mqa_logits_impl", external_backend)
+    monkeypatch.setattr(deep_gemm, "_fp8_paged_mqa_logits_sm12x", fallback)
+
+    q = (torch.empty(0), None)
+    kv_cache = torch.empty(0)
+    weights = torch.empty(0)
+    context_lens = torch.empty(0, dtype=torch.int32)
+    block_tables = torch.empty(0, dtype=torch.int32)
+    schedule_metadata = torch.empty(0, dtype=torch.int32)
+    output = deep_gemm.fp8_fp4_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        1024,
+        clean_logits=False,
+    )
+
+    assert output is backend_output
+    vendored_backend.assert_called_once_with(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        1024,
+        clean_logits=False,
+        logits_dtype=torch.float32,
+    )
+    external_backend.assert_not_called()
+    fallback.assert_not_called()
+
+
+def test_sm120_paged_mqa_logits_falls_back_without_deepgemm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    backend_output = torch.empty(0)
+    fallback = Mock(return_value=backend_output)
+    monkeypatch.setattr(
+        deep_gemm,
+        "_can_use_sm120_deep_gemm_paged_mqa",
+        lambda *args: False,
+    )
+    monkeypatch.setattr(deep_gemm, "_use_sm12x_mqa_fallback", lambda: True)
+    monkeypatch.setattr(deep_gemm, "_fp8_paged_mqa_logits_sm12x", fallback)
+
+    q = (torch.empty(0), None)
+    kv_cache = torch.empty(0)
+    weights = torch.empty(0)
+    context_lens = torch.empty(0, dtype=torch.int32)
+    block_tables = torch.empty(0, dtype=torch.int32)
+    schedule_metadata = torch.empty(0, dtype=torch.int32)
+    output = deep_gemm.fp8_fp4_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        1024,
+        clean_logits=False,
+    )
+
+    assert output is backend_output
+    fallback.assert_called_once_with(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        1024,
+    )
+
+
+def test_sm120_paged_mqa_metadata_uses_vendored_backend(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    backend_output = torch.empty((1, 2), dtype=torch.int32)
+    vendored_backend = Mock(return_value=backend_output)
+    external_backend = Mock()
+    monkeypatch.setattr(
+        deep_gemm,
+        "is_sm120_deep_gemm_paged_mqa_supported",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        deep_gemm,
+        "_get_vendored_sm120_paged_mqa_impls",
+        lambda: (vendored_backend, Mock()),
+    )
+    monkeypatch.setattr(
+        deep_gemm, "_get_paged_mqa_logits_metadata_impl", external_backend
+    )
+    context_lens = torch.ones((2, 1), dtype=torch.int32)
+
+    output = deep_gemm.get_paged_mqa_logits_metadata(context_lens, 64, 188)
+
+    assert output is backend_output
+    vendored_backend.assert_called_once_with(context_lens, 64, 188)
+    external_backend.assert_not_called()
+
+
+def test_sm120_paged_mqa_enables_scheduler_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.backends.mla import indexer
+
+    monkeypatch.setattr(indexer.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer.current_platform,
+        "is_device_capability_family",
+        lambda family: family == 120,
+    )
+    monkeypatch.setattr(
+        indexer,
+        "is_sm120_deep_gemm_paged_mqa_supported",
+        lambda: True,
+    )
+    assert indexer._uses_deep_gemm_scheduler_metadata()
+
+    monkeypatch.setattr(
+        indexer,
+        "is_sm120_deep_gemm_paged_mqa_supported",
+        lambda: False,
+    )
+    assert not indexer._uses_deep_gemm_scheduler_metadata()
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True)])
+def test_sm120_deepgemm_mqa_policy_honors_global_opt_out(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+    expected: bool,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM", value)
+    assert deep_gemm._sm120_deep_gemm_mqa_enabled() is expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform.is_device_capability_family(120),
+    reason="requires SM120",
+)
+def test_sm120_deepgemm_mqa_eligibility_guard(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "_sm120_deep_gemm_mqa_enabled", lambda: True)
+    monkeypatch.setattr(
+        deep_gemm,
+        "_get_vendored_sm120_mqa_logits_impl",
+        lambda: Mock(),
+    )
+
+    m, n, h, d = 2, 4, 16, 32
+    q_values = torch.empty((m, h, d), device="cuda", dtype=torch.float8_e4m3fn)
+    k_values = torch.empty((n, d), device="cuda", dtype=torch.float8_e4m3fn)
+    k_scale = torch.empty(n, device="cuda", dtype=torch.float32)
+    weights = torch.empty((m, h), device="cuda", dtype=torch.float32)
+    cu_seqlen_ks = torch.zeros(m, device="cuda", dtype=torch.int32)
+    cu_seqlen_ke = torch.full((m,), n, device="cuda", dtype=torch.int32)
+
+    def eligible(
+        q: tuple[torch.Tensor, torch.Tensor | None] = (q_values, None),
+        kv: tuple[torch.Tensor, torch.Tensor] = (k_values, k_scale),
+        query_weights: torch.Tensor = weights,
+    ) -> bool:
+        return deep_gemm._can_use_sm120_deep_gemm_mqa(
+            q,
+            kv,
+            query_weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+        )
+
+    assert eligible()
+
+    invalid_q = torch.empty((m, 8, d), device="cuda", dtype=torch.float8_e4m3fn)
+    invalid_weights = torch.empty((m, 8), device="cuda", dtype=torch.float32)
+    assert not eligible((invalid_q, None), query_weights=invalid_weights)
+
+    noncontiguous_k = torch.empty((n, d * 2), device="cuda", dtype=torch.float8_e4m3fn)[
+        :, ::2
+    ]
+    assert not eligible(kv=(noncontiguous_k, k_scale))
+
+    monkeypatch.setattr(
+        deep_gemm,
+        "_get_vendored_sm120_mqa_logits_impl",
+        lambda: None,
+    )
+    assert not eligible()
+
+    monkeypatch.setattr(deep_gemm, "_sm120_deep_gemm_mqa_enabled", lambda: False)
+    assert not eligible()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform.is_device_capability_family(120),
+    reason="requires SM120",
+)
+def test_sm120_deepgemm_paged_mqa_eligibility_guard(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    monkeypatch.setattr(
+        deep_gemm,
+        "is_sm120_deep_gemm_paged_mqa_supported",
+        lambda: True,
+    )
+    batch_size, next_n, num_heads, head_dim = 2, 1, 16, 32
+    q_values = torch.empty(
+        (batch_size, next_n, num_heads, head_dim),
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    kv_cache = torch.empty(
+        (4, 64, 1, head_dim + 4),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    weights = torch.empty(
+        (batch_size * next_n, num_heads),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    context_lens = torch.ones(
+        (batch_size, next_n),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_tables = torch.zeros((batch_size, 1), device="cuda", dtype=torch.int32)
+    schedule_metadata = torch.zeros((189, 2), device="cuda", dtype=torch.int32)
+
+    def eligible(
+        query: tuple[torch.Tensor, torch.Tensor | None] = (q_values, None),
+        cache: torch.Tensor = kv_cache,
+        indices: torch.Tensor | None = None,
+    ) -> bool:
+        return deep_gemm._can_use_sm120_deep_gemm_paged_mqa(
+            query,
+            cache,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            64,
+            indices,
+        )
+
+    assert eligible()
+    assert not eligible((q_values, torch.empty(0, device="cuda")))
+    assert not eligible(
+        indices=torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    )
+    assert not eligible(cache=kv_cache[:, :32])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sm12x_mqa_logits_rejects_output_on_wrong_device() -> None:
+    from vllm.models.deepseek_v4.nvidia.ops.sm12x_mqa import fp8_mqa_logits_triton
+
+    q = torch.empty((0, 16, 32), device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.empty((0, 32), device="cuda", dtype=torch.float8_e4m3fn)
+    k_scale = torch.empty(0, device="cuda", dtype=torch.float32)
+    weights = torch.empty((0, 16), device="cuda", dtype=torch.float32)
+    cu_seqlen_ks = torch.empty(0, device="cuda", dtype=torch.int32)
+    cu_seqlen_ke = torch.empty(0, device="cuda", dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="device cuda"):
+        fp8_mqa_logits_triton(
+            q,
+            (k, k_scale),
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            out=torch.empty((0, 0), dtype=torch.float32),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sm12x_direct_topk_handles_topk_wider_than_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.models.deepseek_v4.nvidia.ops import (
+        sm12x_deep_gemm_fallbacks,
+        sm12x_mqa,
+    )
+
+    logits = torch.randn((4, 2), device="cuda", dtype=torch.float32)
+    monkeypatch.setattr(sm12x_mqa, "fp8_mqa_logits_triton", lambda *args: logits)
+    q = torch.empty((4, 16, 32), device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.empty((2, 32), device="cuda", dtype=torch.float8_e4m3fn)
+    k_scale = torch.ones(2, device="cuda", dtype=torch.float32)
+    weights = torch.empty((4, 16), device="cuda", dtype=torch.float32)
+    row_starts = torch.zeros(4, device="cuda", dtype=torch.int32)
+    row_ends = torch.tensor([0, 1, 2, 2], device="cuda", dtype=torch.int32)
+    output = torch.empty((4, 4), device="cuda", dtype=torch.int32)
+
+    assert sm12x_deep_gemm_fallbacks._fp8_mqa_logits_topk_triton(
+        (q, None),
+        (k, k_scale),
+        weights,
+        row_starts,
+        row_ends,
+        output,
+    )
+    actual = output.sort(dim=1).values
+    expected = torch.tensor(
+        [
+            [-1, -1, -1, -1],
+            [-1, -1, -1, 0],
+            [-1, -1, 0, 1],
+            [-1, -1, 0, 1],
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sm120_mqa_logits_falls_back_without_deepgemm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import vllm.utils.deep_gemm as deep_gemm
+
+    monkeypatch.setattr(deep_gemm, "_can_use_sm120_deep_gemm_mqa", lambda *args: False)
+    monkeypatch.setattr(deep_gemm, "_use_sm12x_mqa_fallback", lambda: True)
+    backend_output = torch.empty(0)
+    fallback = Mock(return_value=backend_output)
+    monkeypatch.setattr(deep_gemm, "_fp8_mqa_logits_sm12x", fallback)
+
+    q = (torch.empty(0), None)
+    kv = (torch.empty(0), torch.empty(0))
+    weights = torch.empty(0)
+    cu_seqlen_ks = torch.empty(0, dtype=torch.int32)
+    cu_seqlen_ke = torch.empty(0, dtype=torch.int32)
+
+    output = deep_gemm.fp8_fp4_mqa_logits(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=False,
+    )
+
+    assert output is backend_output
+    fallback.assert_called_once_with(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        False,
+    )
+
+
+def test_sm12x_direct_paged_mqa_topk_dispatch(monkeypatch: pytest.MonkeyPatch):
+    import vllm.utils.deep_gemm as deep_gemm
+    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+    monkeypatch.setattr(
+        deep_gemm, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(deep_gemm, "_use_sm12x_mqa_fallback", lambda: True)
+    backend = Mock(return_value=True)
+    monkeypatch.setattr(
+        sm12x_deep_gemm_fallbacks,
+        "fp8_fp4_paged_mqa_topk_indices",
+        backend,
+    )
+
+    q = (torch.empty(0), None)
+    kv_cache = torch.empty(0)
+    weights = torch.empty(0)
+    context_lens = torch.empty(0, dtype=torch.int32)
+    block_tables = torch.empty(0, dtype=torch.int32)
+    topk_indices = torch.empty(0, dtype=torch.int32)
+
+    assert deep_gemm.fp8_fp4_paged_mqa_topk_indices(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        1024,
+        topk_indices,
+    )
+    backend.assert_called_once_with(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        1024,
+        topk_indices,
+    )
 
 
 def kv_cache_cast_to_fp8(x: torch.Tensor) -> torch.Tensor:

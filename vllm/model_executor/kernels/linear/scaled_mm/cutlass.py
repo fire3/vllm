@@ -29,6 +29,14 @@ from .ScaledMMLinearKernel import (
     Int8ScaledMMLinearLayerConfig,
 )
 
+_SM12X_BLOCK_FP8_TRITON_M = frozenset((4, 7, 8, 16, 32))
+
+
+def _use_triton_for_sm12x_block_fp8(m: int, n: int, k: int) -> bool:
+    if m == 64 and n >= 24576:
+        return True
+    return n == 24576 and k == 7168 and m in _SM12X_BLOCK_FP8_TRITON_M
+
 
 class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     @classmethod
@@ -275,6 +283,13 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     def __init__(self, config: FP8ScaledMMLinearLayerConfig) -> None:
         super().__init__(config)
+        self.logical_output_size = config.weight_shape[0]
+        capability = current_platform.get_device_capability()
+        self.is_sm12x = capability is not None and capability.major == 12
+        block_n = config.weight_quant_key.scale.group_shape[0]
+        self.output_padding = (
+            -self.logical_output_size % block_n if self.is_sm12x else 0
+        )
         act_scale_descriptor = config.activation_quant_key.scale
         self.quant_fp8 = QuantFP8(
             static=act_scale_descriptor.static,
@@ -309,6 +324,29 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             )
         return True, None
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if self.output_padding == 0:
+            return
+
+        params = self._get_layer_params(layer)
+        expected_padded_size = self.logical_output_size + self.output_padding
+        if params.weight.shape[0] == expected_padded_size:
+            return
+        if params.weight.shape[0] != self.logical_output_size:
+            raise ValueError(
+                "Unexpected block FP8 weight output size: "
+                f"expected {self.logical_output_size}, got {params.weight.shape[0]}"
+            )
+        padded_weight = params.weight.new_zeros(
+            (expected_padded_size, params.weight.shape[1])
+        )
+        padded_weight[: self.logical_output_size].copy_(params.weight)
+        replace_parameter(layer, params.WEIGHT, padded_weight)
+
+    def _get_logical_output_size(self, weight: torch.Tensor) -> int:
+        return self.logical_output_size
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -317,13 +355,26 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         Bs: torch.Tensor,
     ) -> torch.Tensor:
         out_dtype = self.config.out_dtype
-        return ops.cutlass_scaled_mm(
+        n, k = self.config.weight_shape
+        if self.is_sm12x and _use_triton_for_sm12x_block_fp8(A.shape[0], n, k):
+            return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+                A,
+                B[: self.logical_output_size],
+                As,
+                Bs,
+                list(self.weight_group_shape),
+                out_dtype,
+            )
+        output = ops.cutlass_scaled_mm(
             A,
             B.T,
             out_dtype=out_dtype,
             scale_a=As,
             scale_b=Bs.T,
         )
+        if self.output_padding:
+            output = output[..., : self.logical_output_size].contiguous()
+        return output
 
 
 def cutlass_scaled_mm(

@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -129,12 +130,25 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     c128a_decode_topk_lens: torch.Tensor | None = None
     # Prefill: local topk indices (used by combine_topk_swa_indices).
     c128a_prefill_topk_indices: torch.Tensor | None = None
+    # SM120 FlashInfer prefill: global slot ids + valid-entry counts.
+    c128a_global_prefill_topk_indices: torch.Tensor | None = None
+    c128a_global_prefill_topk_lens: torch.Tensor | None = None
 
 
 class DeepseekV4FlashMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if current_platform.is_cuda() and current_platform.is_device_capability_family(
+            100
+        ):
+            return AttentionCGSupport.ALWAYS
+        return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
         self,
@@ -193,6 +207,9 @@ class DeepseekV4FlashMLAMetadataBuilder(
                 dtype=torch.int32,
                 device=device,
             )
+            self.c128a_prefill_lens_buffer = torch.empty(
+                max_num_batched_tokens, dtype=torch.int32, device=device
+            )
 
     def build(
         self,
@@ -235,6 +252,12 @@ class DeepseekV4FlashMLAMetadataBuilder(
             ),
             c128a_decode_topk_lens=c128a_fields.get("c128a_decode_topk_lens"),
             c128a_prefill_topk_indices=c128a_fields.get("c128a_prefill_topk_indices"),
+            c128a_global_prefill_topk_indices=c128a_fields.get(
+                "c128a_global_prefill_topk_indices"
+            ),
+            c128a_global_prefill_topk_lens=c128a_fields.get(
+                "c128a_global_prefill_topk_lens"
+            ),
         )
 
     def _build_c128a_metadata(
@@ -324,6 +347,7 @@ def build_c128a_topk_metadata(
         decode_lens_buffer,
         prefill_buffer,
         prefill_buffer.stride(0),
+        decode_lens_buffer,
         positions,
         compress_ratio,
         max_compressed_tokens,
@@ -334,8 +358,57 @@ def build_c128a_topk_metadata(
         block_size,
         slot_mapping,
         BLOCK_SIZE=1024,
+        PREFILL_GLOBAL=False,
     )
     return global_decode, decode_lens, prefill_local
+
+
+def build_c128a_global_prefill_metadata(
+    positions: torch.Tensor,
+    compress_ratio: int,
+    num_decode_tokens: int,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    slot_mapping: torch.Tensor,
+    global_decode_buffer: torch.Tensor,
+    decode_lens_buffer: torch.Tensor,
+    prefill_buffer: torch.Tensor,
+    prefill_lens_buffer: torch.Tensor,
+    max_compressed_tokens: int = 8192,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build global C128A metadata for SM120 FlashInfer prefill."""
+    num_tokens = positions.shape[0]
+    num_prefill_tokens = num_tokens - num_decode_tokens
+
+    global_decode = global_decode_buffer[:num_decode_tokens]
+    decode_lens = decode_lens_buffer[:num_decode_tokens]
+    global_prefill = prefill_buffer[:num_prefill_tokens]
+    prefill_lens = prefill_lens_buffer[:num_prefill_tokens]
+
+    if num_tokens == 0:
+        return global_decode, decode_lens, global_prefill, prefill_lens
+
+    _build_c128a_topk_metadata_kernel[(num_tokens,)](
+        global_decode_buffer,
+        global_decode_buffer.stride(0),
+        decode_lens_buffer,
+        prefill_buffer,
+        prefill_buffer.stride(0),
+        prefill_lens_buffer,
+        positions,
+        compress_ratio,
+        max_compressed_tokens,
+        num_decode_tokens,
+        token_to_req_indices,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        slot_mapping,
+        BLOCK_SIZE=1024,
+        PREFILL_GLOBAL=True,
+    )
+    return global_decode, decode_lens, global_prefill, prefill_lens
 
 
 @triton.jit
@@ -345,8 +418,9 @@ def _build_c128a_topk_metadata_kernel(
     global_decode_stride,
     decode_lens_ptr,
     # Prefill output
-    prefill_local_ptr,
-    prefill_local_stride,
+    prefill_ptr,
+    prefill_stride,
+    prefill_lens_ptr,
     # Inputs
     positions_ptr,
     compress_ratio,
@@ -358,6 +432,7 @@ def _build_c128a_topk_metadata_kernel(
     block_size,
     slot_mapping_ptr,
     BLOCK_SIZE: tl.constexpr,
+    PREFILL_GLOBAL: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     position = tl.load(positions_ptr + token_idx)
@@ -395,13 +470,31 @@ def _build_c128a_topk_metadata_kernel(
             tl.where(is_valid_token, count, 0),
         )
     else:
-        # --- Prefill: write local indices ---
         pfx_idx = token_idx - num_decode_tokens
+        if PREFILL_GLOBAL:
+            req_idx = tl.load(token_to_req_indices_ptr + token_idx)
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
+            is_valid = offset < num_compressed
+            if PREFILL_GLOBAL:
+                block_indices = offset // block_size
+                block_numbers = tl.load(
+                    block_table_ptr + req_idx * block_table_stride + block_indices,
+                    mask=mask & is_valid,
+                )
+                values = block_numbers * block_size + offset % block_size
+                values = tl.where(is_valid, values, -1)
+            else:
+                values = tl.where(is_valid, offset, -1)
             tl.store(
-                prefill_local_ptr + pfx_idx * prefill_local_stride + offset,
-                tl.where(offset < num_compressed, offset, -1),
+                prefill_ptr + pfx_idx * prefill_stride + offset,
+                values,
                 mask=mask,
+            )
+        if PREFILL_GLOBAL:
+            is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
+            tl.store(
+                prefill_lens_ptr + pfx_idx,
+                tl.where(is_valid_token, num_compressed, 0),
             )

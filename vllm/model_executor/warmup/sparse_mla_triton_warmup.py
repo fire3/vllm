@@ -102,29 +102,87 @@ def _warm_sparse_swa_prefill_metadata_kernel(
     prefill_tokens: int,
 ) -> None:
     from vllm.v1.attention.backends.mla.sparse_swa import (
+        _SM120_TILED_SWA_PREFILL_MIN_TOKENS,
         _compute_prefill_metadata_kernel,
+        _use_fused_prefill_metadata,
+        build_swa_prefill_indices_and_metadata,
     )
 
-    for num_prefills in _SPARSE_PREFILL_METADATA_NUM_PREFILLS:
-        for num_decodes in _SPARSE_PREFILL_METADATA_NUM_DECODES:
-            query_lens = [1] * num_decodes
-            query_lens += [prefill_tokens] * num_prefills
-            query_start_locs = [0]
-            for query_len in query_lens:
-                query_start_locs.append(query_start_locs[-1] + query_len)
-            query_start_loc = torch.tensor(
-                query_start_locs,
+    use_fused_prefill_metadata = _use_fused_prefill_metadata()
+    warmup_cases = [
+        (prefill_tokens, num_prefills, num_decodes)
+        for num_prefills in _SPARSE_PREFILL_METADATA_NUM_PREFILLS
+        for num_decodes in _SPARSE_PREFILL_METADATA_NUM_DECODES
+    ]
+    if use_fused_prefill_metadata:
+        warmup_cases.extend(
+            (
+                _SM120_TILED_SWA_PREFILL_MIN_TOKENS // num_prefills,
+                num_prefills,
+                0,
+            )
+            for num_prefills in _SPARSE_PREFILL_METADATA_NUM_PREFILLS
+        )
+
+    for case_prefill_tokens, num_prefills, num_decodes in warmup_cases:
+        query_lens = [1] * num_decodes
+        query_lens += [case_prefill_tokens] * num_prefills
+        query_start_locs = [0]
+        for query_len in query_lens:
+            query_start_locs.append(query_start_locs[-1] + query_len)
+        query_start_loc = torch.tensor(
+            query_start_locs,
+            dtype=torch.int32,
+            device=device,
+        )
+        seq_lens = torch.tensor(
+            [1] * num_decodes + [window_size + q for q in query_lens[num_decodes:]],
+            dtype=torch.int32,
+            device=device,
+        )
+        prefill_gather_lens = torch.empty(
+            num_prefills, dtype=torch.int32, device=device
+        )
+        if use_fused_prefill_metadata:
+            query_lens_tensor = torch.tensor(
+                query_lens, dtype=torch.int32, device=device
+            )
+            token_to_req = torch.arange(
+                num_decodes + num_prefills,
+                dtype=torch.int32,
+                device=device,
+            ).repeat_interleave(query_lens_tensor)
+            num_prefill_tokens = case_prefill_tokens * num_prefills
+            block_size = 64
+            blocks_per_req = (
+                window_size + case_prefill_tokens + block_size - 1
+            ) // block_size
+            block_table = torch.zeros(
+                (num_decodes + num_prefills, blocks_per_req),
                 dtype=torch.int32,
                 device=device,
             )
-            seq_lens = torch.tensor(
-                [1] * num_decodes + [window_size + q for q in query_lens[num_decodes:]],
-                dtype=torch.int32,
-                device=device,
+            build_swa_prefill_indices_and_metadata(
+                torch.empty(
+                    num_prefill_tokens,
+                    1,
+                    window_size,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                torch.empty(num_prefill_tokens, dtype=torch.int32, device=device),
+                prefill_gather_lens,
+                window_size,
+                query_start_loc,
+                seq_lens,
+                token_to_req,
+                torch.ones(token_to_req.shape[0], dtype=torch.bool, device=device),
+                block_table,
+                block_size,
+                token_offset=num_decodes,
+                num_decodes=num_decodes,
             )
-            prefill_gather_lens = torch.empty(
-                num_prefills, dtype=torch.int32, device=device
-            )
+        else:
             _compute_prefill_metadata_kernel[(1,)](
                 prefill_gather_lens,
                 seq_lens,

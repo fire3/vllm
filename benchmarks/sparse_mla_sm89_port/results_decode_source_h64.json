@@ -1,0 +1,56 @@
+[
+  {
+    "num_tokens": 1,
+    "num_heads": 64,
+    "topk": 128,
+    "rel_diff": 0.0318649560213089,
+    "flashinfer_ms": 0.07791615962982178,
+    "triton_ms": 0.0621830415725708,
+    "speedup_triton_over_flashinfer": 0.7980763152085687
+  },
+  {
+    "num_tokens": 8,
+    "num_heads": 64,
+    "topk": 128,
+    "rel_diff": 0.028210489079356194,
+    "flashinfer_ms": 0.07585728168487549,
+    "triton_ms": 0.06550464153289795,
+    "speedup_triton_over_flashinfer": 0.8635247675366984
+  },
+  {
+    "num_tokens": 32,
+    "num_heads": 64,
+    "topk": 128,
+    "rel_diff": 0.0344306044280529,
+    "flashinfer_ms": 0.07748095989227295,
+    "triton_ms": 0.079552001953125,
+    "speedup_triton_over_flashinfer": 1.026729690284317
+  },
+  {
+    "num_tokens": 64,
+    "num_heads": 64,
+    "topk": 128,
+    "rel_diff": 0.034782614558935165,
+    "flashinfer_ms": 0.07518976211547851,
+    "triton_ms": 0.1674880027770996,
+    "speedup_triton_over_flashinfer": 2.227537341052721
+  },
+  {
+    "num_tokens": 128,
+    "num_heads": 64,
+    "topk": 128,
+    "rel_diff": 0.01517085637897253,
+    "flashinfer_ms": 0.03430272102355957,
+    "triton_ms": 0.24796096801757814,
+    "speedup_triton_over_flashinfer": 7.228609294501016
+  },
+  {
+    "num_tokens": 256,
+    "num_heads": 64,
+    "topk": 128,
+    "rel_diff": 0.013409123755991459,
+    "flashinfer_ms": 0.047445759773254395,
+    "triton_ms": 0.49898303985595704,
+    "speedup_triton_over_flashinfer": 10.516915362734656
+  }
+]

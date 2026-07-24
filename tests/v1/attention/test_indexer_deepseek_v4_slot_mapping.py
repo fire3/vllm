@@ -13,6 +13,11 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 def test_deep_gemm_scheduler_metadata_requires_platform_support(monkeypatch):
     monkeypatch.setattr(indexer_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer_module.current_platform,
+        "is_device_capability_family",
+        lambda _: False,
+    )
     monkeypatch.setattr(indexer_module, "is_deep_gemm_supported", lambda: False)
 
     assert not indexer_module._uses_deep_gemm_scheduler_metadata()
@@ -20,6 +25,11 @@ def test_deep_gemm_scheduler_metadata_requires_platform_support(monkeypatch):
 
 def test_deep_gemm_scheduler_metadata_enabled_on_supported_cuda(monkeypatch):
     monkeypatch.setattr(indexer_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        indexer_module.current_platform,
+        "is_device_capability_family",
+        lambda _: False,
+    )
     monkeypatch.setattr(indexer_module, "is_deep_gemm_supported", lambda: True)
 
     assert indexer_module._uses_deep_gemm_scheduler_metadata()

@@ -72,6 +72,14 @@ void cutlass_scaled_mm_sm120(torch::stable::Tensor& c,
                              torch::stable::Tensor const& a_scales,
                              torch::stable::Tensor const& b_scales,
                              std::optional<torch::stable::Tensor> const& bias);
+
+namespace vllm {
+void deepseek_v4_fp8_bmm_sm120_impl(torch::stable::Tensor& out,
+                                    torch::stable::Tensor const& a,
+                                    torch::stable::Tensor const& b,
+                                    torch::stable::Tensor const& a_scales,
+                                    torch::stable::Tensor const& b_scales);
+}  // namespace vllm
 #endif
 
 #if defined ENABLE_SCALED_MM_SM100 && ENABLE_SCALED_MM_SM100
@@ -194,6 +202,14 @@ bool cutlass_group_gemm_supported(int64_t cuda_device_capability) {
   return false;
 }
 
+bool deepseek_v4_fp8_bmm_sm120_supported(int64_t cuda_device_capability) {
+#if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
+  return cuda_device_capability >= 120 && cuda_device_capability < 130;
+#else
+  return false;
+#endif
+}
+
 void cutlass_scaled_mm(torch::stable::Tensor& c, torch::stable::Tensor const& a,
                        torch::stable::Tensor const& b,
                        torch::stable::Tensor const& a_scales,
@@ -266,6 +282,25 @@ void cutlass_scaled_mm(torch::stable::Tensor& c, torch::stable::Tensor const& a,
       false,
       "No compiled cutlass_scaled_mm for a compute capability less than "
       "CUDA device capability: ",
+      version_num);
+}
+
+void deepseek_v4_fp8_bmm_sm120(torch::stable::Tensor& out,
+                               torch::stable::Tensor const& a,
+                               torch::stable::Tensor const& b,
+                               torch::stable::Tensor const& a_scales,
+                               torch::stable::Tensor const& b_scales) {
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      a.get_device_index());
+  int32_t version_num = get_sm_version_num();
+#if defined ENABLE_SCALED_MM_SM120 && ENABLE_SCALED_MM_SM120
+  if (version_num >= 120 && version_num < 130) {
+    vllm::deepseek_v4_fp8_bmm_sm120_impl(out, a, b, a_scales, b_scales);
+    return;
+  }
+#endif
+  STD_TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "deepseek_v4_fp8_bmm_sm120 requires a compiled SM12x kernel, got ",
       version_num);
 }
 

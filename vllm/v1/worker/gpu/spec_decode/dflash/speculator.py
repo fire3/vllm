@@ -9,6 +9,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -99,11 +100,10 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def capture(self, attn_states: dict | None = None) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
-        # Reset sampling indices to zero to prevent stale values from prior
-        # dummy runs from being baked into the captured graph.
+        # Padded sample rows must not scatter into a live request during capture.
         self.sample_indices.zero_()
         self.sample_pos.zero_()
-        self.sample_idx_mapping.zero_()
+        self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -460,6 +460,7 @@ def _prepare_dflash_inputs_kernel(
 
     num_rejected = tl.load(num_rejected_ptr + req_idx)
     valid_ctx_end = ctx_end - num_rejected
+    num_valid_ctx = valid_ctx_end - ctx_start
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:
@@ -473,22 +474,27 @@ def _prepare_dflash_inputs_kernel(
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     is_ctx = j < num_ctx
-    is_query = (j >= num_ctx) & (j < num_ctx + num_query_per_req)
-    query_off = j - num_ctx
+    is_valid_ctx = j < num_valid_ctx
+    is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_query_per_req)
+    query_off = j - num_valid_ctx
 
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
-    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
+    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
     ctx_block_num = ctx_pos // block_size
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
-        mask=is_ctx,
+        mask=is_valid_ctx,
         other=0,
     ).to(tl.int64)
     ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
-    tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+    tl.store(
+        out_context_slot_mapping_ptr + ctx_start + j,
+        tl.where(is_valid_ctx, ctx_slot, PAD_SLOT_ID),
+        mask=is_ctx,
+    )
 
     # --- Query positions / input_ids / slots ---
     query_pos = last_valid_pos + 1 + query_off
@@ -596,7 +602,7 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
-    BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+    BLOCK_SIZE = _select_prepare_dflash_block_size(max_tokens_per_req)
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
@@ -629,3 +635,10 @@ def prepare_dflash_inputs(
         PAD_SLOT_ID=PAD_SLOT_ID,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+def _select_prepare_dflash_block_size(max_tokens_per_req: int) -> int:
+    block_size = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+    if current_platform.is_device_capability_family(120):
+        return max(128, block_size)
+    return block_size

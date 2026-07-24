@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
-from typing import ClassVar, cast
+from typing import cast
 
 import torch
 
@@ -18,8 +18,13 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
+from vllm.v1.attention.ops.flashmla import (
+    FlashMLASchedMeta,
+    get_mla_metadata,
+    is_flashmla_sparse_supported,
+)
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -33,6 +38,20 @@ from vllm.v1.kv_cache_interface import (
 _LAYER_TYPE_SWAONLY = "swaonly"
 _LAYER_TYPE_C4A = "c4a"
 _LAYER_TYPE_C128A = "c128a"
+_SM120_TILED_SWA_PREFILL_MIN_TOKENS = 1024
+
+
+def _use_fused_prefill_metadata() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        120
+    )
+
+
+def _use_tiled_swa_prefill_metadata(num_prefill_tokens: int) -> bool:
+    return (
+        num_prefill_tokens >= _SM120_TILED_SWA_PREFILL_MIN_TOKENS
+        and _use_fused_prefill_metadata()
+    )
 
 
 def _layer_type_for(compress_ratio: int) -> str:
@@ -177,6 +196,7 @@ class DeepseekSparseSWAMetadata:
     num_prefills: int = 0
     num_decode_tokens: int = 0
     num_prefill_tokens: int = 0
+    max_decode_query_len: int = 1
 
     # Pre-computed prefill metadata shared across all DeepseekV4 attention layers.
     prefill_seq_lens: torch.Tensor | None = None
@@ -293,7 +313,18 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
     # Base threshold: query_len <= 1 is decode
     reorder_batch_threshold: int = 1
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        if current_platform.is_cuda() and current_platform.is_device_capability_family(
+            100
+        ):
+            return AttentionCGSupport.ALWAYS
+        return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -322,6 +353,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.decode_threshold = (
             self.reorder_batch_threshold + spec_mult * self.num_speculative_tokens
         )
+        self.max_decode_query_len = 1 + self.num_speculative_tokens
 
         hf_config = self.vllm_config.model_config.hf_config
         assert hasattr(hf_config, "sliding_window")
@@ -363,6 +395,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             device=self.device,
         )
         self.prefill_swa_lens = torch.zeros(
+            max_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.prefill_gather_lens = torch.zeros(
             max_tokens,
             dtype=torch.int32,
             device=self.device,
@@ -471,31 +508,59 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                     block_table,
                     block_table.stride(0),
                     self.block_size,
+                    self.prefill_gather_lens,
+                    num_decodes,
+                    num_prefills,
                     token_offset=0,
                     TRITON_BLOCK_SIZE=1024,
+                    PREFILL_METADATA_BLOCK_SIZE=1,
+                    WRITE_PREFILL_METADATA=False,
                 )
 
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
+        fused_prefill_gather_lens = None
         if num_prefill_tokens > 0:
             prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
-            _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
-                prefill_swa_indices,
-                prefill_swa_indices.stride(0),
-                prefill_swa_lens,
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                token_offset=num_decode_tokens,
-                TRITON_BLOCK_SIZE=1024,
-            )
+            if _use_fused_prefill_metadata():
+                fused_prefill_gather_lens = self.prefill_gather_lens[:num_prefills]
+                build_swa_prefill_indices_and_metadata(
+                    prefill_swa_indices,
+                    prefill_swa_lens,
+                    fused_prefill_gather_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    self.block_size,
+                    token_offset=num_decode_tokens,
+                    num_decodes=num_decodes,
+                )
+            else:
+                _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
+                    prefill_swa_indices,
+                    prefill_swa_indices.stride(0),
+                    prefill_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    self.prefill_gather_lens,
+                    num_decodes,
+                    num_prefills,
+                    token_offset=num_decode_tokens,
+                    TRITON_BLOCK_SIZE=1024,
+                    PREFILL_METADATA_BLOCK_SIZE=1,
+                    WRITE_PREFILL_METADATA=False,
+                )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
@@ -505,6 +570,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            fused_prefill_gather_lens,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
@@ -538,6 +604,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            max_decode_query_len=self.max_decode_query_len,
             tile_sched_swaonly=tile_sched[_LAYER_TYPE_SWAONLY],
             tile_sched_c4a=tile_sched[_LAYER_TYPE_C4A],
             tile_sched_c128a=tile_sched[_LAYER_TYPE_C128A],
@@ -555,20 +622,15 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         call of each type. Subsequent same-type calls reuse the plan because
         the tensors (and ``have_initialized``) are populated on the struct.
 
-        Returns all-``None`` when there are no decode tokens this step, so
-        ``_forward_decode`` sees a clean sentinel.
+        Returns all-``None`` when there are no decode tokens or FlashMLA sparse
+        is unsupported, so non-FlashMLA backends see a clean sentinel.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
             _LAYER_TYPE_SWAONLY: None,
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
-        if (
-            num_decode_tokens == 0
-            or current_platform.is_rocm()
-            or current_platform.is_xpu()
-            or current_platform.is_device_capability_family(120)
-        ):
+        if num_decode_tokens == 0 or not is_flashmla_sparse_supported()[0]:
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
@@ -586,6 +648,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
+        prefill_gather_lens: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | int | None]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
@@ -600,22 +663,23 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # --- Prefill query metadata (single Triton kernel + CPU slicing) ---
         if num_prefills > 0:
             assert seq_lens_cpu is not None
-            pfx_gather_lens = torch.empty(
-                num_prefills, dtype=torch.int32, device=seq_lens.device
-            )
-            _compute_prefill_metadata_kernel[(1,)](
-                pfx_gather_lens,
-                seq_lens,
-                query_start_loc,
-                num_prefills,
-                num_decodes,
-                self.window_size,
-                BLOCK_SIZE=triton.next_power_of_2(num_prefills),
-            )
+            if prefill_gather_lens is None:
+                prefill_gather_lens = torch.empty(
+                    num_prefills, dtype=torch.int32, device=seq_lens.device
+                )
+                _compute_prefill_metadata_kernel[(1,)](
+                    prefill_gather_lens,
+                    seq_lens,
+                    query_start_loc,
+                    num_prefills,
+                    num_decodes,
+                    self.window_size,
+                    BLOCK_SIZE=triton.next_power_of_2(num_prefills),
+                )
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
             result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
-            result["prefill_gather_lens"] = pfx_gather_lens
+            result["prefill_gather_lens"] = prefill_gather_lens
             result["prefill_query_lens_cpu"] = (
                 query_start_loc_cpu[num_decodes + 1 : num_decodes + num_prefills + 1]
                 - query_start_loc_cpu[num_decodes : num_decodes + num_prefills]
@@ -658,7 +722,232 @@ def _compute_prefill_metadata_kernel(
     tl.store(prefill_gather_lens_ptr + offset, gather_len, mask=mask)
 
 
-@triton.jit(do_not_specialize=["token_offset"])
+def build_swa_prefill_indices_and_metadata(
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    prefill_gather_lens: torch.Tensor,
+    window_size: int,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    *,
+    token_offset: int,
+    num_decodes: int,
+) -> None:
+    """Build causal prefill SWA indices and request metadata in one launch."""
+    num_prefill_tokens = swa_indices.shape[0]
+    if num_prefill_tokens == 0:
+        return
+    if _use_tiled_swa_prefill_metadata(num_prefill_tokens):
+        build_swa_indices_and_metadata_tiled(
+            swa_indices,
+            swa_lens,
+            prefill_gather_lens,
+            window_size,
+            query_start_loc,
+            seq_lens,
+            token_to_req_indices,
+            is_valid_token,
+            block_table,
+            block_size,
+            token_offset=token_offset,
+            num_decodes=num_decodes,
+            write_prefill_metadata=True,
+        )
+        return
+    num_prefills = prefill_gather_lens.shape[0]
+    _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
+        swa_indices,
+        swa_indices.stride(0),
+        swa_lens,
+        window_size,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        prefill_gather_lens,
+        num_decodes,
+        num_prefills,
+        token_offset=token_offset,
+        TRITON_BLOCK_SIZE=1024,
+        PREFILL_METADATA_BLOCK_SIZE=triton.next_power_of_2(num_prefills),
+        WRITE_PREFILL_METADATA=True,
+    )
+
+
+def build_swa_indices_and_metadata_tiled(
+    swa_indices: torch.Tensor,
+    swa_lens: torch.Tensor,
+    prefill_gather_lens: torch.Tensor,
+    window_size: int,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    *,
+    token_offset: int,
+    num_decodes: int,
+    write_prefill_metadata: bool,
+) -> None:
+    """Build causal SWA metadata with four token rows per Triton program."""
+    num_tokens = swa_indices.shape[0]
+    if num_tokens == 0:
+        return
+    num_prefills = prefill_gather_lens.shape[0] if write_prefill_metadata else 0
+    _compute_swa_indices_and_lens_tiled_kernel[(triton.cdiv(num_tokens, 4),)](
+        swa_indices,
+        swa_indices.stride(0),
+        swa_lens,
+        window_size,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        prefill_gather_lens,
+        num_tokens,
+        num_decodes,
+        num_prefills,
+        token_offset=token_offset,
+        TOKENS_PER_PROGRAM=4,
+        WINDOW_BLOCK_SIZE=triton.next_power_of_2(window_size),
+        PREFILL_METADATA_BLOCK_SIZE=(
+            triton.next_power_of_2(num_prefills) if write_prefill_metadata else 1
+        ),
+        WRITE_PREFILL_METADATA=write_prefill_metadata,
+        num_warps=8,
+    )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "token_offset",
+        "num_decodes",
+        "num_prefills",
+    ]
+)
+def _compute_swa_indices_and_lens_tiled_kernel(
+    swa_indices_ptr,
+    swa_indices_stride,
+    swa_lens_ptr,
+    window_size,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    token_to_req_indices_ptr,
+    is_valid_token_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    prefill_gather_lens_ptr,
+    num_tokens,
+    num_decodes,
+    num_prefills,
+    token_offset,
+    TOKENS_PER_PROGRAM: tl.constexpr,
+    WINDOW_BLOCK_SIZE: tl.constexpr,
+    PREFILL_METADATA_BLOCK_SIZE: tl.constexpr,
+    WRITE_PREFILL_METADATA: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if WRITE_PREFILL_METADATA and pid == 0:
+        prefill_idx = tl.arange(0, PREFILL_METADATA_BLOCK_SIZE)
+        request_mask = prefill_idx < num_prefills
+        safe_prefill_idx = tl.minimum(prefill_idx, num_prefills - 1)
+        metadata_req_idx = num_decodes + safe_prefill_idx
+        metadata_query_start = tl.load(
+            query_start_loc_ptr + metadata_req_idx,
+            mask=request_mask,
+        )
+        metadata_query_end = tl.load(
+            query_start_loc_ptr + metadata_req_idx + 1,
+            mask=request_mask,
+        )
+        metadata_query_len = metadata_query_end - metadata_query_start
+        metadata_seq_len = tl.load(
+            seq_lens_ptr + metadata_req_idx,
+            mask=request_mask,
+        )
+        metadata_prefix_len = metadata_seq_len - metadata_query_len
+        gather_len = metadata_query_len + tl.minimum(
+            metadata_prefix_len,
+            window_size - 1,
+        )
+        tl.store(
+            prefill_gather_lens_ptr + prefill_idx,
+            gather_len,
+            mask=request_mask,
+        )
+
+    row = pid * TOKENS_PER_PROGRAM + tl.arange(0, TOKENS_PER_PROGRAM)[:, None]
+    offset = tl.arange(0, WINDOW_BLOCK_SIZE)[None, :]
+    row_mask = row < num_tokens
+    token_idx = row + token_offset
+    is_valid = tl.load(
+        is_valid_token_ptr + token_idx,
+        mask=row_mask,
+        other=False,
+    )
+    active_row = row_mask & is_valid
+    req_idx = tl.load(
+        token_to_req_indices_ptr + token_idx,
+        mask=active_row,
+        other=0,
+    )
+    query_start = tl.load(
+        query_start_loc_ptr + req_idx,
+        mask=active_row,
+        other=0,
+    )
+    query_end = tl.load(
+        query_start_loc_ptr + req_idx + 1,
+        mask=active_row,
+        other=0,
+    )
+    query_len = query_end - query_start
+    seq_len = tl.load(
+        seq_lens_ptr + req_idx,
+        mask=active_row,
+        other=0,
+    )
+    prefix_len = seq_len - query_len
+    pos = prefix_len + token_idx - query_start
+    start_pos = tl.maximum(pos - window_size + 1, 0)
+    swa_len = pos + 1 - start_pos
+
+    tl.store(
+        swa_lens_ptr + row,
+        tl.where(active_row, swa_len, 0),
+        mask=row_mask,
+    )
+    pos_offset = start_pos + offset
+    entry_mask = active_row & (offset < swa_len) & (offset < window_size)
+    block_indices = pos_offset // block_size
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + block_indices,
+        mask=entry_mask,
+        other=0,
+    )
+    slot_ids = block_numbers * block_size + pos_offset % block_size
+    slot_ids = tl.where(entry_mask, slot_ids, -1)
+    tl.store(
+        swa_indices_ptr + row * swa_indices_stride + offset,
+        slot_ids,
+        mask=row_mask & (offset < window_size),
+    )
+
+
+@triton.jit(do_not_specialize=["token_offset", "num_decodes", "num_prefills"])
 def _compute_swa_indices_and_lens_kernel(
     swa_indices_ptr,
     swa_indices_stride,
@@ -671,22 +960,60 @@ def _compute_swa_indices_and_lens_kernel(
     block_table_ptr,
     block_table_stride,
     block_size,
+    prefill_gather_lens_ptr,
+    num_decodes,
+    num_prefills,
     token_offset,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    PREFILL_METADATA_BLOCK_SIZE: tl.constexpr,
+    WRITE_PREFILL_METADATA: tl.constexpr,
 ):
     pid = tl.program_id(0)
     token_idx = pid + token_offset
     is_valid = tl.load(is_valid_token_ptr + token_idx)
+    if WRITE_PREFILL_METADATA and pid == 0:
+        prefill_idx = tl.arange(0, PREFILL_METADATA_BLOCK_SIZE)
+        request_mask = prefill_idx < num_prefills
+        safe_prefill_idx = tl.minimum(prefill_idx, num_prefills - 1)
+        metadata_req_idx = num_decodes + safe_prefill_idx
+        metadata_query_start = tl.load(
+            query_start_loc_ptr + metadata_req_idx,
+            mask=request_mask,
+        )
+        metadata_query_end = tl.load(
+            query_start_loc_ptr + metadata_req_idx + 1,
+            mask=request_mask,
+        )
+        metadata_query_len = metadata_query_end - metadata_query_start
+        metadata_seq_len = tl.load(
+            seq_lens_ptr + metadata_req_idx,
+            mask=request_mask,
+        )
+        metadata_prefix_len = metadata_seq_len - metadata_query_len
+        gather_len = metadata_query_len + tl.minimum(
+            metadata_prefix_len,
+            window_size - 1,
+        )
+        tl.store(
+            prefill_gather_lens_ptr + prefill_idx,
+            gather_len,
+            mask=request_mask,
+        )
     if not is_valid:
         tl.store(swa_lens_ptr + pid, 0)
+        for i in range(0, window_size, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < window_size,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
-
     query_start = tl.load(query_start_loc_ptr + req_idx)
     query_end = tl.load(query_start_loc_ptr + req_idx + 1)
     query_len = query_end - query_start
-
     seq_len = tl.load(seq_lens_ptr + req_idx)
     prefix_len = seq_len - query_len
 
@@ -745,6 +1072,13 @@ def _compute_dspark_noncausal_swa_indices_kernel(
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
         tl.store(swa_lens_ptr + pid, 0)
+        for i in range(0, index_width, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < index_width,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)

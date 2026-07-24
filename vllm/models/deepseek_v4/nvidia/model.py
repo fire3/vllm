@@ -68,7 +68,6 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
-    _flashinfer_sparse_mla_support_error,
     _is_flashinfer_sparse_jit_capability,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
@@ -781,8 +780,6 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         if device_capability is not None and _is_flashinfer_sparse_jit_capability(
             device_capability
         ):
-            if error := _flashinfer_sparse_mla_support_error(device_capability):
-                raise RuntimeError(f"FLASHINFER_MLA_SPARSE_DSV4 {error}.")
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
     if backend in (
@@ -794,8 +791,6 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     if device_capability is not None and _is_flashinfer_sparse_jit_capability(
         device_capability
     ):
-        if error := _flashinfer_sparse_mla_support_error(device_capability):
-            raise RuntimeError(f"FLASHINFER_MLA_SPARSE_DSV4 {error}.")
         return DeepseekV4FlashInferSM120Attention
     return DeepseekV4FlashMLAAttention
 
