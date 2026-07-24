@@ -118,6 +118,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "                  Tensor b, Tensor a_scales,"
       "                  Tensor b_scales, Tensor? bias) -> ()");
 
+  ops.def(
+      "deepseek_v4_fp8_bmm_sm120(Tensor! out, Tensor a, Tensor b, "
+      "Tensor a_scales, Tensor b_scales) -> ()");
+
   // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
   // quantization.
   ops.def(
@@ -133,6 +137,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // Check if cutlass grouped gemm is supported for CUDA devices of the given
   // capability
   ops.def("cutlass_group_gemm_supported(int cuda_device_capability) -> bool");
+
+  ops.def(
+      "deepseek_v4_fp8_bmm_sm120_supported(int cuda_device_capability) -> "
+      "bool");
 
   // CUTLASS w8a8 grouped GEMM
   ops.def(
@@ -613,6 +621,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #ifndef USE_ROCM
   // CUTLASS scaled_mm ops
   ops.impl("cutlass_scaled_mm", TORCH_BOX(&cutlass_scaled_mm));
+  ops.impl("deepseek_v4_fp8_bmm_sm120", TORCH_BOX(&deepseek_v4_fp8_bmm_sm120));
   ops.impl("cutlass_scaled_mm_azp", TORCH_BOX(&cutlass_scaled_mm_azp));
   ops.impl("cutlass_moe_mm", TORCH_BOX(&cutlass_moe_mm));
   ops.impl("get_cutlass_moe_mm_data", TORCH_BOX(&get_cutlass_moe_mm_data));
@@ -750,6 +759,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CompositeExplicitAutograd, ops) {
            TORCH_BOX(&cutlass_scaled_mm_supports_fp8));
   ops.impl("cutlass_group_gemm_supported",
            TORCH_BOX(&cutlass_group_gemm_supported));
+  ops.impl("deepseek_v4_fp8_bmm_sm120_supported",
+           TORCH_BOX(&deepseek_v4_fp8_bmm_sm120_supported));
   ops.impl("cutlass_scaled_mm_supports_block_fp8",
            TORCH_BOX(&cutlass_scaled_mm_supports_block_fp8));
   ops.impl("cutlass_scaled_mm_supports_fp4",

@@ -1022,19 +1022,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
-        block_tables = self.block_tables.gather_block_tables(
-            input_batch.idx_mapping,
-            num_reqs_padded=input_batch.num_reqs_after_padding,
-        )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
-        # Kernel pads beyond num_tokens with PAD_SLOT_ID.
-        slot_mappings = self.block_tables.compute_slot_mappings(
+        return self.block_tables.gather_block_tables_and_compute_slot_mappings(
             input_batch.idx_mapping,
-            input_batch.query_start_loc,
-            input_batch.positions,
+            query_start_loc=input_batch.query_start_loc,
+            positions=input_batch.positions,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
             num_tokens_padded=input_batch.num_tokens_after_padding,
+            is_padding=(input_batch.is_padding if envs.VLLM_MOE_SKIP_PADDING else None),
         )
-        return block_tables, slot_mappings
 
     def prepare_dummy_attn(
         self, input_batch: InputBatch

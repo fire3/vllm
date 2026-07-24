@@ -208,6 +208,78 @@ def _apply_pdl(mod, enable: bool = True) -> None:
         logger.warning_once("Failed to set DeepGEMM PDL on %s: %s", mod_name, e)
 
 
+def _set_deep_gemm_jit_cache() -> None:
+    if not os.environ.get("DG_JIT_CACHE_DIR"):
+        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(envs.VLLM_CACHE_ROOT, "deep_gemm")
+
+
+@functools.cache
+def _get_vendored_sm120_mqa_logits_impl() -> Callable[..., Any] | None:
+    """Resolve the SM120 MQA kernel from the bundled DeepGEMM revision."""
+    _set_deep_gemm_jit_cache()
+    try:
+        module = importlib.import_module("vllm.third_party.deep_gemm")
+    except ImportError:
+        logger.info_once("Vendored DeepGEMM MQA is unavailable")
+        return None
+
+    if current_platform.is_arch_support_pdl():
+        _apply_pdl(module, True)
+    impl = getattr(module, "fp8_fp4_mqa_logits", None)
+    if impl is None:
+        logger.warning_once(
+            "Vendored DeepGEMM SM120 MQA symbol is unavailable; "
+            "using the portable fallback."
+        )
+    return impl
+
+
+@functools.cache
+def _get_vendored_sm120_paged_mqa_impls() -> tuple[
+    Callable[..., Any] | None,
+    Callable[..., Any] | None,
+]:
+    """Resolve the SM120 paged-MQA APIs from bundled DeepGEMM."""
+    _set_deep_gemm_jit_cache()
+    try:
+        module = importlib.import_module("vllm.third_party.deep_gemm")
+    except ImportError:
+        logger.info_once("Vendored DeepGEMM paged MQA is unavailable")
+        return None, None
+
+    if current_platform.is_arch_support_pdl():
+        _apply_pdl(module, True)
+    metadata_impl = getattr(module, "get_paged_mqa_logits_metadata", None)
+    logits_impl = getattr(module, "fp8_fp4_paged_mqa_logits", None)
+    if metadata_impl is None or logits_impl is None:
+        logger.warning_once(
+            "Vendored DeepGEMM SM120 paged-MQA symbols are unavailable; "
+            "using the portable fallback."
+        )
+    return metadata_impl, logits_impl
+
+
+@functools.cache
+def _get_vendored_sm120_hc_prenorm_impl() -> Callable[..., Any] | None:
+    """Resolve the SM120 HC pre-norm kernel from bundled DeepGEMM."""
+    _set_deep_gemm_jit_cache()
+    try:
+        module = importlib.import_module("vllm.third_party.deep_gemm")
+    except ImportError:
+        logger.info_once("Vendored DeepGEMM SM120 HC pre-norm is unavailable")
+        return None
+
+    if current_platform.is_arch_support_pdl():
+        _apply_pdl(module, True)
+    impl = getattr(module, "tf32_hc_prenorm_gemm", None)
+    if impl is None:
+        logger.warning_once(
+            "Vendored DeepGEMM SM120 HC pre-norm symbol is unavailable; "
+            "using the portable fallback."
+        )
+    return impl
+
+
 def _lazy_init() -> None:
     """Import deep_gemm and resolve symbols on first use."""
     global _cublaslt_gemm_nt_impl
@@ -246,12 +318,7 @@ def _lazy_init() -> None:
     if not has_deep_gemm():
         return
 
-    # Set up deep_gemm cache path
-    DEEP_GEMM_JIT_CACHE_ENV_NAME = "DG_JIT_CACHE_DIR"
-    if not os.environ.get(DEEP_GEMM_JIT_CACHE_ENV_NAME, None):
-        os.environ[DEEP_GEMM_JIT_CACHE_ENV_NAME] = os.path.join(
-            envs.VLLM_CACHE_ROOT, "deep_gemm"
-        )
+    _set_deep_gemm_jit_cache()
 
     _dg = _import_deep_gemm()
     if _dg is None:
@@ -496,6 +563,239 @@ def transform_sf_into_required_layout(*args, **kwargs):
     )
 
 
+def _use_sm12x_mqa_fallback() -> bool:
+    """Use portable MQA/HC kernels where DeepGEMM is unsupported."""
+    return current_platform.is_device_capability_family(120) or (
+        current_platform.is_cuda() and current_platform.is_device_capability((8, 9))
+    )
+
+
+def is_mqa_backend_available() -> bool:
+    """Whether MQA kernels are available through DeepGEMM or a fallback."""
+    return has_deep_gemm() or _use_sm12x_mqa_fallback()
+
+
+def _sm120_deep_gemm_mqa_enabled() -> bool:
+    """Honor the global DeepGEMM opt-out for the fixed vendored SM120 path."""
+    return envs.VLLM_USE_DEEP_GEMM
+
+
+def _can_use_sm120_deep_gemm_hc_prenorm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int,
+) -> bool:
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and envs.VLLM_USE_DEEP_GEMM
+        and num_split > 0
+    ):
+        return False
+    if x.ndim != 2 or fn.ndim != 2:
+        return False
+
+    m, k = x.shape
+    n = fn.shape[0]
+    num_k_blocks = cdiv(k, 64)
+    if not (
+        x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and m >= 64
+        and k > 0
+        and k % 64 == 0
+        and fn.dtype == torch.float32
+        and fn.shape == (n, k)
+        and fn.is_contiguous()
+        and n > 0
+        and n % 8 == 0
+        and out.dtype == torch.float32
+        and out.shape == (num_split, m, n)
+        and out.is_contiguous()
+        and sqrsum.dtype == torch.float32
+        and sqrsum.shape == (num_split, m)
+        and sqrsum.is_contiguous()
+        and num_split <= num_k_blocks // 4
+        and x.device == fn.device == out.device == sqrsum.device
+    ):
+        return False
+
+    return _get_vendored_sm120_hc_prenorm_impl() is not None
+
+
+def is_sm120_deep_gemm_paged_mqa_supported() -> bool:
+    """Return whether the fixed vendored SM120 paged-MQA APIs are usable."""
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and _sm120_deep_gemm_mqa_enabled()
+    ):
+        return False
+    metadata_impl, logits_impl = _get_vendored_sm120_paged_mqa_impls()
+    return metadata_impl is not None and logits_impl is not None
+
+
+def _can_use_sm120_deep_gemm_mqa(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> bool:
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and _sm120_deep_gemm_mqa_enabled()
+    ):
+        return False
+
+    q_values, q_scale = q
+    k_values, k_scale = kv
+    if not (
+        q_scale is None
+        and q_values.is_cuda
+        and q_values.dtype == torch.float8_e4m3fn
+        and q_values.ndim == 3
+        and q_values.is_contiguous()
+        and q_values.shape[0] > 0
+        and q_values.shape[1] in (16, 32, 64)
+        and q_values.shape[2] in (32, 64, 128)
+        and k_values.dtype == torch.float8_e4m3fn
+        and k_values.ndim == 2
+        and k_values.is_contiguous()
+        and k_values.shape[0] > 0
+        and k_scale.dtype == torch.float32
+        and k_scale.ndim == 1
+        and k_scale.is_contiguous()
+        and k_values.shape == (k_scale.shape[0], q_values.shape[2])
+        and weights.dtype == torch.float32
+        and weights.shape == q_values.shape[:2]
+        and weights.stride(1) == 1
+        and cu_seqlen_ks.dtype == torch.int32
+        and cu_seqlen_ke.dtype == torch.int32
+        and cu_seqlen_ks.shape == (q_values.shape[0],)
+        and cu_seqlen_ke.shape == (q_values.shape[0],)
+        and cu_seqlen_ks.is_contiguous()
+        and cu_seqlen_ke.is_contiguous()
+        and q_values.device
+        == k_values.device
+        == k_scale.device
+        == weights.device
+        == cu_seqlen_ks.device
+        == cu_seqlen_ke.device
+    ):
+        return False
+
+    return _get_vendored_sm120_mqa_logits_impl() is not None
+
+
+def _can_use_sm120_deep_gemm_paged_mqa(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    max_model_len: int,
+    indices: torch.Tensor | None,
+) -> bool:
+    if not is_sm120_deep_gemm_paged_mqa_supported() or indices is not None:
+        return False
+
+    q_values, q_scale = q
+    if q_values.ndim != 4:
+        return False
+    batch_size, next_n, num_heads, head_dim = q_values.shape
+    return (
+        q_scale is None
+        and q_values.is_cuda
+        and q_values.dtype == torch.float8_e4m3fn
+        and q_values.is_contiguous()
+        and batch_size > 0
+        and next_n > 0
+        and num_heads in (16, 32, 64)
+        and head_dim in (32, 64, 128)
+        and kv_cache.dtype == torch.uint8
+        and kv_cache.ndim == 4
+        and kv_cache.shape[1:] == (64, 1, head_dim + torch.float32.itemsize)
+        and kv_cache.stride(1) == head_dim + torch.float32.itemsize
+        and kv_cache.stride(3) == 1
+        and weights.dtype == torch.float32
+        and weights.shape == (batch_size * next_n, num_heads)
+        and weights.is_contiguous()
+        and context_lens.dtype == torch.int32
+        and context_lens.shape == (batch_size, next_n)
+        and context_lens.is_contiguous()
+        and block_tables.dtype == torch.int32
+        and block_tables.ndim == 2
+        and block_tables.shape[0] == batch_size
+        and block_tables.stride(1) == 1
+        and schedule_metadata.dtype == torch.int32
+        and schedule_metadata.ndim == 2
+        and schedule_metadata.shape[1] == 2
+        and schedule_metadata.is_contiguous()
+        and max_model_len > 0
+        and q_values.device
+        == kv_cache.device
+        == weights.device
+        == context_lens.device
+        == block_tables.device
+        == schedule_metadata.device
+    )
+
+
+def fp8_fp4_mqa_topk_indices(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_indices: torch.Tensor,
+) -> bool:
+    """Write SM89/SM12x FP8 MQA top-k indices without full logits."""
+    if not (current_platform.is_cuda() and _use_sm12x_mqa_fallback() and q[1] is None):
+        return False
+    if _can_use_sm120_deep_gemm_mqa(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+    ):
+        return False
+    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+    used = sm12x_deep_gemm_fallbacks.fp8_fp4_mqa_topk_indices(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_indices,
+    )
+    if used:
+        logger.info_once("Using SM89/SM12x direct FP8 MQA top-k path.")
+    return used
+
+
+def _fp8_mqa_logits_sm12x(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+    return sm12x_deep_gemm_fallbacks._fp8_mqa_logits_sm12x(
+        q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+    )
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -528,6 +828,29 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    if q[1] is None:
+        if _can_use_sm120_deep_gemm_mqa(
+            q,
+            kv,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+        ):
+            impl = _get_vendored_sm120_mqa_logits_impl()
+            assert impl is not None
+            logger.info_once("Using DeepGEMM SM120 fused FP8 MQA logits.")
+            return impl(
+                q,
+                kv,
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                clean_logits=clean_logits,
+            )
+        if _use_sm12x_mqa_fallback():
+            return _fp8_mqa_logits_sm12x(
+                q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+            )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -542,24 +865,86 @@ def fp8_fp4_mqa_logits(
 
 
 def get_paged_mqa_logits_metadata(
-    context_lens: torch.Tensor, block_size: int, num_sms: int
+    context_lens: torch.Tensor,
+    block_size: int,
+    num_sms: int,
+    indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build scheduling metadata for paged MQA logits.
 
     Args:
-        context_lens: Tensor of shape [B], dtype int32; effective context length
-            per batch element.
+        context_lens: Tensor of shape [B, next_n], dtype int32; effective
+            context length per decode row.
         block_size: KV-cache block size in tokens (e.g., 64).
         num_sms: Number of SMs available. 132 for Hopper
+        indices: Optional request index for each varlen row.
 
     Returns:
         Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
         schedule work across SMs.
     """
+    if (
+        is_sm120_deep_gemm_paged_mqa_supported()
+        and block_size == 64
+        and indices is None
+        and context_lens.dtype == torch.int32
+        and context_lens.ndim == 2
+        and context_lens.is_contiguous()
+    ):
+        metadata_impl, _ = _get_vendored_sm120_paged_mqa_impls()
+        assert metadata_impl is not None
+        return metadata_impl(context_lens, block_size, num_sms)
+
     _lazy_init()
     if _get_paged_mqa_logits_metadata_impl is None:
         return _missing()
-    return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
+    kwargs = {} if indices is None else {"indices": indices}
+    return _get_paged_mqa_logits_metadata_impl(
+        context_lens, block_size, num_sms, **kwargs
+    )
+
+
+def _fp8_paged_mqa_logits_sm12x(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+    return sm12x_deep_gemm_fallbacks._fp8_paged_mqa_logits_sm12x(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len
+    )
+
+
+def fp8_fp4_paged_mqa_topk_indices(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+    topk_indices: torch.Tensor,
+) -> bool:
+    """Write SM89/SM12x FP8 paged-MQA top-k indices without full logits."""
+    if not (current_platform.is_cuda() and _use_sm12x_mqa_fallback() and q[1] is None):
+        return False
+    from vllm.models.deepseek_v4.nvidia.ops import sm12x_deep_gemm_fallbacks
+
+    used = sm12x_deep_gemm_fallbacks.fp8_fp4_paged_mqa_topk_indices(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        max_model_len,
+        topk_indices,
+    )
+    if used:
+        logger.info_once("Using SM89/SM12x direct FP8 paged-MQA top-k path.")
+    return used
 
 
 def fp8_fp4_paged_mqa_logits(
@@ -571,6 +956,7 @@ def fp8_fp4_paged_mqa_logits(
     schedule_metadata: torch.Tensor,
     max_model_len: int,
     clean_logits: bool,
+    indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute MQA logits using a paged KV-cache.
 
@@ -587,22 +973,52 @@ def fp8_fp4_paged_mqa_logits(
             D+4], dtype `torch.uint8`, with the last 4 bytes per (block, pos)
             storing the float dequant scale.
         weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
-        context_lens: Tensor of shape [B], dtype int32; effective context length
-            for each batch element.
+        context_lens: Tensor of shape [B, next_n], dtype int32; effective
+            context length per decode row.
         block_tables: Tensor of shape [B, max_blocks], dtype int32; maps logical
             block indices to physical blocks in the paged cache.
         schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
         clean_logits: Whether to clean the unfilled logits into `-inf`.
+        indices: Optional request index for each varlen row.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if _can_use_sm120_deep_gemm_paged_mqa(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        max_model_len,
+        indices,
+    ):
+        _, impl = _get_vendored_sm120_paged_mqa_impls()
+        assert impl is not None
+        logger.info_once("Using DeepGEMM SM120 fused FP8 paged-MQA logits.")
+        return impl(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_model_len,
+            clean_logits=clean_logits,
+            logits_dtype=torch.float32,
+        )
+    if _use_sm12x_mqa_fallback() and q[1] is None:
+        return _fp8_paged_mqa_logits_sm12x(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
+    kwargs = {} if indices is None else {"indices": indices}
     return _fp8_fp4_paged_mqa_logits_impl(
         q,
         kv_cache,
@@ -612,6 +1028,7 @@ def fp8_fp4_paged_mqa_logits(
         schedule_metadata,
         max_model_len,
         clean_logits=clean_logits,
+        **kwargs,
     )
 
 
@@ -629,6 +1046,25 @@ def tf32_hc_prenorm_gemm(
 
     See the caller function for shape requirement
     """
+    if _use_sm12x_mqa_fallback():
+        if _can_use_sm120_deep_gemm_hc_prenorm(
+            x,
+            fn,
+            out,
+            sqrsum,
+            num_split,
+        ):
+            impl = _get_vendored_sm120_hc_prenorm_impl()
+            assert impl is not None
+            logger.info_once("Using DeepGEMM SM120 TF32 HC pre-norm GEMM.")
+            return impl(x, fn, out, sqrsum, num_split)
+        from vllm.models.deepseek_v4.nvidia.ops import (
+            sm12x_deep_gemm_fallbacks,
+        )
+
+        return sm12x_deep_gemm_fallbacks._tf32_hc_prenorm_gemm_sm12x(
+            x, fn, out, sqrsum, num_split
+        )
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()

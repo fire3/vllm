@@ -212,6 +212,37 @@ def _gumbel_sample_kernel(
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
 
+@triton.jit
+def _reduce_gumbel_argmax_kernel(
+    sampled_ptr,
+    local_argmax_ptr,
+    local_argmax_stride,
+    local_max_ptr,
+    local_max_stride,
+    NUM_BLOCKS: tl.constexpr,
+    REDUCTION_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    block_offsets = tl.arange(0, REDUCTION_SIZE)
+    block_mask = block_offsets < NUM_BLOCKS
+    local_values = tl.load(
+        local_max_ptr + token_idx * local_max_stride + block_offsets,
+        mask=block_mask,
+        other=float("-inf"),
+    )
+    nan_offsets = tl.where(local_values != local_values, block_offsets, REDUCTION_SIZE)
+    first_nan = tl.min(nan_offsets, axis=0)
+    finite_values = tl.where(local_values != local_values, float("-inf"), local_values)
+    max_value = tl.max(finite_values, axis=0)
+    max_offsets = tl.where(
+        block_mask & (finite_values == max_value), block_offsets, REDUCTION_SIZE
+    )
+    first_max = tl.min(max_offsets, axis=0)
+    winner = tl.where(first_nan < NUM_BLOCKS, first_nan, first_max)
+    sampled = tl.load(local_argmax_ptr + token_idx * local_argmax_stride + winner)
+    tl.store(sampled_ptr + token_idx, sampled)
+
+
 def gumbel_sample(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     expanded_idx_mapping: torch.Tensor,  # [num_tokens]
@@ -259,6 +290,14 @@ def gumbel_sample(
         PER_TOKEN_COL=per_token_col,
     )
     # NOTE(woosuk): Use int64 for later indexing.
-    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
-    sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
+    sampled = logits.new_empty(num_tokens, dtype=torch.int64)
+    _reduce_gumbel_argmax_kernel[(num_tokens,)](
+        sampled,
+        local_argmax,
+        local_argmax.stride(0),
+        local_max,
+        local_max.stride(0),
+        NUM_BLOCKS=num_blocks,
+        REDUCTION_SIZE=triton.next_power_of_2(num_blocks),
+    )
     return sampled

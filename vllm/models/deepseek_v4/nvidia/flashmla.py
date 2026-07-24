@@ -301,6 +301,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                     block_table=block_table[chunk_start:chunk_end],
                     block_size=attn_metadata.block_size // self.compress_ratio,
                     offset=0,
+                    max_gather_tokens=chunk_N,
                 )
 
             # Gather SWA KV
@@ -313,6 +314,7 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 block_table=swa_block_table[chunk_start:chunk_end],
                 block_size=swa_metadata.block_size,
                 offset=chunk_N,
+                max_gather_tokens=chunk_M - chunk_N,
             )
 
             # Combine the topk indices and SWA indices for gathered KV cache

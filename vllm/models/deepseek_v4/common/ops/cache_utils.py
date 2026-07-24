@@ -23,6 +23,33 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
+_GLOBAL_TOPK_CUTEDSL_TOPK = 512
+_GLOBAL_TOPK_CUTEDSL_MIN_TOKENS = 8192
+_COMBINE_TOPK_CUTEDSL_MIN_TOKENS = 2048
+_COMBINE_SWA_ONLY_CUTEDSL_MIN_TOKENS = 4096
+
+
+def _can_use_global_topk_cutedsl(*, topk: int, num_tokens: int) -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and topk == _GLOBAL_TOPK_CUTEDSL_TOPK
+        and num_tokens >= _GLOBAL_TOPK_CUTEDSL_MIN_TOKENS
+        and has_cutedsl()
+    )
+
+
+def _can_use_combine_topk_swa_cutedsl(*, topk: int, num_tokens: int) -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and has_cutedsl()
+        and (
+            (topk in (512, 1024) and num_tokens >= _COMBINE_TOPK_CUTEDSL_MIN_TOKENS)
+            or (topk == 0 and num_tokens >= _COMBINE_SWA_ONLY_CUTEDSL_MIN_TOKENS)
+        )
+    )
+
 
 @triton.jit
 def quantize_and_insert_k_kernel(
@@ -392,6 +419,7 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
     use_fnuz: bool = False,
+    max_gather_tokens: int | None = None,
 ) -> None:
     """Dequantize and gather a paged DSv4 K cache.
 
@@ -399,6 +427,9 @@ def dequantize_and_gather_k_cache(
     ``False`` for ``compressed_k_cache`` (Triton encoder is OCP everywhere),
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
+
+    ``max_gather_tokens`` is an optional host-known upper bound for launch
+    tuning. It does not change the output layout or device-side gather lengths.
     """
     if has_cutedsl():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
@@ -407,7 +438,14 @@ def dequantize_and_gather_k_cache(
         )
 
         dequantize_and_gather_k_cache_cutedsl(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+            out,
+            k_cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            offset,
+            max_gather_tokens=max_gather_tokens,
         )
         return
 
@@ -440,6 +478,25 @@ def compute_global_topk_indices_and_lens(
     num_tokens = topk_indices.shape[0]
     global_topk_indices = torch.empty_like(topk_indices)
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+    if num_tokens == 0:
+        return global_topk_indices, topk_lens
+
+    if _can_use_global_topk_cutedsl(topk=topk_indices.shape[-1], num_tokens=num_tokens):
+        from vllm.models.deepseek_v4.nvidia.ops.global_topk_cutedsl import (
+            launch_global_topk_indices_and_lens_cutedsl,
+        )
+
+        launch_global_topk_indices_and_lens_cutedsl(
+            global_topk_indices,
+            topk_lens,
+            topk_indices,
+            token_to_req_indices[:num_tokens],
+            block_table,
+            block_size,
+            is_valid_token[:num_tokens],
+        )
+        return global_topk_indices, topk_lens
+
     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
         global_topk_indices.stride(0),
@@ -527,6 +584,30 @@ def combine_topk_swa_indices(
     M: int,
     N: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    return combine_topk_swa_indices_sm120(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size,
+        compress_ratio,
+        topk,
+        M,
+        N,
+    )
+
+
+def _combine_topk_swa_indices_triton_baseline(
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    M: int,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
     combined_topk = (
@@ -559,7 +640,111 @@ def combine_topk_swa_indices(
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
-        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+        PADDED_TOP_K=triton.next_power_of_2(max(topk_indices.shape[-1], 1)),
+    )
+    return combined_indices, combined_lens
+
+
+def combine_topk_swa_indices_sm120(
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    M: int,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build sparse prefill indices with SM120 shape dispatch."""
+    num_tokens = topk_indices.shape[0]
+    if _can_use_combine_topk_swa_cutedsl(topk=topk, num_tokens=num_tokens):
+        from vllm.models.deepseek_v4.nvidia.ops.combine_topk_swa_cutedsl import (
+            combine_topk_swa_indices_cutedsl,
+        )
+
+        return combine_topk_swa_indices_cutedsl(
+            topk_indices,
+            query_start_loc,
+            seq_lens,
+            gather_lens,
+            window_size,
+            compress_ratio,
+            topk,
+            M,
+            N,
+        )
+    if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
+        return combine_topk_swa_indices_fused_triton(
+            topk_indices,
+            query_start_loc,
+            seq_lens,
+            gather_lens,
+            window_size,
+            compress_ratio,
+            topk,
+            M,
+            N,
+        )
+    return _combine_topk_swa_indices_triton_baseline(
+        topk_indices,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        window_size,
+        compress_ratio,
+        topk,
+        M,
+        N,
+    )
+
+
+def combine_topk_swa_indices_fused_triton(
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    M: int,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build each output row in one Triton launch."""
+    num_tokens = topk_indices.shape[0]
+    num_reqs = seq_lens.shape[0]
+    combined_topk = (
+        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // _SPARSE_PREFILL_TOPK_ALIGNMENT
+        * _SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+    combined_indices = torch.empty(
+        (num_tokens, combined_topk),
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    combined_lens = torch.empty(
+        num_tokens, dtype=torch.int32, device=topk_indices.device
+    )
+
+    num_workers = 128
+    _combine_topk_swa_indices_fused_kernel[(num_reqs, num_workers)](
+        combined_indices,
+        combined_indices.stride(0),
+        combined_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        M,
+        N,
+        TOP_K=topk,
+        COMPRESS_RATIO=compress_ratio,
+        WINDOW_SIZE=window_size,
+        COMBINED_TOP_K=combined_topk,
+        PADDED_TOP_K=triton.next_power_of_2(max(topk_indices.shape[-1], 1)),
+        PADDED_COMBINED_TOP_K=triton.next_power_of_2(combined_topk),
     )
     return combined_indices, combined_lens
 
@@ -609,17 +794,18 @@ def _combine_topk_swa_indices_kernel(
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
-        offset = tl.arange(0, PADDED_TOP_K)
-        mask = offset < topk_len
-        topk_indices = tl.load(
-            topk_indices_ptr + token_idx * topk_indices_stride + offset,
-            mask=mask,
-        )
-        tl.store(
-            combined_indices_ptr + token_idx * combined_indices_stride + offset,
-            topk_indices + M * batch_idx,
-            mask=mask,
-        )
+        if TOP_K > 0:
+            offset = tl.arange(0, PADDED_TOP_K)
+            mask = offset < topk_len
+            topk_indices = tl.load(
+                topk_indices_ptr + token_idx * topk_indices_stride + offset,
+                mask=mask,
+            )
+            tl.store(
+                combined_indices_ptr + token_idx * combined_indices_stride + offset,
+                topk_indices + M * batch_idx,
+                mask=mask,
+            )
         offset = tl.arange(0, WINDOW_SIZE)
         # Index into gathered buffer: N + (position - gather_start)
         # For positions [pos - swa_len + 1, pos], the buffer indices are:
@@ -634,6 +820,78 @@ def _combine_topk_swa_indices_kernel(
         )
 
         combined_len = topk_len + swa_len
+        tl.store(combined_lens_ptr + token_idx, combined_len)
+
+
+@triton.jit
+def _combine_topk_swa_indices_fused_kernel(
+    combined_indices_ptr,
+    combined_indices_stride,
+    combined_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    M,
+    N,
+    TOP_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    COMBINED_TOP_K: tl.constexpr,
+    PADDED_TOP_K: tl.constexpr,
+    PADDED_COMBINED_TOP_K: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    base = tl.load(query_start_loc_ptr)
+    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    gather_len = tl.load(gather_lens_ptr + batch_idx)
+    start_pos = seq_len - query_len
+    gather_start = seq_len - gather_len
+
+    for token_idx in range(query_start + worker_id, query_end, num_workers):
+        pos = start_pos + token_idx - query_start
+        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+
+        if TOP_K > 0:
+            topk_offset = tl.arange(0, PADDED_TOP_K)
+            topk_mask = topk_offset < topk_len
+            topk_values = tl.load(
+                topk_indices_ptr + token_idx * topk_indices_stride + topk_offset,
+                mask=topk_mask,
+            )
+            tl.store(
+                combined_indices_ptr
+                + token_idx * combined_indices_stride
+                + topk_offset,
+                topk_values + M * batch_idx,
+                mask=topk_mask,
+            )
+
+        swa_offset = tl.arange(0, WINDOW_SIZE)
+        tl.store(
+            combined_indices_ptr
+            + token_idx * combined_indices_stride
+            + topk_len
+            + swa_offset,
+            M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start,
+            mask=swa_offset < swa_len,
+        )
+
+        padding_offset = tl.arange(0, PADDED_COMBINED_TOP_K)
+        combined_len = topk_len + swa_len
+        tl.store(
+            combined_indices_ptr + token_idx * combined_indices_stride + padding_offset,
+            -1,
+            mask=(padding_offset >= combined_len) & (padding_offset < COMBINED_TOP_K),
+        )
         tl.store(combined_lens_ptr + token_idx, combined_len)
 
 

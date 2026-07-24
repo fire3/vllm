@@ -20,8 +20,10 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
+    fp8_fp4_mqa_topk_indices,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    fp8_fp4_paged_mqa_topk_indices,
+    is_mqa_backend_available,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -451,6 +453,19 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+                if (
+                    dcp_world_size == 1
+                    and not current_platform.is_xpu()
+                    and fp8_fp4_mqa_topk_indices(
+                        (q_slice_cast, q_scale_slice),
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                    )
+                ):
+                    continue
                 if current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
@@ -543,95 +558,119 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
-            if padded_q_scale is not None:
-                raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
-            seq_lens_xpu = (
-                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
-            )
-            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
-                padded_q_quant_cast,
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens_xpu,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len,
-            )
-        else:
-            logits = fp8_fp4_paged_mqa_logits(
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        logits_bytes = num_padded_tokens * max_model_len * torch.float32.itemsize
+        max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        used_direct_topk = False
+        if (
+            dcp_world_size == 1
+            and decode_metadata.indices is None
+            and decode_metadata.global_seq_lens is None
+            and not current_platform.is_xpu()
+            and logits_bytes > max_logits_bytes
+        ):
+            used_direct_topk = fp8_fp4_paged_mqa_topk_indices(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 weights[:num_padded_tokens],
                 seq_lens,
                 decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-            )
-        num_rows = logits.shape[0]
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-
-        use_cooperative_topk = (
-            current_platform.is_cuda()
-            and topk_tokens in (512, 1024, 2048)
-            and num_rows <= 32
-            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
-        )
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
-            512,
-            1024,
-            2048,
-        )
-        if use_cooperative_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.cooperative_topk(
-                logits,
-                seq_lens,
+                max_model_len,
                 topk_indices,
-                topk_workspace,
-                topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
-            )
-        elif use_persistent_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                logits.shape[1],
-            )
-        else:
-            ops.top_k_per_row_decode(
-                logits,
-                next_n,
-                seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
             )
 
-        if decode_metadata.global_seq_lens is not None:
-            _merge_dcp_topk_global(
-                logits,
-                topk_indices,
-                topk_tokens,
-                dcp_rank,
-                dcp_world_size,
-                cp_kv_cache_interleave_size,
+        if not used_direct_topk:
+            if current_platform.is_xpu():
+                if padded_q_scale is not None:
+                    raise RuntimeError(
+                        "XPU fp8_paged_mqa_logits does not support FP4 Q"
+                    )
+                seq_lens_xpu = (
+                    seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+                )
+                logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens_xpu,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len,
+                )
+            else:
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                    indices=decode_metadata.indices,
+                )
+            num_rows = logits.shape[0]
+
+            use_cooperative_topk = (
+                current_platform.is_cuda()
+                and topk_tokens in (512, 1024, 2048)
+                and num_rows <= 32
+                and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+                and current_platform.has_device_capability(90)
+                and not current_platform.is_device_capability_family(120)
             )
+            use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+                512,
+                1024,
+                2048,
+            )
+            if use_cooperative_topk:
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.cooperative_topk(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    attn_metadata_narrowed.max_seq_len,
+                )
+            elif use_persistent_topk:
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    logits.shape[1],
+                )
+            else:
+                ops.top_k_per_row_decode(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+
+            if decode_metadata.global_seq_lens is not None:
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -725,7 +764,7 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not is_mqa_backend_available():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."

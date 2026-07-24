@@ -780,6 +780,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_c3x_sm120.cu"
       "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_sm120_fp8.cu"
       "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm120_fp8.cu"
+      "csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/deepseek_v4_fp8_bmm_sm120.cu"
     )
     set_gencode_flags_for_srcs(
       SRCS "${SCALED_MM_SM120_SRCS}"

@@ -7,11 +7,84 @@ Output scale format is pre-transformed (MN-major TMA-aligned; FP32 on SM90,
 INT32-packed UE8M0 on SM100) so fp8_einsum skips transform_sf_into_required_layout.
 """
 
+import functools
+import importlib
+from collections.abc import Callable
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import direct_register_custom_op
+
+_INVERSE_ROPE_FP8_QUANT_CUTE_MIN_TOKENS = 256
+
+
+@functools.cache
+def _get_inverse_rope_fp8_quant_cute_impl() -> Callable[..., None] | None:
+    if not has_cutedsl():
+        return None
+    try:
+        cute_dsl = importlib.import_module("flashinfer.cute_dsl")
+    except ModuleNotFoundError as exc:
+        if exc.name in {"flashinfer", "flashinfer.cute_dsl"}:
+            return None
+        raise
+    return getattr(cute_dsl, "inverse_rope_fp8_quant_cute", None)
+
+
+def _can_use_inverse_rope_fp8_quant_cute(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    fp8_buf: torch.Tensor,
+    scale_buf_gst: torch.Tensor,
+    heads_per_group: int,
+    quant_group_size: int,
+    chunks_per_head: int,
+    rope_start: int,
+    half_rope: int,
+    tma_aligned_scales: bool,
+    fp8_max: float,
+    num_tokens: int,
+    n_groups: int,
+    d: int,
+    scale_inner: int,
+) -> bool:
+    tensors = (o, positions, cos_sin_cache, fp8_buf, scale_buf_gst)
+    vector_tensors = (o, cos_sin_cache, fp8_buf, scale_buf_gst)
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and num_tokens >= _INVERSE_ROPE_FP8_QUANT_CUTE_MIN_TOKENS
+        and n_groups in (2, 8)
+        and heads_per_group == 8
+        and quant_group_size == 128
+        and chunks_per_head == 4
+        and rope_start == 64
+        and half_rope == 32
+        and not tma_aligned_scales
+        and fp8_max == 448.0
+        and d == 4096
+        and scale_inner == 32
+        and o.shape == (num_tokens, n_groups * heads_per_group, 512)
+        and positions.shape == (num_tokens,)
+        and cos_sin_cache.ndim == 2
+        and cos_sin_cache.shape[1] == 64
+        and fp8_buf.shape == (n_groups, num_tokens, d)
+        and scale_buf_gst.shape == (n_groups, scale_inner, num_tokens)
+        and o.dtype == torch.bfloat16
+        and positions.dtype == torch.int64
+        and cos_sin_cache.dtype == torch.float32
+        and fp8_buf.dtype == torch.float8_e4m3fn
+        and scale_buf_gst.dtype == torch.float32
+        and all(tensor.device == o.device for tensor in tensors)
+        and all(tensor.is_cuda for tensor in tensors)
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and all(tensor.data_ptr() % 16 == 0 for tensor in vector_tensors)
+        and positions.data_ptr() % 8 == 0
+    )
 
 
 @triton.jit(do_not_specialize=["num_tokens"])
@@ -158,6 +231,7 @@ def fused_inv_rope_fp8_quant(
     rope_dim: int = 64,
     quant_group_size: int = 128,
     tma_aligned_scales: bool = False,
+    compact_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused inverse RoPE + block-scaled FP8 quantization.
 
@@ -172,6 +246,7 @@ def fused_inv_rope_fp8_quant(
         quant_group_size: FP8 quantization block size (default 128).
         tma_aligned_scales: Output INT32 packed UE8M0 for SM100 (True)
                             or FP32 for SM90 (False).
+        compact_scales: Omit token padding in the scale storage.
 
     Returns:
         o_fp8: [T, G, D] float8_e4m3fn, strides (D, T*D, 1).
@@ -195,7 +270,9 @@ def fused_inv_rope_fp8_quant(
     fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 
-    tma_aligned_T = get_tma_aligned_size(num_tokens, 4)
+    tma_aligned_T = (
+        num_tokens if compact_scales else get_tma_aligned_size(num_tokens, 4)
+    )
     if tma_aligned_scales:
         packed_sf_k = (num_scale_blocks + 3) // 4
         scale_inner = packed_sf_k
@@ -255,9 +332,39 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         (n_groups, num_tokens, scale_inner),
         (scale_inner * tma_aligned_T, 1, tma_aligned_T),
     )
+    scale_buf_gst = scale_buf.permute(0, 2, 1)
+    if _can_use_inverse_rope_fp8_quant_cute(
+        o,
+        positions,
+        cos_sin_cache,
+        fp8_buf,
+        scale_buf_gst,
+        heads_per_group,
+        quant_group_size,
+        chunks_per_head,
+        rope_start,
+        half_rope,
+        tma_aligned_scales,
+        fp8_max,
+        num_tokens,
+        n_groups,
+        d,
+        scale_inner,
+    ):
+        inverse_rope_fp8_quant_cute = _get_inverse_rope_fp8_quant_cute_impl()
+        if inverse_rope_fp8_quant_cute is not None:
+            inverse_rope_fp8_quant_cute(
+                o,
+                positions,
+                cos_sin_cache,
+                fp8_buf,
+                scale_buf_gst,
+                enable_pdl=current_platform.is_arch_support_pdl(),
+            )
+            return fp8_buf, scale_buf
+
     grid = (tma_aligned_T, n_groups * heads_per_group)
     use_gdc = current_platform.is_arch_support_pdl()
-    pdl_kwargs = {"launch_pdl": True} if use_gdc else {}
     _fused_inv_rope_fp8_quant_per_head[grid](
         o,
         positions,
@@ -281,8 +388,8 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         HALF_ROPE=half_rope,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
         USE_GDC=use_gdc,
+        launch_pdl=use_gdc,
         num_stages=1,
-        **pdl_kwargs,
         num_warps=1,
     )
     return fp8_buf, scale_buf

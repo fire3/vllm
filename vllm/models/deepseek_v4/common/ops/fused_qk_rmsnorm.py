@@ -1,8 +1,64 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
+import importlib
+from collections.abc import Callable
+
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.import_utils import has_cutedsl
+
+_DUAL_RMSNORM_MIN_TOKENS = 16
+_DUAL_RMSNORM_SERIAL_TOKENS = 8192
+
+
+@functools.cache
+def _get_dual_rmsnorm_cute_impl() -> Callable[..., None] | None:
+    if not has_cutedsl():
+        return None
+    try:
+        cute_dsl = importlib.import_module("flashinfer.cute_dsl")
+    except ModuleNotFoundError as exc:
+        if exc.name in {"flashinfer", "flashinfer.cute_dsl"}:
+            return None
+        raise
+    return getattr(cute_dsl, "dual_rmsnorm_cute", None)
+
+
+def _can_use_dual_rmsnorm_cute(
+    qr: torch.Tensor,
+    kv: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv_weight: torch.Tensor,
+    qr_out: torch.Tensor,
+    kv_out: torch.Tensor,
+) -> bool:
+    tensors = (qr, kv, q_weight, kv_weight, qr_out, kv_out)
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and qr.shape[0] >= _DUAL_RMSNORM_MIN_TOKENS
+        and qr.shape[1] == 1536
+        and kv.shape[1] == 512
+        and q_weight.shape == (1536,)
+        and kv_weight.shape == (512,)
+        and all(tensor.dtype == torch.bfloat16 for tensor in tensors)
+        and all(tensor.device == qr.device for tensor in tensors)
+        and all(tensor.is_cuda for tensor in tensors)
+        and all(tensor.data_ptr() % 16 == 0 for tensor in tensors)
+        and qr.stride(-1) == 1
+        and kv.stride(-1) == 1
+        and qr_out.stride(-1) == 1
+        and kv_out.stride(-1) == 1
+        and qr.stride(0) % 8 == 0
+        and kv.stride(0) % 8 == 0
+        and qr_out.stride(0) % 8 == 0
+        and kv_out.stride(0) % 8 == 0
+        and q_weight.is_contiguous()
+        and kv_weight.is_contiguous()
+    )
 
 
 @triton.jit
@@ -75,6 +131,28 @@ def fused_q_kv_rmsnorm(
     kv_out = torch.empty_like(kv)
     if num_tokens == 0:
         return qr_out, kv_out
+
+    if _can_use_dual_rmsnorm_cute(
+        qr,
+        kv,
+        q_weight,
+        kv_weight,
+        qr_out,
+        kv_out,
+    ):
+        dual_rmsnorm_cute = _get_dual_rmsnorm_cute_impl()
+        if dual_rmsnorm_cute is not None:
+            dual_rmsnorm_cute(
+                qr,
+                kv,
+                q_weight,
+                kv_weight,
+                qr_out,
+                kv_out,
+                eps,
+                parallel_tasks=num_tokens < _DUAL_RMSNORM_SERIAL_TOKENS,
+            )
+            return qr_out, kv_out
 
     block_size = triton.next_power_of_2(max(q_size, kv_size))
     _fused_q_kv_rmsnorm_kernel[(num_tokens, 2)](

@@ -20,11 +20,14 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
+    DeepseekV4FlashMLAMetadataBuilder,
+    build_c128a_global_prefill_metadata,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
-from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backend import CommonAttentionMetadata, MultipleOf
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -50,11 +53,71 @@ def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
     return workspace
 
 
+def _use_c128a_global_prefill_metadata() -> bool:
+    return current_platform.is_device_capability_family(120)
+
+
+class DeepseekV4FlashInferSparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuilder):
+    """Build global C128A prefill metadata only for the SM120 consumer."""
+
+    def _build_c128a_metadata(
+        self,
+        cm: CommonAttentionMetadata,
+        req_id_per_token: torch.Tensor,
+    ) -> dict[str, torch.Tensor | None]:
+        if not _use_c128a_global_prefill_metadata():
+            return super()._build_c128a_metadata(cm, req_id_per_token)
+
+        (
+            num_decodes,
+            num_prefills,
+            num_decode_tokens,
+            num_prefill_tokens,
+        ) = split_decodes_and_prefills(
+            cm,
+            decode_threshold=self.reorder_batch_threshold or 1,
+        )
+        num_total = num_decode_tokens + num_prefill_tokens
+        if num_total == 0:
+            return {}
+
+        if cm.positions is None:
+            raise RuntimeError("positions is required for C128A metadata build")
+        block_size = self.kv_cache_spec.block_size // self.compress_ratio
+        global_decode, decode_lens, global_prefill, prefill_lens = (
+            build_c128a_global_prefill_metadata(
+                cm.positions[:num_total],
+                self.compress_ratio,
+                num_decode_tokens,
+                req_id_per_token,
+                cm.block_table_tensor[: num_decodes + num_prefills],
+                block_size,
+                cm.slot_mapping,
+                self.c128a_global_decode_buffer,
+                self.c128a_decode_lens_buffer,
+                self.c128a_prefill_buffer,
+                self.c128a_prefill_lens_buffer,
+                max_compressed_tokens=self.c128a_max_compressed,
+            )
+        )
+
+        result: dict[str, torch.Tensor | None] = {}
+        if num_decode_tokens > 0:
+            result["c128a_global_decode_topk_indices"] = global_decode.view(
+                num_decode_tokens, 1, -1
+            )
+            result["c128a_decode_topk_lens"] = decode_lens
+        if num_prefill_tokens > 0:
+            result["c128a_global_prefill_topk_indices"] = global_prefill
+            result["c128a_global_prefill_topk_lens"] = prefill_lens
+        return result
+
+
 class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
     """FlashInfer backend using the DSv4 sparse metadata/cache layout.
 
-    Inheriting from the FlashMLA V4 backend reuses its
-    ``DeepseekV4FlashMLAMetadata`` builder.
+    The specialized builder emits global C128A prefill metadata on SM120 and
+    retains the FlashMLA-compatible local representation on other devices.
     """
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
@@ -73,6 +136,10 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
     @staticmethod
     def get_name() -> str:
         return "FLASHINFER_MLA_SPARSE_DSV4"
+
+    @staticmethod
+    def get_builder_cls() -> type[DeepseekV4FlashInferSparseMetadataBuilder]:
+        return DeepseekV4FlashInferSparseMetadataBuilder
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -297,20 +364,19 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         assert swa_metadata.decode_swa_indices is not None
         assert swa_metadata.block_table is not None
 
+        decode_swa_width = swa_metadata.decode_swa_indices.shape[-1]
+        assert num_prefill_tokens == 0 or decode_swa_width == self.window_size
         decode_swa_indices = swa_metadata.decode_swa_indices.reshape(
-            num_decode_tokens, self.window_size
+            num_decode_tokens, decode_swa_width
         )
         decode_compressed_topk_lens = None
         decode_compressed_indices_are_local = False
         decode_is_valid_token = None
 
         if swa_only:
-            assert self.topk_indices_buffer is not None
             compressed_kv_cache = swa_k_cache
             decode_compressed_indices = None
-            prefill_topk_indices = self.topk_indices_buffer[
-                num_decode_tokens:num_tokens, :0
-            ]
+            prefill_topk_indices = decode_swa_indices.new_empty(num_prefill_tokens, 0)
             compressed_block_table = None
             compressed_block_size = swa_metadata.block_size
             top_k = 0
@@ -391,7 +457,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 swa_metadata.block_size,
                 compressed_block_table,
                 compressed_block_size,
-                self.window_size,
+                decode_swa_width,
                 self.compress_ratio,
                 top_k,
                 decode_compressed_indices_are_local=decode_compressed_indices_are_local,
@@ -473,8 +539,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         # uniform-q batches, and this avoids flattening mixed batches into one call.
         if num_decode_tokens > 0:
             decode_cu = query_start_loc[: num_decodes + 1]
-            decode_cu_cpu = query_start_loc_cpu[: num_decodes + 1]
-            decode_lens_cpu = decode_cu_cpu[1:] - decode_cu_cpu[:-1]
             flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
                 query=query[:num_decode_tokens],
                 swa_kv_cache=swa_k_cache,
@@ -488,7 +552,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                 bmm2_scale=bmm2_scale,
                 sinks=self.attn_sink,
                 cum_seq_lens_q=decode_cu,
-                max_q_len=int(decode_lens_cpu.max().item()),
+                max_q_len=swa_metadata.max_decode_query_len,
             )
 
         if num_prefill_tokens > 0:
@@ -794,6 +858,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         prefill_token_base = query_start_loc_cpu[num_decodes]
 
         local_topk_indices: torch.Tensor | None
+        extra_sparse_indices: torch.Tensor | None = None
+        extra_sparse_lengths: torch.Tensor | None = None
         if swa_only:
             local_topk_indices = None
         elif self.compress_ratio == 4:
@@ -807,10 +873,21 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         else:
             if attn_metadata is None:
                 raise RuntimeError("C128A prefill metadata is missing.")
-            local_topk_indices = attn_metadata.c128a_prefill_topk_indices
+            extra_sparse_indices = attn_metadata.c128a_global_prefill_topk_indices
+            extra_sparse_lengths = attn_metadata.c128a_global_prefill_topk_lens
+            if extra_sparse_indices is None:
+                if extra_sparse_lengths is not None:
+                    raise RuntimeError(
+                        "C128A global prefill lengths require global indices."
+                    )
+                local_topk_indices = attn_metadata.c128a_prefill_topk_indices
+            else:
+                if extra_sparse_lengths is None:
+                    raise RuntimeError(
+                        "C128A global prefill indices require valid-entry lengths."
+                    )
+                local_topk_indices = None
 
-        extra_sparse_indices: torch.Tensor | None = None
-        extra_sparse_lengths: torch.Tensor | None = None
         if local_topk_indices is not None:
             if attn_metadata is None:
                 raise RuntimeError("C4A prefill metadata is missing.")
