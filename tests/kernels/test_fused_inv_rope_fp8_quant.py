@@ -370,6 +370,36 @@ def test_output_strides(num_tokens, num_heads, n_groups):
     )
 
 
+@pytest.mark.parametrize("num_tokens", [256, 257])
+@torch.inference_mode()
+def test_compact_scale_layout(num_tokens):
+    num_heads, n_groups = 64, 8
+    heads_per_group = num_heads // n_groups
+    max_pos = 4096
+    device = "cuda"
+    o = torch.randn(
+        num_tokens, num_heads, HEAD_DIM, device=device, dtype=torch.bfloat16
+    )
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), device=device, dtype=torch.long
+    )
+    cos_sin_cache = make_cos_sin_cache(max_pos, device=device)
+
+    _, fused_scale = fused_inv_rope_fp8_quant(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups,
+        heads_per_group,
+        compact_scales=True,
+    )
+
+    scale_blocks = heads_per_group * HEAD_DIM // QUANT_GROUP_SIZE
+    cutlass_scale = fused_scale.transpose(0, 1).permute(0, 2, 1)
+    assert cutlass_scale.shape == (n_groups, scale_blocks, num_tokens)
+    assert cutlass_scale.is_contiguous()
+
+
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 128])
 @torch.inference_mode()
 def test_per_group_contiguity(num_tokens):

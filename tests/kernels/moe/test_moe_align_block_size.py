@@ -288,6 +288,52 @@ def test_moe_align_block_size_with_expert_map(
     )
 
 
+@pytest.mark.parametrize("num_experts", [64, 256])
+@pytest.mark.parametrize("use_expert_map", [False, True])
+def test_moe_align_block_size_ignores_negative_expert_ids(
+    num_experts: int, use_expert_map: bool
+):
+    topk_ids = torch.tensor(
+        [[-1, 0], [1, -1], [2, 3], [-1, -1]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    block_size = 8
+    expert_map = (
+        torch.arange(num_experts, device="cuda", dtype=torch.int32)
+        if use_expert_map
+        else None
+    )
+
+    actual_sorted_ids, actual_expert_ids, actual_num_tokens = moe_align_block_size(
+        topk_ids=topk_ids,
+        block_size=block_size,
+        num_experts=num_experts,
+        expert_map=expert_map,
+        ignore_invalid_experts=use_expert_map,
+    )
+    golden_sorted_ids, golden_expert_ids, golden_num_tokens = (
+        torch_moe_align_block_size(
+            topk_ids=topk_ids,
+            block_size=block_size,
+            num_experts=num_experts,
+            expert_map=expert_map,
+        )
+    )
+
+    torch.testing.assert_close(actual_num_tokens, golden_num_tokens, atol=0, rtol=0)
+    torch.testing.assert_close(actual_expert_ids, golden_expert_ids, atol=0, rtol=0)
+    assert actual_num_tokens.item() == 4 * block_size
+    _verify_expert_level_sorting(
+        actual_sorted_ids,
+        golden_sorted_ids,
+        actual_expert_ids,
+        block_size,
+        actual_num_tokens.item(),
+        topk_ids.numel(),
+    )
+
+
 def test_moe_align_block_size_deterministic():
     m, topk, num_experts, block_size = 128, 2, 32, 64
 
