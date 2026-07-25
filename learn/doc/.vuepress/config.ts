@@ -27,6 +27,19 @@ export default defineUserConfig({
           "/01-overview/03-build-system.md",
         ],
       },
+      {
+        text: "阶段二：核心推理管线",
+        link: "/02-inference-pipeline/",
+        children: [
+          "/02-inference-pipeline/01-request-lifecycle.md",
+          "/02-inference-pipeline/02-kv-cache-system.md",
+          "/02-inference-pipeline/03-scheduler.md",
+          "/02-inference-pipeline/04-attention-backend.md",
+          "/02-inference-pipeline/05-sampler.md",
+          "/02-inference-pipeline/06-worker-model-runner.md",
+          "/02-inference-pipeline/07-engine-layer.md",
+        ],
+      },
     ],
   }),
 
