@@ -69,6 +69,7 @@ export default defineUserConfig({
           "/05-distributed-parallel/02-communication.md",
           "/05-distributed-parallel/03-kv-weight-transfer.md",
           "/05-distributed-parallel/04-coordination.md",
+          "/05-distributed-parallel/05-pd-disaggregation.md",
         ],
       },
       {
