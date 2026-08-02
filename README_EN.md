@@ -11,7 +11,7 @@ It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM8
 
 ### 2026-08-02
 
-- Added support for the latest `DeepSeek-V4-Flash-0731` model and completed short-context, long-context, and ModelScope GSM8K accuracy validation on 4× RTX 4090.
+- Added support for the latest `DeepSeek-V4-Flash-0731` model and completed short-context, long-context, and GSM8K accuracy validation on 4× RTX 4090.
 - Fixed FlashInfer SM89 sparse MLA decode accuracy by reconstructing the distributed query/KV UE8M0 scales for each MMA accumulator, handling boundary encodings, and supporting page block size 256.
 - Install the matching vLLM and FlashInfer wheels from the [latest Release](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/releases/latest) in the same dependency-resolution invocation.
 
