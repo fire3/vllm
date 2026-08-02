@@ -391,23 +391,34 @@ class LazyLoader(ModuleType):
 
 # Optional dependency detection utilities
 @cache
-def _has_module(module_name: str) -> bool:
+def _has_module(module_name: str, *, log_traceback: bool = True) -> bool:
     """Return True if *module_name* can be imported in the current environment.
 
     Uses ``importlib.util.find_spec`` as a fast pre-check, then performs a
     trial import to verify that native dependencies (shared libraries, etc.)
     are also satisfied. Any failure during the trial import is treated as the
     module being unavailable. The result is cached so that subsequent queries
-    for the same module incur no additional overhead.
+    for the same module incur no additional overhead. Set ``log_traceback`` to
+    ``False`` for optional backends whose import failure is an expected fallback.
     """
     try:
         if importlib.util.find_spec(module_name) is None:
             return False
         importlib.import_module(module_name)
-    except Exception:
-        logger.warning(
-            "Module %s was found but failed to import", module_name, exc_info=True
-        )
+    except Exception as exc:
+        if log_traceback:
+            logger.warning(
+                "Module %s was found but failed to import",
+                module_name,
+                exc_info=True,
+            )
+        else:
+            logger.warning(
+                "Optional module %s was found but failed to import; "
+                "continuing without it: %s",
+                module_name,
+                exc,
+            )
         return False
     return True
 
@@ -479,7 +490,9 @@ def has_deep_gemm() -> bool:
     override with a newer version), then falls back to the vendored copy
     bundled in the vLLM wheel.
     """
-    return _has_module("deep_gemm") or _has_module("vllm.third_party.deep_gemm")
+    return _has_module("deep_gemm", log_traceback=False) or _has_module(
+        "vllm.third_party.deep_gemm", log_traceback=False
+    )
 
 
 def has_nixl_ep() -> bool:

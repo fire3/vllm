@@ -9,6 +9,10 @@
 
 ## Changelog
 
+### 2026-08-02
+
+- 适配最新 `DeepSeek-V4-Flash-0731` 模型，并在 4× RTX 4090 上完成短上下文、长上下文和 ModelScope GSM8K 准确性测试。
+
 ### 2026-07-10
 
 - SM89 sparse MLA 的 prefill/decode 路径切换到 **FlashInfer 0.6.14 sparse MLA JIT fork**；release 同时提供匹配的 FlashInfer wheel，运行时会拒绝未包含 SM89 补丁的官方包。

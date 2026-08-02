@@ -9,6 +9,10 @@ It extends vLLM's **DeepSeek-V4-Flash** inference from SM90/SM100/SM120 to **SM8
 
 ## Changelog
 
+### 2026-08-02
+
+- Added support for the latest `DeepSeek-V4-Flash-0731` model and completed short-context, long-context, and ModelScope GSM8K accuracy validation on 4× RTX 4090.
+
 ### 2026-07-10
 
 - Switched SM89 sparse MLA prefill/decode to the **FlashInfer 0.6.14 sparse MLA JIT fork**. The release includes the matching FlashInfer wheel, and runtime validation rejects an official package without the SM89 patch.

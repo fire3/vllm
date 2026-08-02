@@ -4,7 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.utils.import_utils import PlaceholderModule, _has_module
+from vllm.utils import import_utils
+from vllm.utils.import_utils import PlaceholderModule, _has_module, has_deep_gemm
 
 
 def _raises_module_not_found():
@@ -101,3 +102,31 @@ class TestHasModule:
             result = _has_module("json")  # should hit cache
             mock_spec.assert_not_called()
             assert result is True
+
+    def test_deep_gemm_import_failure_warns_without_traceback(self):
+        fake_spec = MagicMock()
+
+        def find_spec(module_name: str):
+            if module_name == "deep_gemm":
+                return None
+            return fake_spec
+
+        with (
+            patch(
+                "vllm.utils.import_utils.importlib.util.find_spec",
+                side_effect=find_spec,
+            ),
+            patch(
+                "vllm.utils.import_utils.importlib.import_module",
+                side_effect=ImportError("cannot import name '_C'"),
+            ),
+            patch.object(import_utils.logger, "warning") as warning,
+        ):
+            assert has_deep_gemm() is False
+
+        warning.assert_called_once()
+        args, kwargs = warning.call_args
+        assert "continuing without it" in args[0]
+        assert args[1] == "vllm.third_party.deep_gemm"
+        assert str(args[2]) == "cannot import name '_C'"
+        assert "exc_info" not in kwargs
