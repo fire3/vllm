@@ -272,7 +272,7 @@ def _fp8_paged_mqa_logits_kernel(
         + block_rank[None, :] * stride_btk,
         mask=valid_m[:, None] & valid_n[None, :],
         other=0,
-    )
+    ).to(tl.int64)
 
     logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     scale = tl.load(
@@ -397,7 +397,7 @@ def _fp8_paged_mqa_logits_rowwise_kernel(
         block_tables_ptr + batch * stride_btb + block_rank * stride_btk,
         mask=valid_row & context_mask,
         other=0,
-    )
+    ).to(tl.int64)
 
     scale = tl.load(
         scale_ptr + block_idx * stride_sb + block_offset * stride_ss,
