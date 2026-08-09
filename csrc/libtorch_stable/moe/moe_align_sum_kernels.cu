@@ -294,10 +294,9 @@ __device__ void _moe_align_block_size_small_batch_expert(
     int32_t rank_post_pad =
         tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
 
-      if (token_mask == nullptr || token_mask[i / topk_num]) {
-        sorted_token_ids[sorted_token_ids_offset + rank_post_pad] = i;
-        ++tokens_cnts[tid * num_experts + expert_id];
-      }
+    if (token_mask == nullptr || token_mask[i / topk_num]) {
+      sorted_token_ids[sorted_token_ids_offset + rank_post_pad] = i;
+      ++tokens_cnts[tid * num_experts + expert_id];
     }
   }
 }
