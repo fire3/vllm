@@ -109,7 +109,8 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            alignment=576 if uses_fp8_ds_mla_layout else None,
+            # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).
+            alignment=576 if uses_fp8_ds_mla_layout else 512,
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),
         )
@@ -345,8 +346,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         # Decode can have query_len up to
         #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
-        # This MUST match the flashmla_sparse / indexer threshold so that
-        # all backends agree on the decode/prefill split.
+        # sparse_swa has no MQA-vs-dense-MHA routing, so multi-token queries take
+        # the prefill path and the decode/prefill split stays at that width.
         spec_mult = (
             2 if (spec_config is not None and spec_config.parallel_drafting) else 1
         )
