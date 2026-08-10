@@ -15,6 +15,7 @@ SM 8.9 (NVIDIA Ada) support, embedded as PTX.
 conda activate vllm-dev
 source scripts/build/cu130_env.sh        # CUDA_HOME, arch list, etc.
 bash scripts/build/cu130_install_deps.sh # torch 2.11.0+cu130 + build deps
+bash scripts/build/prepare_deps.sh       # sync .deps to the current checkout's CMake pins
 bash scripts/build/cu130_build_wheel.sh  # builds dist/vllm-*.whl
 bash scripts/build/cu130_verify.sh       # confirms the embedded kernels
 ```
@@ -44,6 +45,12 @@ pip install dist/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/c
 
 ## Notes
 
+- `prepare_deps.sh` now discovers repo/tag/submodule requirements directly from
+  the current checkout's `CMakeLists.txt` and `cmake/external_projects/*.cmake`.
+  When you switch vLLM branches or release tags, rerun it so `.deps` stays in
+  sync with the new pins.
+- Use `bash scripts/build/prepare_deps.sh --gpu --list` to inspect the current
+  CUDA dependency manifest, or `--check` to verify an existing `.deps` tree.
 - `--no-build-isolation` is required so the build uses the conda env's cu130
   torch instead of downloading the CPU torch from PyPI.
 - PyTorch is installed from the `cu130` index only; the other build deps
