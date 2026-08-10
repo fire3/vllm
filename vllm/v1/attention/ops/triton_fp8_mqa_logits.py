@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Temporary gfx942 fallback for AITER's fp8_mqa_logits kernel.
+"""Triton FP8 MQA logits helpers.
 
-This module vendors AITER's Triton fp8_mqa_logits kernel with the gfx942
-tile-size workaround from ROCm/aiter#3257. It is used only while vLLM's
-pinned AITER version lacks that fix.
-
-TODO: Remove this vendored copy once vLLM pins an AITER version that includes
-ROCm/aiter#3257 bugfix for gfx942.
+This module started as a vendored gfx942 fallback for AITER's Triton
+``fp8_mqa_logits`` kernel. It now also provides a CUDA/Triton fallback used by
+SM89 DeepSeek V4 sparse attention when DeepGEMM is unavailable.
 """
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 # gfx942 (MI300X) has 64 KiB of LDS per CU. We accept the default
@@ -259,4 +257,263 @@ def fp8_mqa_logits_gfx942(
         matrix_instr_nonkdim=matrix_instr_nonkdim,
     )
 
+    return logits
+
+
+def fp8_mqa_logits_triton(
+    q: torch.Tensor,
+    k_fp8: torch.Tensor,
+    kv_scales: torch.Tensor,
+    weights: torch.Tensor,
+    cu_starts: torch.Tensor,
+    cu_ends: torch.Tensor,
+) -> torch.Tensor:
+    """Compute FP8 MQA logits with Triton on CUDA/ROCm.
+
+    This is a lightweight local fallback for environments that do not provide
+    DeepGEMM's ``fp8_fp4_mqa_logits`` entry points. It preserves the same output
+    contract as the ROCm reference path: a dense ``[M, N]`` fp32 logits matrix
+    with positions outside ``[cu_starts[i], cu_ends[i])`` pre-filled to ``-inf``.
+    """
+    seq_len, num_heads, head_size = q.shape
+    seq_len_kv = k_fp8.shape[0]
+    assert num_heads & (num_heads - 1) == 0, (
+        f"num_heads must be a power of two (got {num_heads})"
+    )
+    assert head_size & (head_size - 1) == 0, (
+        f"head_size must be a power of two (got {head_size})"
+    )
+
+    kv_scales_1d = kv_scales.reshape(-1)
+    logits = torch.full(
+        (seq_len, seq_len_kv),
+        fill_value=-float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    block_kv = min(128, max(16, triton.next_power_of_2(seq_len_kv)))
+    stride_q_s, stride_q_h, stride_q_d = q.stride()
+    stride_kv_s, stride_kv_d = k_fp8.stride()
+    stride_w_s, stride_w_h = weights.stride()
+    stride_logits_s, stride_logits_k = logits.stride()
+
+    launch_kwargs = dict(num_warps=4, num_stages=2)
+    if current_platform.is_rocm():
+        matrix_instr_nonkdim = 32 if seq_len > 1024 else 16
+        launch_kwargs.update(
+            waves_per_eu=2, matrix_instr_nonkdim=matrix_instr_nonkdim
+        )
+
+    _fp8_mqa_logits_kernel[(seq_len,)](
+        Q_ptr=q,
+        KV_ptr=k_fp8,
+        kv_scales_ptr=kv_scales_1d,
+        weights_ptr=weights,
+        cu_start_ptr=cu_starts,
+        cu_end_ptr=cu_ends,
+        logits_ptr=logits,
+        seq_len=seq_len,
+        seq_len_kv=seq_len_kv,
+        NUM_HEADS=num_heads,
+        HEAD_SIZE=head_size,
+        stride_q_s=stride_q_s,
+        stride_q_h=stride_q_h,
+        stride_q_d=stride_q_d,
+        stride_kv_s=stride_kv_s,
+        stride_kv_d=stride_kv_d,
+        stride_w_s=stride_w_s,
+        stride_w_h=stride_w_h,
+        stride_logits_s=stride_logits_s,
+        stride_logits_k=stride_logits_k,
+        BLOCK_KV=block_kv,
+        **launch_kwargs,
+    )
+    return logits
+
+
+@triton.jit
+def _fp8_paged_mqa_logits_kernel(
+    q_ptr,  # [rows, H, D] fp8
+    kv_values_ptr,  # [num_blocks, block_size, D] fp8
+    kv_scales_ptr,  # [num_blocks, block_size] fp32
+    weights_ptr,  # [rows, H] fp32
+    context_limits_ptr,  # [rows] int32
+    q_offsets_ptr,  # [rows] int32
+    block_tables_ptr,  # [B, max_blocks] int32
+    logits_ptr,  # [rows, max_model_len] fp32
+    next_n,
+    max_blocks,
+    max_model_len,
+    NUM_HEADS: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_COL: tl.constexpr,
+    stride_q_row: tl.int64,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    stride_kv_block: tl.int64,
+    stride_kv_token: tl.int64,
+    stride_kv_d: tl.constexpr,
+    stride_kv_scale_block: tl.int64,
+    stride_kv_scale_token: tl.int64,
+    stride_w_row: tl.int64,
+    stride_w_h: tl.constexpr,
+    stride_bt_batch: tl.int64,
+    stride_bt_block: tl.int64,
+    stride_logits_row: tl.int64,
+    stride_logits_col: tl.int64,
+    block_size: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    col_block_id = tl.program_id(1)
+
+    tl.assume(stride_q_row > 0)
+    tl.assume(stride_kv_block > 0)
+    tl.assume(stride_kv_token > 0)
+    tl.assume(stride_w_row > 0)
+    tl.assume(stride_bt_batch > 0)
+    tl.assume(stride_bt_block > 0)
+    tl.assume(stride_logits_row > 0)
+    tl.assume(stride_logits_col > 0)
+
+    context_limit = tl.load(context_limits_ptr + row_id)
+    q_offset = tl.load(q_offsets_ptr + row_id)
+    batch_idx = row_id // next_n
+
+    col_offsets = col_block_id * BLOCK_COL + tl.arange(0, BLOCK_COL)
+    valid_cols = (
+        (col_offsets < max_model_len)
+        & (col_offsets < context_limit)
+        & (col_offsets <= q_offset)
+    )
+
+    logical_blocks = col_offsets // block_size
+    in_bt_range = logical_blocks < max_blocks
+    safe_blocks = tl.where(in_bt_range, logical_blocks, 0)
+    physical_blocks = tl.load(
+        block_tables_ptr + batch_idx * stride_bt_batch + safe_blocks * stride_bt_block,
+        mask=valid_cols & in_bt_range,
+        other=0,
+    )
+    block_offsets = col_offsets % block_size
+
+    h_offsets = tl.arange(0, NUM_HEADS)[:, None]
+    d_offsets = tl.arange(0, HEAD_SIZE)
+    q_ptrs = (
+        q_ptr
+        + row_id * stride_q_row
+        + h_offsets * stride_q_h
+        + d_offsets[None, :] * stride_q_d
+    )
+    q_block = tl.load(q_ptrs)
+    w_ptrs = weights_ptr + row_id * stride_w_row + h_offsets * stride_w_h
+    w_block = tl.load(w_ptrs).to(tl.float32)
+
+    kv_ptrs = (
+        kv_values_ptr
+        + physical_blocks[None, :] * stride_kv_block
+        + block_offsets[None, :] * stride_kv_token
+        + d_offsets[:, None] * stride_kv_d
+    )
+    kv_block = tl.load(kv_ptrs, mask=valid_cols[None, :], other=0.0)
+    kv_scales = tl.load(
+        kv_scales_ptr
+        + physical_blocks * stride_kv_scale_block
+        + block_offsets * stride_kv_scale_token,
+        mask=valid_cols,
+        other=0.0,
+    )
+
+    scores = tl.dot(q_block, kv_block, input_precision="ieee")
+    scores = tl.maximum(scores * kv_scales[None, :], 0.0)
+    scores = scores * w_block
+    scores = tl.sum(scores, axis=0)
+
+    logits_ptrs = logits_ptr + row_id * stride_logits_row + col_offsets * stride_logits_col
+    tl.store(logits_ptrs, scores, mask=valid_cols)
+
+
+def fp8_paged_mqa_logits_triton(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Compute paged FP8 MQA logits with Triton.
+
+    The paged KV cache uses DeepGEMM's packed FP8 layout:
+    ``[num_blocks, block_size, 1, head_dim + 4]`` where the final 4 bytes store
+    a per-token fp32 scale. This helper keeps the existing dense-logits
+    interface but replaces the Python loop fallback with a single Triton kernel.
+    """
+    fp8_dtype = current_platform.fp8_dtype()
+    batch_size, next_n, num_heads, head_dim = q.shape
+    rows = batch_size * next_n
+    q_rows = q.reshape(rows, num_heads, head_dim).contiguous()
+    weight_rows = weights.view(rows, num_heads).contiguous()
+
+    if kv_cache.shape[-2] == 1:
+        kv_cache = kv_cache.squeeze(-2)
+    kv_values = kv_cache[..., :head_dim].view(fp8_dtype).contiguous()
+    kv_scales = kv_cache[..., head_dim:].view(torch.float32).reshape(
+        kv_cache.shape[0], kv_cache.shape[1]
+    ).contiguous()
+
+    if context_lens.ndim == 1:
+        steps = torch.arange(next_n, device=q.device, dtype=torch.int32)
+        context_limits = context_lens.to(device=q.device, dtype=torch.int32)[:, None]
+        context_limits = context_limits.expand(batch_size, next_n).reshape(-1).contiguous()
+        q_offsets = (
+            context_lens.to(device=q.device, dtype=torch.int32)[:, None]
+            - next_n
+            + steps[None, :]
+        ).reshape(-1).contiguous()
+    else:
+        context_limits = context_lens.to(device=q.device, dtype=torch.int32).reshape(-1)
+        q_offsets = (context_limits - 1).contiguous()
+
+    logits = torch.full(
+        (rows, max_model_len),
+        fill_value=-float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    block_col = 64
+    grid = (rows, triton.cdiv(max_model_len, block_col))
+    _fp8_paged_mqa_logits_kernel[grid](
+        q_ptr=q_rows,
+        kv_values_ptr=kv_values,
+        kv_scales_ptr=kv_scales,
+        weights_ptr=weight_rows,
+        context_limits_ptr=context_limits,
+        q_offsets_ptr=q_offsets,
+        block_tables_ptr=block_tables,
+        logits_ptr=logits,
+        next_n=next_n,
+        max_blocks=block_tables.shape[1],
+        max_model_len=max_model_len,
+        NUM_HEADS=num_heads,
+        HEAD_SIZE=head_dim,
+        BLOCK_COL=block_col,
+        stride_q_row=q_rows.stride(0),
+        stride_q_h=q_rows.stride(1),
+        stride_q_d=q_rows.stride(2),
+        stride_kv_block=kv_values.stride(0),
+        stride_kv_token=kv_values.stride(1),
+        stride_kv_d=kv_values.stride(2),
+        stride_kv_scale_block=kv_scales.stride(0),
+        stride_kv_scale_token=kv_scales.stride(1),
+        stride_w_row=weight_rows.stride(0),
+        stride_w_h=weight_rows.stride(1),
+        stride_bt_batch=block_tables.stride(0),
+        stride_bt_block=block_tables.stride(1),
+        stride_logits_row=logits.stride(0),
+        stride_logits_col=logits.stride(1),
+        block_size=kv_values.shape[1],
+        num_warps=4,
+        num_stages=2,
+    )
     return logits
