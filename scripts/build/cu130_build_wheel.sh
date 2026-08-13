@@ -73,6 +73,18 @@ if ! "${PYTHON}" -c "import setuptools_rust, setuptools_scm, wheel, ninja, cmake
   exit 1
 fi
 
+# Refuse to build against a non-cu130 torch: the wheel would link the wrong
+# PyTorch ABI and fail at runtime.
+TORCH_BUILD="$("${PYTHON}" -c "import torch; print(torch.__version__)" 2>/dev/null || true)"
+case "${TORCH_BUILD}" in
+  *+cu130) ;;
+  *)
+    echo "The active env does not have the cu130 torch build (got: ${TORCH_BUILD:-torch not importable})."
+    echo "Run first: bash scripts/build/cu130_install_deps.sh"
+    exit 1
+    ;;
+esac
+
 mkdir -p "${DIST_DIR}"
 
 # --no-build-isolation lets the build reuse the torch already installed in the

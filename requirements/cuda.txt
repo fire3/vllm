@@ -12,10 +12,12 @@ torchcodec >= 0.14
 PyNvVideoCodec==2.0.4
 # FlashInfer should be updated together with the Dockerfile
 # flashinfer-cubin is not on PyPI since 0.6.14; setup.py excludes it from
-# install_requires so the published wheel does not carry an unresolvable pin
+# install_requires so the published wheel does not carry an unresolvable pin.
+# JIT dev mode: no prebuilt cubin package; kernels are JIT-compiled at runtime
+# (nvcc + ninja must be available). Re-enable the pin to use prebuilt cubins.
 --extra-index-url https://flashinfer.ai/whl/
 flashinfer-python==0.6.16.post3
-flashinfer-cubin==0.6.16.post3
+# flashinfer-cubin==0.6.16.post3
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1

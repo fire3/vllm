@@ -14,7 +14,7 @@ SM 8.9 (NVIDIA Ada) support, embedded as PTX.
 ```bash
 conda activate vllm-dev
 source scripts/build/cu130_env.sh        # CUDA_HOME, arch list, etc.
-bash scripts/build/cu130_install_deps.sh # torch 2.11.0+cu130 + build deps
+bash scripts/build/cu130_install_deps.sh # torch 2.13.0+cu130 + build deps
 bash scripts/build/prepare_deps.sh       # sync .deps to the current checkout's CMake pins
 bash scripts/build/cu130_build_wheel.sh  # builds dist/vllm-*.whl
 bash scripts/build/cu130_verify.sh       # confirms the embedded kernels
@@ -71,3 +71,17 @@ pip install dist/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/c
   keep `--index-url` off for those two commands.
 - The local wheel version is derived from git tags (setuptools-scm). To tag it
   explicitly (e.g. `0.26.0+cu130sm89`), export `VLLM_VERSION_OVERRIDE`.
+
+## Docker 开发环境（可选）
+
+如果不想在宿主机装 conda/CUDA，可以直接在 Docker 容器里开发（宿主机 Ubuntu
+22.04 + Ubuntu 24.04 容器，GPU 通过 NVIDIA Container Toolkit 透传）：
+
+```bash
+bash scripts/build/docker/setup_host.sh       # 服务器一次性准备 Docker + GPU
+bash scripts/build/docker/build_dev_image.sh  # 构建开发镜像
+bash scripts/build/docker/run_dev.sh up       # 进入容器
+```
+
+容器内直接复用本目录的 `prepare_deps.sh` / `cu130_build_wheel.sh`（脚本通过
+`CONDA_PREFIX=/opt/venv` 兼容容器环境）。详细说明见 `scripts/build/docker/README.md`。
