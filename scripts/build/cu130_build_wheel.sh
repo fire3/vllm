@@ -2,11 +2,34 @@
 # Build the vLLM wheel against the cu130 PyTorch already installed in the
 # active conda env, targeting only SM 8.9 via PTX.
 #
-#   bash scripts/build/cu130_build_wheel.sh
+#   bash scripts/build/cu130_build_wheel.sh [--editable]
+#
+# Pass --editable to additionally install the freshly compiled vLLM into the
+# active conda env in editable mode (the wheel is still built as well).
 #
 # Build output is printed live and saved to $BUILD_LOG. Set VERBOSE=0 to
 # suppress verbose CMake output.
 set -euo pipefail
+
+EDITABLE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --editable)
+      EDITABLE=1
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $0 [--editable]" >&2
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Usage: $0 [--editable]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${CONDA_PREFIX:?run inside your conda env, e.g. \"conda activate vllm-dev\"}/bin/python"
@@ -62,6 +85,20 @@ mkdir -p "${DIST_DIR}"
   --no-build-isolation \
   --no-deps \
   -w "${DIST_DIR}" 2>&1 | tee "${BUILD_LOG}"
+
+# Editable install: compile the extensions in place into the source tree and
+# link the conda env to this checkout, so Python changes take effect without
+# reinstalling. The CMake build tree is reused, so this is mostly an
+# incremental rebuild plus a cmake --install into the source tree. Like the
+# wheel build, --no-build-isolation/--no-deps keep the cu130 torch and other
+# deps already installed in the conda env untouched.
+if [[ "${EDITABLE}" == "1" ]]; then
+  echo "Installing vLLM in editable mode..."
+  "${PYTHON}" -m pip install -e . \
+    --no-build-isolation \
+    --no-deps 2>&1 | tee -a "${BUILD_LOG}"
+  echo "Editable install complete."
+fi
 
 echo "Build log: ${BUILD_LOG}"
 echo "Built wheel:"

@@ -20,6 +20,19 @@ bash scripts/build/cu130_build_wheel.sh  # builds dist/vllm-*.whl
 bash scripts/build/cu130_verify.sh       # confirms the embedded kernels
 ```
 
+`cu130_build_wheel.sh` accepts an optional `--editable` flag. With it, the
+script also installs the compiled vLLM into the active conda env in editable
+mode, in addition to still building the wheel:
+
+```bash
+bash scripts/build/cu130_build_wheel.sh --editable
+```
+
+The editable install reuses the same CMake build tree and the env's existing
+cu130 dependencies, so Python changes take effect immediately; C++/CUDA
+changes require rebuilding the extension (re-run the script, or use the
+incremental CMake workflow in `docs/contributing/incremental_build.md`).
+
 ## Choosing the architecture
 
 `TORCH_CUDA_ARCH_LIST` controls what nvcc emits (default `8.9+PTX`):
