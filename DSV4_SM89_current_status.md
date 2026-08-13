@@ -13,6 +13,9 @@
 
 本文档描述的是**当前实现状态**，不是最终完成态。
 
+> 关于当前"启动后卡在 sparse MLA warmup"的排查进展，见
+> [`DSV4_SM89_flashinfer_hang_debug.md`](DSV4_SM89_flashinfer_hang_debug.md)。
+
 ## 2. 当前修改概览
 
 本轮已经修改了以下文件：
