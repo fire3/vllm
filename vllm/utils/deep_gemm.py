@@ -631,7 +631,7 @@ def tf32_hc_prenorm_gemm(
     """
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
-        return _missing()
+        return _tf32_hc_prenorm_gemm_torch(x, fn, out, sqrsum, num_split)
     return _tf32_hc_prenorm_gemm_impl(
         x,
         fn,
@@ -639,6 +639,34 @@ def tf32_hc_prenorm_gemm(
         sqrsum,
         num_split,
     )
+
+
+def _tf32_hc_prenorm_gemm_torch(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int | None,
+) -> None:
+    """Torch fallback for DeepGEMM ``tf32_hc_prenorm_gemm``.
+
+    DeepGEMM only supports SM90/SM100/SM120, so on SM89 the vendored module
+    is never built. Match DeepGEMM's contract: ``out = x.float() @ fn.T`` and
+    ``sqrsum = x.float().square().sum(-1)``, splitting K when ``num_split``
+    is given (same layout as the CUDA kernel).
+    """
+    xf = x.float()
+    if num_split is None or num_split <= 1:
+        out.copy_(xf @ fn.T)
+        sqrsum.copy_(xf.square().sum(-1))
+        return
+    k = xf.shape[-1]
+    split = (k + num_split - 1) // num_split
+    for i in range(num_split):
+        lo = i * split
+        hi = min(lo + split, k)
+        out[i].copy_(xf[:, lo:hi] @ fn[:, lo:hi].T)
+        sqrsum[i].copy_(xf[:, lo:hi].square().sum(-1))
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
