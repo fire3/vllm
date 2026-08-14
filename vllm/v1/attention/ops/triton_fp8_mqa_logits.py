@@ -461,6 +461,12 @@ def fp8_paged_mqa_logits_triton(
     never read by the downstream top-k (``seq_lens`` masking), so skipping them
     is semantics-preserving and removes the fixed O(max_model_len) fill +
     launch cost that would otherwise dominate short-context decode.
+
+    The as-strided byte views are passed straight to the Triton kernel (which
+    already takes explicit ``stride_kv_*`` arguments), so no ``.contiguous()``
+    copy of the per-layer indexer KV cache is materialized. The full pool can
+    be tens of MB per layer on 262k-model-len deployments; copying it every
+    decode step (× the number of indexer layers) was pure fixed overhead.
     """
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, num_heads, head_dim = q.shape
@@ -476,13 +482,13 @@ def fp8_paged_mqa_logits_triton(
         kv_cache,
         (num_blocks, block_size, head_dim),
         (block_bytes, head_dim, 1),
-    ).view(fp8_dtype).contiguous()
+    ).view(fp8_dtype)
     kv_scales = torch.as_strided(
         kv_cache,
         (num_blocks, block_size, 4),
         (block_bytes, 4, 1),
         storage_offset=block_size * head_dim,
-    ).view(torch.float32).squeeze(-1).contiguous()
+    ).view(torch.float32).squeeze(-1)
 
     if context_lens.ndim == 1:
         steps = torch.arange(next_n, device=q.device, dtype=torch.int32)
