@@ -73,7 +73,8 @@ pip install dist/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/c
 - PyTorch is installed from the `cu130` index only; the other build deps
   (cmake, ninja, setuptools-rust, ...) are installed from the default index, so
   keep `--index-url` off for those two commands.
-- The local wheel version is derived from git tags (setuptools-scm) and
-  defaults to the public version plus the `+sm89` local marker, e.g.
-  `0.27.1.dev28+g7a1d4cf79` -> `vllm-0.27.1+sm89-...`. To use a custom
-  version, export `VLLM_VERSION_OVERRIDE`, e.g. `0.26.0+cu130sm89`.
+- The local wheel version is derived from git tags (no setuptools_scm needed;
+  same public version its next-version rule would produce) and defaults to the
+  public version plus the `+sm89` local marker, e.g. `0.27.1.dev28+g7a1d4cf79`
+  -> `vllm-0.27.1+sm89-...`. To use a custom version, export
+  `VLLM_VERSION_OVERRIDE`, e.g. `0.26.0+cu130sm89`.
