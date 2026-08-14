@@ -19,6 +19,10 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+> **Fork 说明（`v0.27.0-dsv4-sm89`）**：本分支在 v0.27.0 基础上移植了
+> DeepSeek V4 (Flash) 稀疏 MLA 对 SM89 (NVIDIA Ada) 的支持，含构建脚本、
+> 移植思路与验证方法。详见 [README_SM89.md](README_SM89.md)。
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
