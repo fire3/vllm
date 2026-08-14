@@ -104,6 +104,10 @@ MLA 的 o_proj（逆 RoPE + `wo_a` 低秩 + `wo_b`）上游走 DeepGEMM 的
 | vllm | `v0.27.0-dsv4-sm89`（本分支） | 基于 `v0.27.0` |
 | flashinfer | `v0.6.16.post3-dev-sm89-dsv4` | 提供 SM89 sparse MLA decode |
 
+FlashInfer 侧的内核实现、构建与验证细节见 FlashInfer 仓库（分支
+`v0.6.16.post3-dev-sm89-dsv4`）根目录的 `README_SM89.md`，本文档与其
+互为引用。
+
 推荐环境（已在本项目验证）：
 
 - conda 环境 `vllm-dsv4-sm89`，Python 3.12.0；
