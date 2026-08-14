@@ -18,10 +18,9 @@ CuTe-DSL，只覆盖 SM90/SM100/SM120，在 Ada（SM89）上完全不满足支�
 | CuTe-DSL (`cutlass`) | SM90+（含 Ada 之外的平台） | Ada 上不兼容，需禁用 |
 | FlashInfer sparse MLA | SM120（vLLM 侧） | 需配套分支提供 Ada 内核 |
 
-目标是在 8×L40S（SM89，46 GiB/卡，CUDA 13.0，PyTorch 2.13.0+cu130）上以
-`FLASHINFER_MLA_SPARSE_DSV4` 后端运行 DeepSeek V4 Flash，FP8 KV cache
-（`fp8_ds_mla` 布局），支持稀疏 MLA 的 prefill + decode、CUDA graph 与
-DSpark 投机解码。
+目标是让 SM89 设备（如 L40S）以 `FLASHINFER_MLA_SPARSE_DSV4` 后端运行
+DeepSeek V4 Flash，使用 FP8 KV cache（`fp8_ds_mla` 布局），支持稀疏 MLA
+的 prefill + decode、CUDA graph 与 DSpark 投机解码。
 
 ## 2. 移植思路
 
@@ -108,21 +107,23 @@ FlashInfer 侧的内核实现、构建与验证细节见 [FlashInfer 仓库
 `v0.6.16.post3-dev-sm89-dsv4` 分支的 README_SM89.md](https://github.com/fire3/flashinfer/blob/v0.6.16.post3-dev-sm89-dsv4/README_SM89.md)，
 本文档与其互为引用。
 
-推荐环境（已在本项目验证）：
+建议依赖基线（可按部署环境调整）：
 
-- conda 环境 `vllm-dsv4-sm89`，Python 3.12.0；
-- PyTorch `2.13.0+cu130`，CUDA 13.0，GPU 8×NVIDIA L40S；
+- Python 3.12、CUDA 13.0 / PyTorch `2.13.0+cu130`；
+- SM89 GPU（如 L40S）；
 - 关键依赖：`tokenspeed-mla`、`humming-kernels`、`tilelang`、
-  `flashinfer-python`（editable）。
+  `flashinfer-python`（配套分支）。
 
-两仓库在开发机上均为 editable 安装，改完代码无需重装即生效。
+开发阶段推荐以 editable 方式安装：vllm 用
+`cu130_build_wheel.sh --editable`，flashinfer 用 `pip install -e .`；
+Python 改动即时生效，C++/CUDA 改动需重新构建对应扩展。
 
 ## 4. 编译与安装
 
 ### 4.1 conda 环境构建（推荐）
 
 ```bash
-conda activate vllm-dsv4-sm89
+conda activate <env>                       # 已配置 CUDA 13.0 + PyTorch cu130 的环境
 source scripts/build/cu130_env.sh          # CUDA_HOME、arch 列表等
 bash scripts/build/cu130_install_deps.sh   # torch 2.13.0+cu130 + 构建依赖
 bash scripts/build/prepare_deps.sh         # 按当前 checkout 的 CMake 依赖清单准备 .deps
@@ -162,11 +163,12 @@ bash scripts/build/docker/run_dev.sh up       # 进入容器
 
 ### 4.3 FlashInfer JIT 注意事项（重要）
 
-本环境使用 FlashInfer 的运行时 JIT 编译（不装预编译 `flashinfer-cubin`），
+若使用 FlashInfer 的运行时 JIT 编译（不安装预编译 `flashinfer-cubin`），
 需要：
 
 - `nvcc` 在 `PATH` 中（JIT 编译要用）；
-- `LD_LIBRARY_PATH` 指向 conda 环境的 lib（避免 ICU 78 加载失败）；
+- 按需设置 `LD_LIBRARY_PATH` 指向 Python 环境的 lib（避免 ICU 等第三方库
+  版本冲突导致加载失败）；
 - `FLASHINFER_DISABLE_VERSION_CHECK=1`；
 - `flashinfer/data/cccl/` 目录非空：JIT include 路径引用
   `data/cccl/{cub, libcudacxx/include, thrust}`。仓库里的 `3rdparty/cccl`
@@ -174,9 +176,9 @@ bash scripts/build/docker/run_dev.sh up       # 进入容器
   编译失败。修复方式：
 
   ```bash
-  # 方式一：从任意已装 flashinfer 的环境拷贝
+  # 方式一：从任意已装 flashinfer 的环境拷贝（python 版本按实际环境调整）
   cp -a <env>/lib/python3.12/site-packages/flashinfer/data/cccl/. \
-        ~/flashinfer/flashinfer/data/cccl/
+        <flashinfer 仓库路径>/flashinfer/data/cccl/
   # 方式二：初始化 submodule 后按 pyproject.toml 的映射拷贝
   git submodule update --init 3rdparty/cccl
   ```
@@ -188,26 +190,30 @@ bash scripts/build/docker/run_dev.sh up       # 进入容器
 
 ## 5. 启动服务
 
-8×L40S、TP=8 的启动参数（参考脚本 `vllm_serve_dsv4flash.sh`）：
+以下为 TP=8（8 卡）的启动参数示例，模型路径与卡数按实际部署调整：
 
 ```bash
 python -m vllm.entrypoints.openai.api_server \
-  --model /data1/DeepSeek-V4-Flash-0731 \
+  --model <model_dir> \          # 模型目录，如 /data1/DeepSeek-V4-Flash-0731
   --tensor-parallel-size 8 \
   --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --kv-cache-dtype fp8_ds_mla \
   --max-model-len 262144
 ```
 
-配套环境变量：`LD_LIBRARY_PATH`（conda env lib）、`NCCL_P2P_DISABLE=1`、
-`FLASHINFER_DISABLE_VERSION_CHECK=1`，且 `PATH` 需含 nvcc。
+运行环境需 `PATH` 含 nvcc（JIT 用），并按部署情况设置
+`LD_LIBRARY_PATH`（指向 Python 环境 lib，避免 ICU 等版本冲突）与
+`FLASHINFER_DISABLE_VERSION_CHECK=1`；如遇 P2P 通信问题，可另行设置
+`NCCL_P2P_DISABLE=1`。
 
 ## 6. 验证
 
 ### 6.1 内核精度
 
-`sm89_precision_verify.py`（需 GPU；远程 `/tmp` 下用环境内 Python 运行，
-需 `PATH` 含 nvcc、`LD_LIBRARY_PATH` 指向 env lib、关闭版本检查）：
+`sm89_precision_verify.py`（需 GPU）：在 vllm/flashinfer 仓库目录之外
+（如 `/tmp`）用环境内 Python 运行，避免本地目录被当作 namespace package
+解析；运行环境需 `PATH` 含 nvcc、`LD_LIBRARY_PATH` 指向环境 lib，并设置
+`FLASHINFER_DISABLE_VERSION_CHECK=1`。
 
 - decode + prefill 共 **37/37 PASS**（NH=8/16/32、topk=128/512、
   nt<=2048、sink 开/关、变长 topk_length）；
