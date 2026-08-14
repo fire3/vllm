@@ -190,21 +190,58 @@ bash scripts/build/docker/run_dev.sh up       # 进入容器
 
 ## 5. 启动服务
 
-以下为 TP=8（8 卡）的启动参数示例，模型路径与卡数按实际部署调整：
+以下为 TP=8（8 卡）部署的参考启动方式，模型路径、端口与资源参数按实际
+部署调整。
+
+### 5.1 环境变量（建议在启动脚本中设置）
 
 ```bash
-python -m vllm.entrypoints.openai.api_server \
-  --model <model_dir> \          # 模型目录，如 /data1/DeepSeek-V4-Flash-0731
-  --tensor-parallel-size 8 \
-  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
-  --kv-cache-dtype fp8_ds_mla \
-  --max-model-len 262144
+# 优先使用 conda 环境的 libstdc++（含 CXXABI_1.3.15），否则系统旧版本
+# 会导致 ICU 78 加载失败（sqlite3 -> _sqlite3 -> libicui18n）
+export LD_LIBRARY_PATH="${CONDA_PREFIX:-<env>}/lib:$LD_LIBRARY_PATH"
+# 关闭 P2P 传输（参考脚本中的默认设置，按部署网络情况保留或去掉）
+export NCCL_P2P_DISABLE=1
+# flashinfer 为 JIT 模式（未安装 flashinfer-cubin）时关闭版本检查
+export FLASHINFER_DISABLE_VERSION_CHECK=1
+# nvcc 必须在 PATH 中：flashinfer JIT 编译依赖它
+export PATH="/usr/local/cuda/bin:$PATH"
 ```
 
-运行环境需 `PATH` 含 nvcc（JIT 用），并按部署情况设置
-`LD_LIBRARY_PATH`（指向 Python 环境 lib，避免 ICU 等版本冲突）与
-`FLASHINFER_DISABLE_VERSION_CHECK=1`；如遇 P2P 通信问题，可另行设置
-`NCCL_P2P_DISABLE=1`。
+### 5.2 启动命令
+
+```bash
+# 模型目录，如 /data1/DeepSeek-V4-Flash-0731
+vllm serve <model_dir> \
+  --served-model-name deepseek-v4-flash \
+  --tensor-parallel-size 8 \
+  --kv-cache-dtype fp8_ds_mla \
+  --max-model-len 262144 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 8 \
+  --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
+  --reasoning-parser deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --tokenizer-mode deepseek_v4 \
+  --enable-auto-tool-choice \
+  --trust-remote-code \
+  --host 0.0.0.0 --port 8091
+```
+
+日志可按需重定向，例如追加
+`2>&1 | tee -a /tmp/vllm_serve_dspark.log`。
+
+### 5.3 DSpark 投机解码：当前不可用
+
+**当前 SM89 移植尚未把 DSpark（dflash 草稿路径）作为可用功能，请勿添加
+`--speculative-config '{"method":"dspark",...}'` 参数。** 参考启动脚本中
+该参数保持注释状态：
+
+- DSpark 草稿路径在 SM89 上仍有未根除的稳定性问题：CUDA graph 重放时
+  草稿输入的异步越界断言在长时运行下仍可能出现，代码侧的输入补齐修复
+  只覆盖了已复现场景，尚未完成完整验证；
+- 该参数开启后还会要求草稿头随目标权重内嵌（DeepSeek-V4 DSpark 复用完整
+  DSV4 配置），SM89 上未做端到端验证；
+- 待 DSpark 路径在 SM89 上验证稳定后再启用，届时同步更新本文档。
 
 ## 6. 验证
 
