@@ -482,13 +482,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # trailing window of context PLUS all query tokens, including future ones),
         # so its per-token index list is wider than `window_size`. The kernel pads
         # the q-head count to B_TOPK (64/128), which requires the index width to be
-        # a multiple of 128.
+        # a multiple of 128. The SM120/SM89 decode-dsv4 kernel only instantiates
+        # topk in {128, 512, 1024}, so land the width on the smallest supported
+        # value that covers the draft window; extra slots stay -1 and
+        # decode_swa_lens caps the active length, so the padding is free.
         self.is_dspark = spec_config is not None and spec_config.use_dspark()
-        self.noncausal_index_width = (
-            cdiv(self.window_size + self.num_speculative_tokens, 128) * 128
-            if self.is_dspark
-            else 0
-        )
+        if self.is_dspark:
+            required_width = self.window_size + self.num_speculative_tokens
+            self.noncausal_index_width = next(
+                (w for w in (128, 512, 1024) if w >= required_width),
+                cdiv(required_width, 128) * 128,
+            )
+        else:
+            self.noncausal_index_width = 0
         self.decode_swa_indices_noncausal: torch.Tensor | None = None
         self._max_tokens = max_tokens
 
