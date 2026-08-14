@@ -281,13 +281,11 @@ def fp8_mqa_logits_triton(
 
     This is a lightweight local fallback for environments that do not provide
     DeepGEMM's ``fp8_fp4_mqa_logits`` entry points. It preserves the same output
-    contract as the ROCm reference path: a dense ``[M, N]`` fp32 logits matrix.
-    The launcher uses ``torch.empty`` rather than an ``-inf`` pre-fill: the
-    only consumer (``top_k_per_row_prefill``) reads positions inside
-    ``[cu_starts[i], cu_ends[i])`` only, and the kernel writes every position
-    in that range, so positions outside the range are never read. At
-    prefill-sized batches the ``-inf`` fill was O(M*N) fp32 writes per layer
-    (e.g. ~2.5 GB at 25k tokens), pure fixed overhead.
+    contract as the ROCm reference path: a dense ``[M, N]`` fp32 logits matrix
+    with positions outside ``[cu_starts[i], cu_ends[i])`` pre-filled to ``-inf``.
+    The fill stays: the top-k consumer may touch elements past the row end
+    (float4-aligned tail reads), so uninitialized memory is not safe without
+    a consumer-side change.
     """
     seq_len, num_heads, head_size = q.shape
     seq_len_kv = k_fp8.shape[0]
@@ -299,8 +297,9 @@ def fp8_mqa_logits_triton(
     )
 
     kv_scales_1d = kv_scales.reshape(-1)
-    logits = torch.empty(
+    logits = torch.full(
         (seq_len, seq_len_kv),
+        fill_value=-float("inf"),
         dtype=torch.float32,
         device=q.device,
     )
