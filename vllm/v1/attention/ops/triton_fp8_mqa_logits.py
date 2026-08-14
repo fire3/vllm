@@ -440,6 +440,8 @@ def fp8_paged_mqa_logits_triton(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    *,
+    max_context_len: int | None = None,
 ) -> torch.Tensor:
     """Compute paged FP8 MQA logits with Triton.
 
@@ -447,6 +449,13 @@ def fp8_paged_mqa_logits_triton(
     ``[num_blocks, block_size, 1, head_dim + 4]`` where the final 4 bytes store
     a per-token fp32 scale. This helper keeps the existing dense-logits
     interface but replaces the Python loop fallback with a single Triton kernel.
+
+    ``max_context_len`` optionally clips the dense-logits width (and the launch
+    grid) to the maximum context length present in this batch. Columns beyond
+    that bound are never stored by the kernel (``context_limit`` masking) and
+    never read by the downstream top-k (``seq_lens`` masking), so skipping them
+    is semantics-preserving and removes the fixed O(max_model_len) fill +
+    launch cost that would otherwise dominate short-context decode.
     """
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, num_heads, head_dim = q.shape
@@ -474,15 +483,27 @@ def fp8_paged_mqa_logits_triton(
         context_limits = context_lens.to(device=q.device, dtype=torch.int32).reshape(-1)
         q_offsets = (context_limits - 1).contiguous()
 
+    # Clip the logits width to the maximum context length actually present.
+    # If the caller does not provide a trusted CPU-side bound (e.g. the
+    # scheduler's max_seq_len), fall back to a device max (one small sync).
+    block_col = 64
+    if context_limits.numel() == 0:
+        max_ctx = max_model_len
+    elif max_context_len is None or max_context_len <= 0:
+        max_ctx = int(context_limits.max().item())
+    else:
+        max_ctx = max_context_len
+    max_ctx = min(max(max_ctx, 1), max_model_len)
+    logits_cols = min(max_model_len, triton.cdiv(max_ctx, block_col) * block_col)
+
     logits = torch.full(
-        (rows, max_model_len),
+        (rows, logits_cols),
         fill_value=-float("inf"),
         dtype=torch.float32,
         device=q.device,
     )
 
-    block_col = 64
-    grid = (rows, triton.cdiv(max_model_len, block_col))
+    grid = (rows, logits_cols // block_col)
     _fp8_paged_mqa_logits_kernel[grid](
         q_ptr=q_rows,
         kv_values_ptr=kv_values,
@@ -494,7 +515,7 @@ def fp8_paged_mqa_logits_triton(
         logits_ptr=logits,
         next_n=next_n,
         max_blocks=block_tables.shape[1],
-        max_model_len=max_model_len,
+        max_model_len=logits_cols,
         NUM_HEADS=num_heads,
         HEAD_SIZE=head_dim,
         BLOCK_COL=block_col,

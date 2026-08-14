@@ -626,6 +626,7 @@ def sparse_attn_indexer(
                     seq_lens,
                     decode_metadata.block_table,
                     max_model_len,
+                    max_context_len=attn_metadata_narrowed.max_seq_len,
                 )
             else:
                 logits = fp8_fp4_paged_mqa_logits(
