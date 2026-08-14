@@ -6,10 +6,8 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
-from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     build_flashinfer_mixed_sparse_indices,
@@ -30,8 +28,6 @@ from vllm.v1.attention.backend import MultipleOf
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
-
-logger = init_logger(__name__)
 
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
@@ -143,29 +139,6 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 8 and device_capability.minor == 9:
-            # DeepSeek-V4-Flash ships index_topk=512, but the SM120 path
-            # requires 2048 (see FlashInferMLASparseSM120Backend). On SM89 the
-            # Triton FP8 indexer has ~2-4% top-k recall loss at 22k+ context;
-            # with 512 slots the DSML/tool-call instructions in a long system
-            # prompt get dropped from attention and the model emits malformed
-            # tool calls (see toolcall_repro ablation). Normalize to 2048 at
-            # backend-selection time so model buffers, attention layers, the
-            # metadata builder and the indexer all see one consistent budget.
-            vllm_config = get_current_vllm_config()
-            hf_config = vllm_config.model_config.hf_config
-            index_topk = getattr(hf_config, "index_topk", None)
-            if index_topk != 2048:
-                logger.warning(
-                    "FLASHINFER_MLA_SPARSE_DSV4 on SM89: forcing index_topk "
-                    "from %s to 2048 to match the SM120 sparse-MLA budget; "
-                    "the smaller top-k degrades long-context tool-call "
-                    "formatting.",
-                    index_topk,
-                )
-                hf_config.index_topk = 2048
-                hf_text_config = vllm_config.model_config.hf_text_config
-                if hf_text_config is not hf_config:
-                    hf_text_config.index_topk = 2048
             if kv_cache_dtype not in (
                 None,
                 "auto",

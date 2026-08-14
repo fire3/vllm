@@ -9,9 +9,12 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -23,6 +26,49 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+logger = init_logger(__name__)
+
+
+def normalize_dsv4_sm89_index_topk(vllm_config: VllmConfig) -> None:
+    """Align the SM89 sparse-MLA index budget with SM120 (index_topk=2048).
+
+    DeepSeek-V4-Flash ships index_topk=512, but the SM120 path requires 2048
+    (see FlashInferMLASparseSM120Backend). On SM89 the Triton FP8 indexer has
+    ~2-4% top-k recall loss at 22k+ context; with 512 slots the DSML/tool-call
+    instructions in a long system prompt get dropped from attention and the
+    model emits malformed tool calls (see toolcall_repro ablation). Normalizing
+    the config before any buffer allocation keeps model buffers, attention
+    layers, the metadata builder and the indexer on one consistent budget.
+
+    Idempotent; no-op unless the FLASHINFER_MLA_SPARSE_DSV4 backend is selected
+    on an SM89 device. Called from the model and the metadata builder so the
+    first one to run covers the other.
+    """
+    capability = current_platform.get_device_capability()
+    if capability is None:
+        return
+    backend = getattr(vllm_config.attention_config, "backend", None)
+    if not (
+        capability.major == 8
+        and capability.minor == 9
+        and backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4
+    ):
+        return
+    hf_config = vllm_config.model_config.hf_config
+    index_topk = getattr(hf_config, "index_topk", None)
+    if index_topk != 2048:
+        logger.warning(
+            "FLASHINFER_MLA_SPARSE_DSV4 on SM89: forcing index_topk "
+            "from %s to 2048 to match the SM120 sparse-MLA budget; "
+            "the smaller top-k degrades long-context tool-call formatting.",
+            index_topk,
+        )
+        hf_config.index_topk = 2048
+        hf_text_config = vllm_config.model_config.hf_text_config
+        if hf_text_config is not hf_config:
+            hf_text_config.index_topk = 2048
+
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
 # h_q=128 (B_TOPK=128). FlashMLA decode asserts extra_topk % B_TOPK == 0;
@@ -145,6 +191,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
+        normalize_dsv4_sm89_index_topk(vllm_config)
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to prefill.
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)

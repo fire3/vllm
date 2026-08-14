@@ -79,6 +79,7 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.models.deepseek_v4.sparse_mla import normalize_dsv4_sm89_index_topk
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -1001,6 +1002,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        normalize_dsv4_sm89_index_topk(vllm_config)
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
