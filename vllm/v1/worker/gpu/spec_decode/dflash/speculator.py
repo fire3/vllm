@@ -528,6 +528,9 @@ def _prepare_dflash_inputs_kernel(
     else:
         # Chunked prefilling: splice in the next prefill token.
         bonus_token = tl.load(next_prefill_tokens_ptr + req_state_idx).to(tl.int32)
+    # last_sampled/next_prefill_tokens can hold -1 for finished/padded requests;
+    # never let it become a query input id (embedding would index OOB).
+    bonus_token = tl.maximum(bonus_token, 0)
 
     last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
     query_base = req_idx * num_query_per_req
@@ -627,6 +630,11 @@ def _prepare_dflash_inputs_kernel(
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+                # Pad query input ids/positions too: the captured graph
+                # replays num_tokens_padded rows, and stale values here
+                # would be fed to the draft embedding (OOB index_select).
+                tl.store(out_input_ids_ptr + block, 0, mask=mask)
+                tl.store(out_query_positions_ptr + block, 0, mask=mask)
 
 
 def prepare_dflash_inputs(
