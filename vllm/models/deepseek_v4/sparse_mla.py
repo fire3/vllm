@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek-V4 FlashMLA sparse backend, metadata, and metadata builder."""
 
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -29,9 +30,13 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+_SM89_INDEX_TOPK_ENV = "VLLM_DSV4_SM89_INDEX_TOPK"
+_SM89_INDEX_TOPK_DEFAULT = 2048
+_SM89_INDEX_TOPK_ALLOWED = (512, 1024, 2048)
+
 
 def normalize_dsv4_sm89_index_topk(vllm_config: VllmConfig) -> None:
-    """Align the SM89 sparse-MLA index budget with SM120 (index_topk=2048).
+    """Align the SM89 sparse-MLA index budget with SM120 by default.
 
     DeepSeek-V4-Flash ships index_topk=512, but the SM120 path requires 2048
     (see FlashInferMLASparseSM120Backend). On SM89 the Triton FP8 indexer has
@@ -44,6 +49,14 @@ def normalize_dsv4_sm89_index_topk(vllm_config: VllmConfig) -> None:
     Idempotent; no-op unless the FLASHINFER_MLA_SPARSE_DSV4 backend is selected
     on an SM89 device. Called from the model and the metadata builder so the
     first one to run covers the other.
+
+    The target budget can be overridden with ``VLLM_DSV4_SM89_INDEX_TOPK``
+    (one of 512/1024/2048). This exists to A/B the top-k budget after the
+    paged indexer K-cache layout fix (recall@512 ≈ 0.978 on synthetic tests);
+    a smaller budget cuts both the indexer top-k work and the sparse-MLA
+    compressed-segment chunk count (2048 → 512 drops decode chunks from
+    ~32 to ~8 per token on C4A layers). Invalid values fall back to the
+    default and log a warning.
     """
     capability = current_platform.get_device_capability()
     if capability is None:
@@ -57,17 +70,35 @@ def normalize_dsv4_sm89_index_topk(vllm_config: VllmConfig) -> None:
         return
     hf_config = vllm_config.model_config.hf_config
     index_topk = getattr(hf_config, "index_topk", None)
-    if index_topk != 2048:
+    try:
+        target_topk = int(os.environ.get(_SM89_INDEX_TOPK_ENV, ""))
+    except ValueError:
+        target_topk = _SM89_INDEX_TOPK_DEFAULT
+    if target_topk not in _SM89_INDEX_TOPK_ALLOWED:
+        if _SM89_INDEX_TOPK_ENV in os.environ:
+            logger.warning(
+                "FLASHINFER_MLA_SPARSE_DSV4 on SM89: ignoring invalid %s=%r, "
+                "falling back to index_topk=%s",
+                _SM89_INDEX_TOPK_ENV,
+                os.environ.get(_SM89_INDEX_TOPK_ENV),
+                _SM89_INDEX_TOPK_DEFAULT,
+            )
+        target_topk = _SM89_INDEX_TOPK_DEFAULT
+    if index_topk != target_topk:
         logger.warning(
             "FLASHINFER_MLA_SPARSE_DSV4 on SM89: forcing index_topk "
-            "from %s to 2048 to match the SM120 sparse-MLA budget; "
-            "the smaller top-k degrades long-context tool-call formatting.",
+            "from %s to %s (env %s; default %s matches the SM120 sparse-MLA "
+            "budget). The smaller top-k degrades long-context tool-call "
+            "formatting unless indexer recall is sufficient.",
             index_topk,
+            target_topk,
+            _SM89_INDEX_TOPK_ENV,
+            _SM89_INDEX_TOPK_DEFAULT,
         )
-        hf_config.index_topk = 2048
+        hf_config.index_topk = target_topk
         hf_text_config = vllm_config.model_config.hf_text_config
         if hf_text_config is not hf_config:
-            hf_text_config.index_topk = 2048
+            hf_text_config.index_topk = target_topk
 
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
