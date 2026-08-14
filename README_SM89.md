@@ -148,20 +148,7 @@ bash scripts/build/cu130_build_wheel.sh --editable
 - 换 vLLM 分支/release tag 后要重跑 `prepare_deps.sh`，可用
   `--gpu --list` 查看依赖清单、`--check` 校验现有 `.deps`。
 
-### 4.2 Docker 开发环境（可选）
-
-宿主机不想装 conda/CUDA 时：
-
-```bash
-bash scripts/build/docker/setup_host.sh       # 一次性：Docker + GPU 透传
-bash scripts/build/docker/build_dev_image.sh  # 构建开发镜像
-bash scripts/build/docker/run_dev.sh up       # 进入容器
-```
-
-容器内复用同一套 `prepare_deps.sh` / `cu130_build_wheel.sh`
-（`CONDA_PREFIX=/opt/venv`）。详见 `scripts/build/docker/README.md`。
-
-### 4.3 FlashInfer JIT 注意事项（重要）
+### 4.2 FlashInfer JIT 注意事项（重要）
 
 若使用 FlashInfer 的运行时 JIT 编译（不安装预编译 `flashinfer-cubin`），
 需要：
@@ -290,7 +277,7 @@ vLLM 侧工具调用/parser 链路。
 | `vllm/utils/deep_gemm.py` / `vllm/v1/attention/ops/flashmla.py` / `fp8_utils.py` | torch 级回退与 E8M0 处理 |
 | `vllm/v1/attention/backends/mla/sparse_swa.py` | DSpark 非因果 SWA 宽度对齐 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` | CUDA graph 重放输入补齐 |
-| `scripts/build/*` | CUDA 13.0 / SM89 构建脚本与 Docker 开发环境 |
+| `scripts/build/*` | CUDA 13.0 / SM89 构建脚本 |
 
 ## 8. 维护与同步说明
 
