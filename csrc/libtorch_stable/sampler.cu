@@ -129,7 +129,15 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads,
       const idxT real_i = skip_cnt + i * items_per_scalar;
 #pragma unroll
       for (int j = 0; j < items_per_scalar; ++j) {
-        f(wide.array[j], real_i + j);
+        const idxT idx = real_i + j;
+        // The last float4 chunk may extend past `len`; only process elements
+        // inside the row so top-k never consumes garbage beyond [rowStart,
+        // rowEnd). Without this bound, callers that pass an uninitialized
+        // logits buffer (e.g. torch.empty after the -inf fill was removed)
+        // could see stale values win top-k slots.
+        if (idx < len) {
+          f(wide.array[j], idx);
+        }
       }
     }
 
