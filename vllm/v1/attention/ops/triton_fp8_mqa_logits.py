@@ -7,10 +7,19 @@ This module started as a vendored gfx942 fallback for AITER's Triton
 SM89 DeepSeek V4 sparse attention when DeepGEMM is unavailable.
 """
 
+import os
+
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
+
+_INDEXER_BLOCK_COL_ENV = "VLLM_SM89_INDEXER_BLOCK_COL"
+_INDEXER_BLOCK_COL_DEFAULT = 64
+_INDEXER_BLOCK_COL_ALLOWED = (64, 128, 256)
 
 # gfx942 (MI300X) has 64 KiB of LDS per CU. We accept the default
 # (BLOCK_KV=128, num_stages=2) tile only when *both* of these hold:
@@ -272,8 +281,13 @@ def fp8_mqa_logits_triton(
 
     This is a lightweight local fallback for environments that do not provide
     DeepGEMM's ``fp8_fp4_mqa_logits`` entry points. It preserves the same output
-    contract as the ROCm reference path: a dense ``[M, N]`` fp32 logits matrix
-    with positions outside ``[cu_starts[i], cu_ends[i])`` pre-filled to ``-inf``.
+    contract as the ROCm reference path: a dense ``[M, N]`` fp32 logits matrix.
+    The launcher uses ``torch.empty`` rather than an ``-inf`` pre-fill: the
+    only consumer (``top_k_per_row_prefill``) reads positions inside
+    ``[cu_starts[i], cu_ends[i])`` only, and the kernel writes every position
+    in that range, so positions outside the range are never read. At
+    prefill-sized batches the ``-inf`` fill was O(M*N) fp32 writes per layer
+    (e.g. ~2.5 GB at 25k tokens), pure fixed overhead.
     """
     seq_len, num_heads, head_size = q.shape
     seq_len_kv = k_fp8.shape[0]
@@ -285,9 +299,8 @@ def fp8_mqa_logits_triton(
     )
 
     kv_scales_1d = kv_scales.reshape(-1)
-    logits = torch.full(
+    logits = torch.empty(
         (seq_len, seq_len_kv),
-        fill_value=-float("inf"),
         dtype=torch.float32,
         device=q.device,
     )
@@ -506,7 +519,20 @@ def fp8_paged_mqa_logits_triton(
     # Clip the logits width to the maximum context length actually present.
     # If the caller does not provide a trusted CPU-side bound (e.g. the
     # scheduler's max_seq_len), fall back to a device max (one small sync).
-    block_col = 64
+    try:
+        block_col = int(os.environ.get(_INDEXER_BLOCK_COL_ENV, ""))
+    except ValueError:
+        block_col = _INDEXER_BLOCK_COL_DEFAULT
+    if block_col not in _INDEXER_BLOCK_COL_ALLOWED:
+        if _INDEXER_BLOCK_COL_ENV in os.environ:
+            logger.warning(
+                "fp8_paged_mqa_logits: ignoring invalid %s=%r, "
+                "falling back to BLOCK_COL=%s",
+                _INDEXER_BLOCK_COL_ENV,
+                os.environ.get(_INDEXER_BLOCK_COL_ENV),
+                _INDEXER_BLOCK_COL_DEFAULT,
+            )
+        block_col = _INDEXER_BLOCK_COL_DEFAULT
     if context_limits.numel() == 0:
         max_ctx = max_model_len
     elif max_context_len is None or max_context_len <= 0:
