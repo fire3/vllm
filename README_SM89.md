@@ -143,8 +143,9 @@ bash scripts/build/sm89_build_wheel.sh --editable
 - `TORCH_CUDA_ARCH_LIST` 默认 `8.9+PTX`（sm_89 SASS + compute_89 PTX，
   Ada 及更新架构可 JIT）；只需 Ada 时可改为 `8.9`。
 - 构建必须 `--no-build-isolation`，用 conda 环境内的 cu130 torch。
-- 本地 wheel 版本由 git tag 推导（setuptools-scm），可用
-  `VLLM_VERSION_OVERRIDE` 显式指定，如 `0.27.0+cu130sm89`。
+- 本地 wheel 版本由 git tag 推导（setuptools-scm），默认取公开版本并追加
+  `+sm89` local 标记（如 `0.27.1.dev28+g7a1d4cf79` → `vllm-0.27.1+sm89-...`）；
+  可用 `VLLM_VERSION_OVERRIDE` 覆盖，如 `0.27.0+cu130sm89`。
 - 换 vLLM 分支/release tag 后要重跑 `sm89_prepare_deps.sh`，可用
   `--gpu --list` 查看依赖清单、`--check` 校验现有 `.deps`。
 
