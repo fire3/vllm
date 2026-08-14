@@ -445,10 +445,15 @@ def fp8_paged_mqa_logits_triton(
 ) -> torch.Tensor:
     """Compute paged FP8 MQA logits with Triton.
 
-    The paged KV cache uses DeepGEMM's packed FP8 layout:
-    ``[num_blocks, block_size, 1, head_dim + 4]`` where the final 4 bytes store
-    a per-token fp32 scale. This helper keeps the existing dense-logits
-    interface but replaces the Python loop fallback with a single Triton kernel.
+    The paged KV cache uses the packed FP8 layout shared by the C++
+    ``indexer_k_quant_and_cache`` writer and the Triton compressor:
+    per block, ``[block_size * head_dim]`` FP8 data bytes followed by
+    ``[block_size * 4]`` fp32 scale bytes. Torch exposes the cache as
+    ``[num_blocks, block_size, head_dim + 4]``, but the physical byte offsets
+    are ``token * head_dim`` for data and ``block_size * head_dim + token * 4``
+    for scales, so the launcher reads them with ``as_strided`` over the raw
+    bytes. This helper keeps the existing dense-logits interface but replaces
+    the Python loop fallback with a single Triton kernel.
 
     ``max_context_len`` optionally clips the dense-logits width (and the launch
     grid) to the maximum context length present in this batch. Columns beyond
@@ -465,10 +470,19 @@ def fp8_paged_mqa_logits_triton(
 
     if kv_cache.shape[-2] == 1:
         kv_cache = kv_cache.squeeze(-2)
-    kv_values = kv_cache[..., :head_dim].view(fp8_dtype).contiguous()
-    kv_scales = kv_cache[..., head_dim:].view(torch.float32).reshape(
-        kv_cache.shape[0], kv_cache.shape[1]
-    ).contiguous()
+    num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
+    block_bytes = kv_cache.stride(0)
+    kv_values = torch.as_strided(
+        kv_cache,
+        (num_blocks, block_size, head_dim),
+        (block_bytes, head_dim, 1),
+    ).view(fp8_dtype).contiguous()
+    kv_scales = torch.as_strided(
+        kv_cache,
+        (num_blocks, block_size, 4),
+        (block_bytes, 4, 1),
+        storage_offset=block_size * head_dim,
+    ).view(torch.float32).squeeze(-1).contiguous()
 
     if context_lens.ndim == 1:
         steps = torch.arange(next_n, device=q.device, dtype=torch.int32)
