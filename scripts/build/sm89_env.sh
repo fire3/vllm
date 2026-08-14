@@ -4,6 +4,8 @@
 #
 #   source scripts/build/sm89_env.sh
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 # nvcc lives under /usr/local (here /usr/local/cuda -> /usr/local/cuda-13.0).
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 export PATH="${CUDA_HOME}/bin:${PATH}"

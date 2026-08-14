@@ -36,9 +36,11 @@ PYTHON="${CONDA_PREFIX:?run inside your conda env, e.g. \"conda activate vllm-de
 DIST_DIR="${DIST_DIR:-${REPO_ROOT}/dist}"
 BUILD_LOG="${BUILD_LOG:-${DIST_DIR}/build_cu130.log}"
 
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9+PTX}"
-export VLLM_MAIN_CUDA_VERSION="${VLLM_MAIN_CUDA_VERSION:-13.0}"
+# Environment defaults (CUDA_HOME, PATH, TORCH_CUDA_ARCH_LIST,
+# VLLM_MAIN_CUDA_VERSION, and the default VLLM_VERSION_OVERRIDE with the
+# "+sm89" wheel marker).
+source scripts/build/sm89_env.sh
+
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 # VERBOSE=1 makes setup.py pass -DCMAKE_VERBOSE_MAKEFILE=ON to CMake, so the
 # build emits every compile command into the log.
