@@ -60,8 +60,7 @@ trap 'rm -rf "${TMP}"' EXIT
 
 # Install the remaining build requirements from PyPI, but strip the torch
 # family first: torch is already installed from the cu130 index above, and a
-# plain PyPI install would replace it with the CPU wheel. Mirrors the
-# filtering done in scripts/build/docker/Dockerfile.dev.
+# plain PyPI install would replace it with the CPU wheel.
 sed -E '/^(torch|torchaudio|torchvision|torchcodec)([[:space:]]*[<>=]|$)/d' \
   "${REPO_ROOT}/requirements/build/cuda.txt" > "${TMP}/build-cuda.txt"
 uv pip install --python "${PYTHON}" \
