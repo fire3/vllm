@@ -59,6 +59,16 @@ The wheel links against cu130 PyTorch, so install it with the cu130 index:
 pip install dist/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
+## SM89 pairing with the FlashInfer wheel
+
+The SM89 vLLM wheel must be used with the matching FlashInfer build
+(`flashinfer_python-0.6.16.post3+sm89-*.whl`, or an editable install built
+with `FLASHINFER_LOCAL_VERSION=sm89`). Install FlashInfer first, then this
+wheel. vLLM's `flashinfer-python==0.6.16.post3` pin is satisfied by the
+`+sm89` wheel (specifier matching ignores the local version), but the SM89
+runtime path requires the fork's FlashInfer build — upstream `0.6.16.post3`
+fails the startup check `has_flashinfer_sparse_mla_sm89()`.
+
 ## Notes
 
 - `sm89_prepare_deps.sh` now discovers repo/tag/submodule requirements directly

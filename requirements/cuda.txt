@@ -18,6 +18,13 @@ PyNvVideoCodec==2.0.4
 --extra-index-url https://flashinfer.ai/whl/
 flashinfer-python==0.6.16.post3
 # flashinfer-cubin==0.6.16.post3
+# SM89 pairing: the fork's wheels carry the PEP 440 local marker "+sm89"
+# (flashinfer_python-0.6.16.post3+sm89 paired with vllm-0.27.1+sm89).
+# Specifier matching ignores local versions, so the ==0.6.16.post3 pin above
+# is satisfied by the +sm89 wheel or an editable install; keep the pin without
+# a local version so plain editable installs still resolve. The SM89 runtime
+# path requires the fork's FlashInfer build (has_flashinfer_sparse_mla_sm89);
+# installing upstream 0.6.16.post3 alone fails that check at startup.
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 nvidia-cudnn-frontend>=1.19.1

@@ -177,6 +177,26 @@ bash scripts/build/sm89_build_wheel.sh --editable
 （性能回退约 1.76~2.1x）。已恢复上游实现并完成正确性验证（9 万+ 除数 ×
 2048 个 n，共 1.84 亿次 divmod，0 错误）。
 
+### 4.3 与 FlashInfer wheel 的配套安装
+
+两个 wheel 必须成对使用，版本对为：
+
+- `vllm-0.27.1+sm89-*.whl`（本分支构建，见 4.1）；
+- `flashinfer_python-0.6.16.post3+sm89-*.whl`（FlashInfer 配套分支构建，见
+  FlashInfer 仓库 README_SM89.md 第 4 节）。
+
+配套规则：
+
+- **先装 FlashInfer `+sm89`**（wheel，或 `FLASHINFER_LOCAL_VERSION=sm89` 的
+  editable 安装），再装 vLLM wheel；
+- vLLM 的 `requirements/cuda.txt` 固定 `flashinfer-python==0.6.16.post3`：
+  PEP 440 的 specifier 匹配忽略 local 版本，`0.6.16.post3+sm89` 可以满足
+  该 pin，因此 pin 不需要、也不应该改成 `==0.6.16.post3+sm89`（严格 local
+  pin 会拒绝不带 local 标记的安装）；
+- **不要用上游索引（PyPI / flashinfer.ai）的 `0.6.16.post3` 替代**：它没有
+  SM89 sparse MLA，vLLM 启动时 `has_flashinfer_sparse_mla_sm89()` 会直接
+  报错并拒绝启用 `FLASHINFER_MLA_SPARSE_DSV4`。
+
 ## 5. 启动服务
 
 以下为 TP=8（8 卡）部署的参考启动方式，模型路径、端口与资源参数按实际
