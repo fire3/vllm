@@ -2,7 +2,7 @@
 # Build the vLLM wheel against the cu130 PyTorch already installed in the
 # active conda env, targeting only SM 8.9 via PTX.
 #
-#   bash scripts/build/cu130_build_wheel.sh [--editable]
+#   bash scripts/build/sm89_build_wheel.sh [--editable]
 #
 # Pass --editable to additionally install the freshly compiled vLLM into the
 # active conda env in editable mode (the wheel is still built as well).
@@ -69,7 +69,7 @@ fi
 # sure its dependencies are present. All of these come from install_deps.sh.
 if ! "${PYTHON}" -c "import setuptools_rust, setuptools_scm, wheel, ninja, cmake" 2>/dev/null; then
   echo "Build dependencies are missing. Run first:"
-  echo "  bash scripts/build/cu130_install_deps.sh"
+  echo "  bash scripts/build/sm89_install_deps.sh"
   exit 1
 fi
 
@@ -80,7 +80,7 @@ case "${TORCH_BUILD}" in
   *+cu130) ;;
   *)
     echo "The active env does not have the cu130 torch build (got: ${TORCH_BUILD:-torch not importable})."
-    echo "Run first: bash scripts/build/cu130_install_deps.sh"
+    echo "Run first: bash scripts/build/sm89_install_deps.sh"
     exit 1
     ;;
 esac

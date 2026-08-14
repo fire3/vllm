@@ -2,7 +2,7 @@
 # Source this file to configure your shell for building a CUDA 13.0 vLLM wheel
 # that only carries SM 8.9 (NVIDIA Ada, e.g. RTX 40-series) as PTX.
 #
-#   source scripts/build/cu130_env.sh
+#   source scripts/build/sm89_env.sh
 
 # nvcc lives under /usr/local (here /usr/local/cuda -> /usr/local/cuda-13.0).
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"

@@ -115,7 +115,7 @@ FlashInfer 侧的内核实现、构建与验证细节见 [FlashInfer 仓库
   `flashinfer-python`（配套分支）。
 
 开发阶段推荐以 editable 方式安装：vllm 用
-`cu130_build_wheel.sh --editable`，flashinfer 用 `pip install -e .`；
+`sm89_build_wheel.sh --editable`，flashinfer 用 `pip install -e .`；
 Python 改动即时生效，C++/CUDA 改动需重新构建对应扩展。
 
 ## 4. 编译与安装
@@ -124,18 +124,18 @@ Python 改动即时生效，C++/CUDA 改动需重新构建对应扩展。
 
 ```bash
 conda activate <env>                       # 已配置 CUDA 13.0 + PyTorch cu130 的环境
-source scripts/build/cu130_env.sh          # CUDA_HOME、arch 列表等
-bash scripts/build/cu130_install_deps.sh   # torch 2.13.0+cu130 + 构建依赖
-bash scripts/build/prepare_deps.sh         # 按当前 checkout 的 CMake 依赖清单准备 .deps
-bash scripts/build/cu130_build_wheel.sh    # 构建 dist/vllm-*.whl
-bash scripts/build/cu130_verify.sh         # 校验嵌入的内核
+source scripts/build/sm89_env.sh           # CUDA_HOME、arch 列表等
+bash scripts/build/sm89_install_deps.sh    # torch 2.13.0+cu130 + 构建依赖
+bash scripts/build/sm89_prepare_deps.sh    # 按当前 checkout 的 CMake 依赖清单准备 .deps
+bash scripts/build/sm89_build_wheel.sh     # 构建 dist/vllm-*.whl
+bash scripts/build/sm89_verify.sh          # 校验嵌入的内核
 ```
 
 开发期直接 editable 安装（Python 改动即时生效；C++/CUDA 改动需要重新
 执行构建脚本）：
 
 ```bash
-bash scripts/build/cu130_build_wheel.sh --editable
+bash scripts/build/sm89_build_wheel.sh --editable
 ```
 
 要点：
@@ -145,7 +145,7 @@ bash scripts/build/cu130_build_wheel.sh --editable
 - 构建必须 `--no-build-isolation`，用 conda 环境内的 cu130 torch。
 - 本地 wheel 版本由 git tag 推导（setuptools-scm），可用
   `VLLM_VERSION_OVERRIDE` 显式指定，如 `0.27.0+cu130sm89`。
-- 换 vLLM 分支/release tag 后要重跑 `prepare_deps.sh`，可用
+- 换 vLLM 分支/release tag 后要重跑 `sm89_prepare_deps.sh`，可用
   `--gpu --list` 查看依赖清单、`--check` 校验现有 `.deps`。
 
 ### 4.2 FlashInfer JIT 注意事项（重要）
@@ -277,7 +277,7 @@ vLLM 侧工具调用/parser 链路。
 | `vllm/utils/deep_gemm.py` / `vllm/v1/attention/ops/flashmla.py` / `fp8_utils.py` | torch 级回退与 E8M0 处理 |
 | `vllm/v1/attention/backends/mla/sparse_swa.py` | DSpark 非因果 SWA 宽度对齐 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` | CUDA graph 重放输入补齐 |
-| `scripts/build/*` | CUDA 13.0 / SM89 构建脚本 |
+| `scripts/build/sm89_*.sh` | CUDA 13.0 / SM89 构建脚本 |
 
 ## 8. 维护与同步说明
 

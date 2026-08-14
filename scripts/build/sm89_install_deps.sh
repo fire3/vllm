@@ -3,8 +3,8 @@
 # conda environment. Run this inside the conda env you will build in.
 #
 #   conda activate vllm-dev
-#   bash scripts/build/cu130_install_deps.sh            # torch + build deps
-#   bash scripts/build/cu130_install_deps.sh --runtime  # also sync runtime deps
+#   bash scripts/build/sm89_install_deps.sh            # torch + build deps
+#   bash scripts/build/sm89_install_deps.sh --runtime  # also sync runtime deps
 #
 # Inside China, set USE_CN_MIRROR=1 to download deps from China mirrors
 # (Aliyun PyTorch wheels, Tsinghua PyPI) for faster installs.
@@ -81,4 +81,4 @@ if [[ "${INSTALL_RUNTIME}" == "1" ]]; then
     -r "${TMP}/cuda.txt"
 fi
 
-echo "Dependencies installed. Next: bash scripts/build/cu130_build_wheel.sh"
+echo "Dependencies installed. Next: bash scripts/build/sm89_build_wheel.sh"

@@ -3,29 +3,32 @@
 Helper scripts to build a CUDA 13.0 wheel from this checkout that only carries
 SM 8.9 (NVIDIA Ada) support, embedded as PTX.
 
+本目录脚本统一使用 `sm89_` 前缀（参考 FlashInfer fork 的
+`scripts/build/` 命名）。
+
 ## Prerequisites
 
 - An activated conda environment (the scripts work in conda; see
-  `cu130_install_deps.sh`).
+  `sm89_install_deps.sh`).
 - CUDA 13.0 toolkit with `nvcc` under `/usr/local/cuda`.
 
 ## Usage
 
 ```bash
 conda activate vllm-dev
-source scripts/build/cu130_env.sh        # CUDA_HOME, arch list, etc.
-bash scripts/build/cu130_install_deps.sh # torch 2.13.0+cu130 + build deps
-bash scripts/build/prepare_deps.sh       # sync .deps to the current checkout's CMake pins
-bash scripts/build/cu130_build_wheel.sh  # builds dist/vllm-*.whl
-bash scripts/build/cu130_verify.sh       # confirms the embedded kernels
+source scripts/build/sm89_env.sh        # CUDA_HOME, arch list, etc.
+bash scripts/build/sm89_install_deps.sh # torch 2.13.0+cu130 + build deps
+bash scripts/build/sm89_prepare_deps.sh # sync .deps to the current checkout's CMake pins
+bash scripts/build/sm89_build_wheel.sh  # builds dist/vllm-*.whl
+bash scripts/build/sm89_verify.sh       # confirms the embedded kernels
 ```
 
-`cu130_build_wheel.sh` accepts an optional `--editable` flag. With it, the
+`sm89_build_wheel.sh` accepts an optional `--editable` flag. With it, the
 script also installs the compiled vLLM into the active conda env in editable
 mode, in addition to still building the wheel:
 
 ```bash
-bash scripts/build/cu130_build_wheel.sh --editable
+bash scripts/build/sm89_build_wheel.sh --editable
 ```
 
 The editable install reuses the same CMake build tree and the env's existing
@@ -58,12 +61,13 @@ pip install dist/vllm-*.whl --extra-index-url https://download.pytorch.org/whl/c
 
 ## Notes
 
-- `prepare_deps.sh` now discovers repo/tag/submodule requirements directly from
-  the current checkout's `CMakeLists.txt` and `cmake/external_projects/*.cmake`.
-  When you switch vLLM branches or release tags, rerun it so `.deps` stays in
-  sync with the new pins.
-- Use `bash scripts/build/prepare_deps.sh --gpu --list` to inspect the current
-  CUDA dependency manifest, or `--check` to verify an existing `.deps` tree.
+- `sm89_prepare_deps.sh` now discovers repo/tag/submodule requirements directly
+  from the current checkout's `CMakeLists.txt` and
+  `cmake/external_projects/*.cmake`. When you switch vLLM branches or release
+  tags, rerun it so `.deps` stays in sync with the new pins.
+- Use `bash scripts/build/sm89_prepare_deps.sh --gpu --list` to inspect the
+  current CUDA dependency manifest, or `--check` to verify an existing `.deps`
+  tree.
 - `--no-build-isolation` is required so the build uses the conda env's cu130
   torch instead of downloading the CPU torch from PyPI.
 - PyTorch is installed from the `cu130` index only; the other build deps

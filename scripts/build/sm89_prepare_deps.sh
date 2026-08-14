@@ -3,7 +3,7 @@
 #
 # vLLM's CMake pulls several Git repositories through FetchContent into
 # $ROOT/.deps (setup.py passes -DFETCHCONTENT_BASE_DIR=$ROOT/.deps). When the
-# build runs with FETCHCONTENT_FULLY_DISCONNECTED=ON (see cu130_build_wheel.sh),
+# build runs with FETCHCONTENT_FULLY_DISCONNECTED=ON (see sm89_build_wheel.sh),
 # CMake never downloads anything -- it expects every dependency to already be
 # present as .deps/<name>-src, checked out to the exact ref the current checkout
 # pins.
@@ -19,10 +19,10 @@
 #                             CMake on the first online configure)
 #
 # Usage:
-#   bash scripts/build/prepare_deps.sh [--gpu|--cpu|--all] [--deps-dir DIR]
-#                                      [--retries N] [--mirror URL]
-#                                      [--device cuda|rocm]
-#                                      [--list] [--fix-stamps] [--check] [-q]
+#   bash scripts/build/sm89_prepare_deps.sh [--gpu|--cpu|--all] [--deps-dir DIR]
+#                                           [--retries N] [--mirror URL]
+#                                           [--device cuda|rocm]
+#                                           [--list] [--fix-stamps] [--check] [-q]
 #
 #   Scope (default: --gpu, the CUDA build dependencies):
 #     --gpu  only what a CUDA build needs
@@ -626,5 +626,5 @@ if (( fail > 0 )); then
   exit 1
 fi
 say
-say "Next: build vLLM offline. cu130_build_wheel.sh already sets"
+say "Next: build vLLM offline. sm89_build_wheel.sh already sets"
 say "FETCHCONTENT_FULLY_DISCONNECTED=ON and will reuse ${DEPS_DIR} as-is."

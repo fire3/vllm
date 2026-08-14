@@ -2,7 +2,7 @@
 # Verify a freshly built wheel: confirm the toolchain and that the compiled
 # kernels contain only SM 8.9 (SASS and/or PTX), not other architectures.
 #
-#   bash scripts/build/cu130_verify.sh [path/to/vllm-*.whl]
+#   bash scripts/build/sm89_verify.sh [path/to/vllm-*.whl]
 set -euo pipefail
 
 PYTHON="${CONDA_PREFIX:?run inside your conda env}/bin/python"
