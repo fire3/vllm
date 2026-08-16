@@ -96,6 +96,24 @@ MLA 的 o_proj（逆 RoPE + `wo_a` 低秩 + `wo_b`）上游走 DeepGEMM 的
 转换，避免 DSV4 Flash 工具调用链路崩溃。与 SM89 无直接关系，但属于该
 分支发布所需的修复，故保留在分支中。
 
+### 2.7 MoE 后端：humming 优先（2026-08-16 A/B）
+
+SM89 上 MXFP4 MoE（`expert_dtype: fp4`）可显式选择
+`--kernel-config '{"moe_backend":"humming"}'` 走 humming-kernels 的
+`HummingIndexedExperts`，替代默认 Marlin。8×L40S、1M ctx、8 并发实测
+（200 prompts，`vllm bench serve`）：
+
+| 后端 | output tok/s | TPOT med (ms) | p99 TPOT (ms) | 工具调用 replay |
+| --- | --- | --- | --- | --- |
+| Marlin | 183.0 | 39.6 | 53.1 | 6/6 |
+| humming indexed | 192.7 / 193.1 | 39.1~39.2 | 42.2~42.3 | 6/6 |
+| humming grouped | 176.7 | 39.0 | 42.8 | — |
+
+结论：humming indexed 稳定快约 5.4%、尾部延迟更好、正确性无回归；grouped
+变体更差，不使用。详细记录见根仓库
+`DSV4_SM89_moe_backend_ab.md`。注意 `moe_backend="auto"` 不会自动选
+humming（GPT-OSS 优先级列表不含它），需显式指定。
+
 ## 3. 分支对应与依赖
 
 | 仓库 | 分支 / 版本 | 说明 |
@@ -227,6 +245,7 @@ vllm serve <model_dir> \
   --max-model-len 262144 \
   --gpu-memory-utilization 0.90 \
   --max-num-seqs 8 \
+  --kernel-config '{"moe_backend":"humming"}' \
   --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --reasoning-parser deepseek_v4 \
   --tool-call-parser deepseek_v4 \
@@ -235,6 +254,9 @@ vllm serve <model_dir> \
   --trust-remote-code \
   --host 0.0.0.0 --port 8091
 ```
+
+`--kernel-config '{"moe_backend":"humming"}'` 为 2026-08-16 A/B 后的
+默认（见 2.7）；如需回退 Marlin，删掉该行（或改值为 `"marlin"`）即可。
 
 日志可按需重定向，例如追加
 `2>&1 | tee -a /tmp/vllm_serve_dspark.log`。
@@ -296,6 +318,7 @@ vLLM 侧工具调用/parser 链路。
 | `vllm/models/deepseek_v4/sparse_mla.py` | `normalize_dsv4_sm89_index_topk`（默认 2048 + env 覆盖） |
 | `vllm/utils/flashinfer.py` | `has_flashinfer_sparse_mla_sm89` 能力探测 |
 | `vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py` | SM89 后端支持、KV cache 布局、启动检查 |
+| `vllm/model_executor/layers/fused_moe/oracle/mxfp4.py` 与 `experts/fused_humming_moe.py` | MXFP4 MoE 后端选择与 humming 专家类（A/B 后默认 humming indexed） |
 | `vllm/utils/deep_gemm.py` / `vllm/v1/attention/ops/flashmla.py` / `fp8_utils.py` | torch 级回退与 E8M0 处理 |
 | `vllm/v1/attention/backends/mla/sparse_swa.py` | DSpark 非因果 SWA 宽度对齐 |
 | `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py` | CUDA graph 重放输入补齐 |
