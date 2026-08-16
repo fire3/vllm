@@ -244,7 +244,7 @@ vllm serve <model_dir> \
   --kv-cache-dtype fp8_ds_mla \
   --max-model-len 262144 \
   --gpu-memory-utilization 0.90 \
-  --max-num-seqs 8 \
+  --max-num-seqs 16 \
   --kernel-config '{"moe_backend":"humming"}' \
   --attention-backend FLASHINFER_MLA_SPARSE_DSV4 \
   --reasoning-parser deepseek_v4 \
@@ -257,6 +257,12 @@ vllm serve <model_dir> \
 
 `--kernel-config '{"moe_backend":"humming"}'` 为 2026-08-16 A/B 后的
 默认（见 2.7）；如需回退 Marlin，删掉该行（或改值为 `"marlin"`）即可。
+
+`--max-model-len 262144` 与 `--max-num-seqs 16` 为 2026-08-16 batch/max-len
+A/B 后的默认（见根仓库 `DSV4_SM89_decode_batch_maxlen_ab.md`）：同 8 并发下
+262k 比 1M 快约 11%，16 并发再 +22%；**并发上限建议 ≤16**，24 会因排队/
+prefill 争抢导致 TTFT 冲到秒级。`--gpu-memory-utilization` 不宜超过 0.91
+（初始化含 CUDA graph 内存预留，过高有启动失败风险）。
 
 日志可按需重定向，例如追加
 `2>&1 | tee -a /tmp/vllm_serve_dspark.log`。
