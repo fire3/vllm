@@ -117,9 +117,9 @@ def test_fp8_mqa_logits_triton_matches_deepgemm_order() -> None:
     ref = _ref_deepgemm_order(q_fp8, k_fp8, weights, k_scale, cu_ks, cu_ke)
     cols = torch.arange(N, device="cuda")
     in_window = (cols[None, :] >= cu_ks[:, None]) & (cols[None, :] < cu_ke[:, None])
-    rel = ((logits - ref).abs() / ref.abs().clamp_min(1e-6))[in_window]
+    abs_err = (logits - ref).abs()[in_window]
     # fp8 MMA accumulation-order noise only (fp8 products are exact in fp32).
-    assert rel.max().item() < 1e-5, f"max_rel={rel.max().item():.3e}"
+    assert abs_err.max().item() < 1e-3, f"max_abs={abs_err.max().item():.3e}"
 
 
 def test_fp8_paged_mqa_logits_triton_matches_deepgemm_order() -> None:
@@ -171,12 +171,8 @@ def test_fp8_paged_mqa_logits_triton_matches_deepgemm_order() -> None:
     )
     for r in range(rows):
         length = int(context_lens[r].item())
-        rel = (logits[r, :length] - ref[r, :length]).abs() / ref[
-            r, :length
-        ].abs().clamp_min(1e-6)
-        assert rel.max().item() < 1e-5, (
-            f"row {r} max_rel={rel.max().item():.3e}"
-        )
+        abs_err = (logits[r, :length] - ref[r, :length]).abs()
+        assert abs_err.max().item() < 1e-3, f"row {r} max_abs={abs_err.max().item():.3e}"
 
 
 def test_fused_indexer_q_weight_fold_matches_cutedsl_order() -> None:

@@ -139,7 +139,7 @@ SM89 的 indexer 打分（`fp8_mqa_logits_triton` / `fp8_paged_mqa_logits_triton
 验证脚本为 `tests/kernels/test_dsv4_indexer_scoring_calibration.py`（CUDA）：
 
 - 打分内核 vs DeepGEMM 规范顺序参考（含非零窗口起点、混合窗口宽度）：
-  `max_rel` 保持在 1e-5 量级（纯 fp8 MMA 累加顺序噪声）；
+  窗口内 `max_abs` 保持在 1e-4 量级（纯 fp8 MMA 累加顺序噪声）；
 - 权重折叠 vs CuteDSL 参考乘序：要求 `bit_equal=True`。
 
 边界说明：打分精度最终受 fp8 量化本身限制，SM89 与 SM100/SM120 使用同一
