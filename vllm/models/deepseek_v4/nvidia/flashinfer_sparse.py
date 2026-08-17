@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
+import time
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -40,6 +41,34 @@ _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 _DSV4_DECODE_MAX_TOKENS = 64
 
 logger = init_logger(__name__)
+
+# Rate-limit verbose per-chunk audit INFO. TP8 duplicates every line across
+# workers, so unbounded per-chunk INFO floods the log during long runs.
+# Warnings (DSV4_H1_WINDOW, decode >64) are never rate-limited.
+_AUDIT_INFO_WINDOW_S = 60.0
+_audit_info_state: tuple[float, int] = (0.0, 0)
+
+
+def _rate_limited_audit_info(message: str, *args: object) -> None:
+    """Log an audit INFO at most once per worker per window.
+
+    The first event logs immediately with full details; events within the
+    window are counted, and the next log line carries the count of events
+    that happened in the previous window.
+    """
+    global _audit_info_state
+    now = time.monotonic()
+    window_start, count = _audit_info_state
+    if count == 0 or now - window_start >= _AUDIT_INFO_WINDOW_S:
+        prefix = (
+            ""
+            if count == 0
+            else f"[{count} more in last {_AUDIT_INFO_WINDOW_S:.0f}s] "
+        )
+        logger.info(prefix + message, *args)
+        _audit_info_state = (now, 1)
+    else:
+        _audit_info_state = (window_start, count + 1)
 
 
 def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
@@ -948,7 +977,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     num_slices = (
                         query_end - query_start + prefill_chunk_tokens - 1
                     ) // prefill_chunk_tokens
-                    logger.info(
+                    _rate_limited_audit_info(
                         "DSV4 SM89 sparse-MLA prefill chunk has %d tokens: "
                         "split into %d slices of <= %d tokens (L0 mitigation "
                         "VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS); every call "
@@ -989,7 +1018,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                             message % args,
                         )
                     else:
-                        logger.info(message, *args)
+                        _rate_limited_audit_info(message, *args)
 
             # Token-slice bounds: with L0 active, cap each flashinfer call at
             # prefill_chunk_tokens tokens (slices may cut across requests;
