@@ -864,20 +864,70 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
-        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-            query=q,
-            swa_kv_cache=swa_cache,
-            workspace_buffer=self._get_workspace(q.device),
-            sparse_indices=swa_indices,
-            compressed_kv_cache=extra_cache,
-            out=output,
-            bmm1_scale=self.scale,
-            sinks=self.attn_sink,
-            kv_layout="NHD",
-            swa_topk_lens=swa_lens,
-            extra_sparse_indices=extra_sparse_indices,
-            extra_sparse_topk_lens=extra_sparse_lengths,
-        )
+
+        # L0 mitigation (same cap as prefill): the flashinfer call reroutes to the
+        # prefill orchestrator whenever the batch exceeds _DSV4_DECODE_MAX_TOKENS. Split
+        # an over-cap decode batch into <=cap token slices so decode always hits the
+        # decode-dsv4 kernels too. Per-token slice is semantics-preserving (each decode
+        # token is an independent q_len=1 batch item). Opt-in via
+        # VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS>0; no-op by default.
+        decode_chunk_tokens = envs.VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS
+        if decode_chunk_tokens > _DSV4_DECODE_MAX_TOKENS:
+            logger.warning_once(
+                "VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS=%d exceeds the "
+                "decode-dsv4 token cutoff %d; clamping to %d.",
+                decode_chunk_tokens,
+                _DSV4_DECODE_MAX_TOKENS,
+                _DSV4_DECODE_MAX_TOKENS,
+            )
+            decode_chunk_tokens = _DSV4_DECODE_MAX_TOKENS
+        if decode_chunk_tokens > 0 and num_decode_tokens > decode_chunk_tokens:
+            n_slices = (
+                num_decode_tokens + decode_chunk_tokens - 1
+            ) // decode_chunk_tokens
+            if envs.VLLM_DSV4_ATTN_AUDIT:
+                logger.info(
+                    "DSV4 SM89 sparse-MLA decode batch has %d tokens: splitting "
+                    "into %d slices of <= %d tokens (L0 mitigation, decode-side).",
+                    num_decode_tokens,
+                    n_slices,
+                    decode_chunk_tokens,
+                )
+            for s in range(0, num_decode_tokens, decode_chunk_tokens):
+                e = min(s + decode_chunk_tokens, num_decode_tokens)
+                flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                    query=q[s:e],
+                    swa_kv_cache=swa_cache,
+                    workspace_buffer=self._get_workspace(q.device),
+                    sparse_indices=swa_indices[s:e],
+                    compressed_kv_cache=extra_cache,
+                    out=output[s:e],
+                    bmm1_scale=self.scale,
+                    sinks=self.attn_sink,
+                    kv_layout="NHD",
+                    swa_topk_lens=swa_lens[s:e],
+                    extra_sparse_indices=extra_sparse_indices[s:e]
+                    if extra_sparse_indices is not None
+                    else None,
+                    extra_sparse_topk_lens=extra_sparse_lengths[s:e]
+                    if extra_sparse_lengths is not None
+                    else None,
+                )
+        else:
+            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                query=q,
+                swa_kv_cache=swa_cache,
+                workspace_buffer=self._get_workspace(q.device),
+                sparse_indices=swa_indices,
+                compressed_kv_cache=extra_cache,
+                out=output,
+                bmm1_scale=self.scale,
+                sinks=self.attn_sink,
+                kv_layout="NHD",
+                swa_topk_lens=swa_lens,
+                extra_sparse_indices=extra_sparse_indices,
+                extra_sparse_topk_lens=extra_sparse_lengths,
+            )
 
     def _forward_prefill(
         self,
