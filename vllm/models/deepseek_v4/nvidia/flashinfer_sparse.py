@@ -46,29 +46,43 @@ logger = init_logger(__name__)
 # workers, so unbounded per-chunk INFO floods the log during long runs.
 # Warnings (DSV4_H1_WINDOW, decode >64) are never rate-limited.
 _AUDIT_INFO_WINDOW_S = 60.0
-_audit_info_state: tuple[float, int] = (0.0, 0)
+_audit_info_state: tuple[float, int, int, int] = (0.0, 0, 0, 0)
 
 
-def _rate_limited_audit_info(message: str, *args: object) -> None:
-    """Log an audit INFO at most once per worker per window.
+def _rate_limited_audit_info(
+    message: str,
+    *args: object,
+    slices: int = 0,
+    tokens: int = 0,
+) -> None:
+    """Log an audit INFO at most once per worker per window, with a rolling
+    summary of events since the previous log line.
 
     The first event logs immediately with full details; events within the
-    window are counted, and the next log line carries the count of events
-    that happened in the previous window.
+    window are accumulated, and the next log line carries the totals for the
+    previous window. ``slices``/``tokens`` let the L0 split logger track
+    launch/size totals (extra kernel launches per window == TTFT cost).
     """
     global _audit_info_state
     now = time.monotonic()
-    window_start, count = _audit_info_state
-    if count == 0 or now - window_start >= _AUDIT_INFO_WINDOW_S:
-        prefix = (
-            ""
-            if count == 0
-            else f"[{count} more in last {_AUDIT_INFO_WINDOW_S:.0f}s] "
-        )
-        logger.info(prefix + message, *args)
-        _audit_info_state = (now, 1)
+    window_start, chunks, tot_slices, tot_tokens = _audit_info_state
+    if chunks == 0 or now - window_start >= _AUDIT_INFO_WINDOW_S:
+        if chunks > 0:
+            summary = f"[{chunks} chunks"
+            if tot_slices > 0:
+                summary += f", {tot_slices} slices, {tot_tokens} tokens"
+            summary += f" in last {_AUDIT_INFO_WINDOW_S:.0f}s] "
+        else:
+            summary = ""
+        logger.info(summary + message, *args)
+        _audit_info_state = (now, 1, slices, tokens)
     else:
-        _audit_info_state = (window_start, count + 1)
+        _audit_info_state = (
+            window_start,
+            chunks + 1,
+            tot_slices + slices,
+            tot_tokens + tokens,
+        )
 
 
 def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
@@ -990,6 +1004,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         num_chunks,
                         num_prefills,
                         num_decode_tokens,
+                        slices=num_slices,
+                        tokens=query_end - query_start,
                     )
                 elif query_end - query_start > _DSV4_DECODE_MAX_TOKENS:
                     # L0 disabled: a >64-token prefill chunk coexisting with
