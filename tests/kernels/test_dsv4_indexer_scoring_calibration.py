@@ -214,9 +214,9 @@ def test_fused_indexer_q_weight_fold_matches_cutedsl_order() -> None:
     r_even = (x_even * cos - x_odd * sin).to(torch.bfloat16).to(torch.float32)
     r_odd = (x_odd * cos + x_even * sin).to(torch.bfloat16).to(torch.float32)
     amax = torch.maximum(
-        torch.maximum(x_nope.abs(), r_even.abs()),
-        r_odd.abs(),
-    ).amax(dim=-1)
+        torch.maximum(x_nope.abs().amax(dim=-1), r_even.abs().amax(dim=-1)),
+        r_odd.abs().amax(dim=-1),
+    )
     q_scale = torch.exp2(
         torch.ceil(torch.log2(torch.maximum(amax, 1e-4) / 448.0))
     )
