@@ -218,7 +218,7 @@ def test_fused_indexer_q_weight_fold_matches_cutedsl_order() -> None:
         r_odd.abs().amax(dim=-1),
     )
     q_scale = torch.exp2(
-        torch.ceil(torch.log2(torch.maximum(amax, 1e-4) / 448.0))
+        torch.ceil(torch.log2(amax.clamp_min(1e-4) / 448.0))
     )
 
     expected = (w * float(softmax_scale * head_scale)) * q_scale
