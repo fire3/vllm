@@ -699,8 +699,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                 )
                 if actual_expanded < num_decode_tokens:
+                    # Zero every column, not just column 0. The rows beyond
+                    # actual_expanded are persistent buffer space: they keep
+                    # block ids from a previous step (or graph) when this slot
+                    # held a real request, and fp8_paged_mqa_logits_triton's
+                    # logical_blocks vector-load reads across the row. The
+                    # valid_cols/context_limit masks currently hide them, but
+                    # full-row zeroing makes the tail deterministic instead of
+                    # relying on every consumer honoring the mask.
                     self.expanded_block_table_buffer[
-                        actual_expanded:num_decode_tokens, 0
+                        actual_expanded:num_decode_tokens
                     ] = 0
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
 

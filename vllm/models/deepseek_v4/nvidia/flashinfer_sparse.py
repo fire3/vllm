@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm import envs
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     build_flashinfer_mixed_sparse_indices,
@@ -31,6 +33,13 @@ if TYPE_CHECKING:
 
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
+
+# Mirrors flashinfer.mla._sparse_mla_sm120._DECODE_MAX_TOKENS: calls with more
+# tokens are silently rerouted from the decode-dsv4 kernels to the prefill
+# orchestrator. Keep in sync when the flashinfer cutoff changes.
+_DSV4_DECODE_MAX_TOKENS = 64
+
+logger = init_logger(__name__)
 
 
 def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
@@ -753,6 +762,18 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+        if (
+            envs.VLLM_DSV4_ATTN_AUDIT
+            and num_decode_tokens > _DSV4_DECODE_MAX_TOKENS
+        ):
+            logger.warning(
+                "DSV4 SM89 sparse-MLA decode batch has %d tokens (> %d cutoff): "
+                "flashinfer will reroute this call to the prefill orchestrator "
+                "instead of the decode-dsv4 kernels (SM89 regression risk; see "
+                "DSV4_SM89_cudagraph_persistent_state_analysis.md).",
+                num_decode_tokens,
+                _DSV4_DECODE_MAX_TOKENS,
+            )
 
         extra_sparse_indices = None
         extra_sparse_lengths = None
@@ -901,6 +922,22 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             query_end = (
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
+            if (
+                envs.VLLM_DSV4_ATTN_AUDIT
+                and query_end - query_start > _DSV4_DECODE_MAX_TOKENS
+            ):
+                logger.info(
+                    "DSV4 SM89 sparse-MLA prefill chunk has %d tokens "
+                    "(> %d cutoff): flashinfer routes it to the prefill "
+                    "orchestrator (chunk %d/%d, num_prefills=%d, "
+                    "num_decode_tokens=%d).",
+                    query_end - query_start,
+                    _DSV4_DECODE_MAX_TOKENS,
+                    chunk_idx + 1,
+                    num_chunks,
+                    num_prefills,
+                    num_decode_tokens,
+                )
 
             extra_sparse_indices_chunk = (
                 extra_sparse_indices[query_start:query_end]

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+    VLLM_DSV4_ATTN_AUDIT: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -748,6 +749,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    # Log DSV4 sparse-MLA attention dispatch details (decode/prefill token
+    # counts and flashinfer's >64-token reroute to the prefill orchestrator).
+    # For incident-window debugging of SM89 long-running CUDA graph issues.
+    "VLLM_DSV4_ATTN_AUDIT": lambda: (
+        os.environ.get("VLLM_DSV4_ATTN_AUDIT", "0") == "1"
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

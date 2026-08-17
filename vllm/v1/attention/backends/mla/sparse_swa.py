@@ -758,6 +758,19 @@ def _compute_swa_indices_and_lens_kernel(
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
         tl.store(swa_lens_ptr + pid, 0)
+        # Defensively invalidate the whole indices row too. The buffers are
+        # persistent across steps/graph replays, so an invalid row can still
+        # hold a real slot id from a previous step when this slot was a valid
+        # request. Consumers currently gate on swa_lens==0, but a vectorized
+        # load that ignores the lens would turn that stale slot id into an OOB
+        # read. Padding rows only, so this is zero-cost.
+        for i in range(0, window_size, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < window_size,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
@@ -824,6 +837,16 @@ def _compute_dspark_noncausal_swa_indices_kernel(
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
         tl.store(swa_lens_ptr + pid, 0)
+        # See _compute_swa_indices_and_lens_kernel: invalidate the whole row
+        # (index_width entries) so stale non-causal slot ids from a previous
+        # step can never be picked up by a consumer that ignores swa_lens.
+        for i in range(0, index_width, TRITON_BLOCK_SIZE):
+            offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+            tl.store(
+                swa_indices_ptr + pid * swa_indices_stride + offset,
+                -1,
+                mask=offset < index_width,
+            )
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
