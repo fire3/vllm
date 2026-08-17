@@ -85,8 +85,7 @@ def _fused_indexer_q_rope_quant_kernel(
     # Index weights
     index_weights_ptr,
     index_weights_stride,
-    index_weights_softmax_scale,
-    index_weights_head_scale,
+    index_weights_scale_combined,
     index_weights_out_ptr,
     index_weights_out_stride,
     FP8_MAX: tl.constexpr = 448.0,
@@ -156,20 +155,22 @@ def _fused_indexer_q_rope_quant_kernel(
     )
 
     # FP8 weight-fold contract:
-    #   index_weights_out = index_weights * q_scale * softmax_scale * head_scale
+    #   index_weights_out = index_weights * scale_combined * q_scale
     # The per-token-per-head q_scale (fp32) IS folded into the output weights
     # here because FP8 Q is stored WITHOUT a companion scale tensor — the
     # downstream fp8_fp4_mqa_logits/fp8_fp4_paged_mqa_logits kernels use `weights` to
-    # apply per-token Q scale inline. See the MXFP4 kernel below for the
-    # contrasting convention (scales live with the Q values, weights are NOT
-    # q-scaled).
+    # apply per-token Q scale inline. `scale_combined` is precomputed on the
+    # host as ``float(softmax_scale * head_scale)`` so the multiply order
+    # ``(w * scale_combined) * q_scale`` is bit-identical to the CuteDSL
+    # reference kernel (fused_indexer_q_cutedsl.py). See the MXFP4 kernel
+    # below for the contrasting convention (scales live with the Q values,
+    # weights are NOT q-scaled).
     index_weights = tl.load(
         index_weights_ptr + tok_idx * index_weights_stride + head_idx
     )
     index_weights = index_weights.to(tl.float32)
+    index_weights *= index_weights_scale_combined
     index_weights *= index_q_scale
-    index_weights *= index_weights_softmax_scale
-    index_weights *= index_weights_head_scale
     tl.store(
         index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
         index_weights,
@@ -199,8 +200,7 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     # with the Q values in the output scale tensor).
     index_weights_ptr,
     index_weights_stride,
-    index_weights_softmax_scale,
-    index_weights_head_scale,
+    index_weights_scale_combined,
     index_weights_out_ptr,
     index_weights_out_stride,
 ):
@@ -269,17 +269,18 @@ def _fused_indexer_q_rope_mxfp4_kernel(
         tl.store(scale_base + NUM_NOPE_BLOCKS + b, ue8m0)
 
     # MXFP4 weight-fold contract:
-    #   index_weights_out = index_weights * softmax_scale * head_scale
+    #   index_weights_out = index_weights * scale_combined
     # NOTE: q_scale is NOT folded here (contrast with the FP8 kernel above).
     # MXFP4 Q emits a separate ue8m0 scale tensor of shape
     # (T, H, HEAD_DIM // MXFP4_BLOCK) alongside the packed values, so each
     # per-block scale is applied by the downstream MXFP4 logits kernel when
     # dequantizing Q — there is no per-token scalar to fold into `weights`.
+    # `scale_combined` = float(softmax_scale * head_scale), computed on the
+    # host, matching the CuteDSL reference's single combined-scale multiply.
     index_weights = tl.load(
         index_weights_ptr + tok_idx * index_weights_stride + head_idx
     ).to(tl.float32)
-    index_weights *= index_weights_softmax_scale
-    index_weights *= index_weights_head_scale
+    index_weights *= index_weights_scale_combined
     tl.store(
         index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
         index_weights,
@@ -328,6 +329,17 @@ def fused_indexer_q_rope_quant(
     assert positions.ndim == 1
     assert index_q.ndim == 3
     assert index_q_cos_sin_cache.ndim == 2
+
+    # Combined weight scale, precomputed on the host (double precision) so the
+    # Triton kernels fold in the same order as the CuteDSL reference:
+    # ``weights_out = weights * scale_combined * q_scale`` (FP8) or
+    # ``weights_out = weights * scale_combined`` (MXFP4). Computing the
+    # product in Python (then rounding to fp32 at the kernel boundary) avoids
+    # an extra fp32 rounding of ``softmax_scale * head_scale`` inside the
+    # kernel and keeps SM89 weights bit-identical to SM100/SM120.
+    index_weights_scale_combined = float(
+        index_weights_softmax_scale * index_weights_head_scale
+    )
 
     num_tokens = positions.shape[0]
     num_index_q_heads = index_q.shape[1]
@@ -412,8 +424,7 @@ def fused_indexer_q_rope_quant(
                 MXFP4_BLOCK_SIZE,
                 index_weights,
                 index_weights.stride(0),
-                index_weights_softmax_scale,
-                index_weights_head_scale,
+                index_weights_scale_combined,
                 index_weights_out,
                 index_weights_out.stride(0),
                 num_warps=1,  # TODO: Tune this
@@ -479,8 +490,7 @@ def fused_indexer_q_rope_quant(
             index_q_head_dim,
             index_weights,
             index_weights.stride(0),
-            index_weights_softmax_scale,
-            index_weights_head_scale,
+            index_weights_scale_combined,
             index_weights_out,
             index_weights_out.stride(0),
             FP8_MAX=fp8_max,

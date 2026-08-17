@@ -114,6 +114,39 @@ SM89 上 MXFP4 MoE（`expert_dtype: fp4`）可显式选择
 `DSV4_SM89_moe_backend_ab.md`。注意 `moe_backend="auto"` 不会自动选
 humming（GPT-OSS 优先级列表不含它），需显式指定。
 
+### 2.8 索引器打分：与 DeepGEMM 参考实现的对齐（2026-08-17）
+
+SM89 的 indexer 打分（`fp8_mqa_logits_triton` / `fp8_paged_mqa_logits_triton`）
+在提交前与 DeepGEMM（SM90/SM100/SM120 参考）和 AITER（gfx942 参考）做了
+逐项对照，结论是**打分数学等价、仅有舍入顺序差异**，随后做了两处位级对齐：
+
+- **评分顺序**：DeepGEMM 的 `fp8_fp4_mqa_logits` / `fp8_fp4_paged_mqa_logits`
+  统一按 `logit = (sum_h relu(q·k_h) * w_h) * s_kv` 计算——per-token KV scale
+  在加权头求和**之后**乘一次；AITER/gfx942 是 `sum_h relu((q·k_h) * s_kv) * w_h`
+  （scale 在 ReLU 前）。两者数学等价，且 indexer 缓存使用 ue8m0 2 的幂 scale，
+  在 fp32 中乘 2^k 精确，两种顺序位级一致。`_fp8_mqa_logits_kernel` 增加
+  `SCALE_AFTER_REDUCE` constexpr 开关：SM89 路径（`fp8_mqa_logits_triton`）取
+  True 对齐 DeepGEMM，gfx942 路径（`fp8_mqa_logits_gfx942`）保持 AITER 原顺序
+  不动；分页 decode 内核直接改为 DeepGEMM 顺序。
+- **权重折叠**：Q 量化器 `fused_indexer_q_rope_quant`（Triton）与 SM100/SM120
+  的 CuteDSL 参考（`fused_indexer_q_cutedsl.py`）使用相同的
+  `scale = 2^ceil(log2(max(amax, 1e-4)/448))`，但权重折叠乘序不同。Triton 两个
+  内核（FP8 / MXFP4）改为接收 host 预计算的 `float(softmax_scale * head_scale)`，
+  折叠顺序变为 `(w * combined) * q_scale`（FP8）与 `w * combined`（MXFP4），
+  与 CuteDSL 参考位级一致，保证同一 Q 下 SM89 与 SM100/SM120 的 indexer
+  权重完全一致。
+
+验证脚本为 `tests/kernels/test_dsv4_indexer_scoring_calibration.py`（CUDA）：
+
+- 打分内核 vs DeepGEMM 规范顺序参考（含非零窗口起点、混合窗口宽度）：
+  `max_rel` 保持在 1e-5 量级（纯 fp8 MMA 累加顺序噪声）；
+- 权重折叠 vs CuteDSL 参考乘序：要求 `bit_equal=True`。
+
+边界说明：打分精度最终受 fp8 量化本身限制，SM89 与 SM100/SM120 使用同一
+indexer K 缓存、同一量化公式，打分侧没有可再挖掘的精度差。真实模型下的
+indexer 召回质量（top-2048 与全注意力 top-k 的重叠率）仍需在部署环境做
+overlap 审计，属分支遗留项。
+
 ## 3. 分支对应与依赖
 
 | 仓库 | 分支 / 版本 | 说明 |

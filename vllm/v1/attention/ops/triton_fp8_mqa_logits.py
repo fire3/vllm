@@ -77,6 +77,15 @@ def _fp8_mqa_logits_kernel(
     stride_logits_k: tl.int64,
     # block sizes
     BLOCK_KV: tl.constexpr,
+    # Scale-application order. AITER's gfx942 reference multiplies the
+    # per-token KV scale into the scores BEFORE ReLU (scores * kv_scales →
+    # relu → weights); DeepGEMM's sm90/sm100 fp8_fp4_mqa_logits kernels apply
+    # it AFTER the weighted head sum (relu → weights → sum → * kv_scales).
+    # The two orders are mathematically equivalent (scale > 0), and with the
+    # ue8m0 power-of-two scales used by the DSv4 indexer cache they are
+    # bit-identical; SCALE_AFTER_REDUCE=True keeps the SM89 fallback on the
+    # DeepGEMM reference order used by SM100/SM120.
+    SCALE_AFTER_REDUCE: tl.constexpr,
 ):
     row_id = tl.program_id(0)
     # go from larger to smaller in terms of work
@@ -130,13 +139,22 @@ def _fp8_mqa_logits_kernel(
 
         # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
         scores = tl.dot(q_block, kv_block, input_precision="ieee")
-        # Multiply by kv_scales (broadcast along rows)
-        scores = scores * kv_scales[None, :]
-        # ReLU
-        scores = tl.maximum(scores, 0.0)
-        scores = scores * w_block
-        # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
-        scores = tl.sum(scores, axis=0)
+        if SCALE_AFTER_REDUCE:
+            # DeepGEMM order: logit = (sum_h relu(q·k_h) * w_h) * s_kv.
+            scores = tl.maximum(scores, 0.0)
+            scores = scores * w_block
+            # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
+            scores = tl.sum(scores, axis=0)
+            scores = scores * kv_scales
+        else:
+            # AITER/gfx942 order: sum_h relu((q·k_h) * s_kv) * w_h.
+            # Multiply by kv_scales (broadcast along rows)
+            scores = scores * kv_scales[None, :]
+            # ReLU
+            scores = tl.maximum(scores, 0.0)
+            scores = scores * w_block
+            # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
+            scores = tl.sum(scores, axis=0)
         tl.store(logits_ptrs, scores)
 
         kv_ptrs += BLOCK_KV * stride_kv_s
@@ -151,13 +169,22 @@ def _fp8_mqa_logits_kernel(
 
     # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
     scores = tl.dot(q_block, kv_block, input_precision="ieee")
-    # Multiply by kv_scales (broadcast along rows)
-    scores = scores * kv_scales[None, :]
-    # ReLU
-    scores = tl.maximum(scores, 0.0)
-    scores = scores * w_block
-    # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
-    scores = tl.sum(scores, axis=0)
+    if SCALE_AFTER_REDUCE:
+        # DeepGEMM order: logit = (sum_h relu(q·k_h) * w_h) * s_kv.
+        scores = tl.maximum(scores, 0.0)
+        scores = scores * w_block
+        # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
+        scores = tl.sum(scores, axis=0)
+        scores = scores * kv_scales
+    else:
+        # AITER/gfx942 order: sum_h relu((q·k_h) * s_kv) * w_h.
+        # Multiply by kv_scales (broadcast along rows)
+        scores = scores * kv_scales[None, :]
+        # ReLU
+        scores = tl.maximum(scores, 0.0)
+        scores = scores * w_block
+        # [NUM_HEADS, BLOCK_KV] -> [BLOCK_KV, ]
+        scores = tl.sum(scores, axis=0)
     # masked store
     in_window = (kv_col_offsets >= start_ind) & (kv_col_offsets < end_ind)
     tl.store(logits_ptrs, scores, mask=in_window)
@@ -260,6 +287,7 @@ def fp8_mqa_logits_gfx942(
         stride_logits_s=stride_logits_s,
         stride_logits_k=stride_logits_k,
         BLOCK_KV=block_kv,
+        SCALE_AFTER_REDUCE=False,
         num_warps=4,
         num_stages=num_stages,
         waves_per_eu=2,
@@ -342,6 +370,7 @@ def fp8_mqa_logits_triton(
         stride_logits_s=stride_logits_s,
         stride_logits_k=stride_logits_k,
         BLOCK_KV=block_kv,
+        SCALE_AFTER_REDUCE=True,
         **launch_kwargs,
     )
     return logits
@@ -440,9 +469,12 @@ def _fp8_paged_mqa_logits_kernel(
     )
 
     scores = tl.dot(q_block, kv_block, input_precision="ieee")
-    scores = tl.maximum(scores * kv_scales[None, :], 0.0)
+    # DeepGEMM paged order: logit = (sum_h relu(q·k_h) * w_h) * s_kv.
+    # (See _fp8_mqa_logits_kernel's SCALE_AFTER_REDUCE comment.)
+    scores = tl.maximum(scores, 0.0)
     scores = scores * w_block
     scores = tl.sum(scores, axis=0)
+    scores = scores * kv_scales
 
     logits_ptrs = logits_ptr + row_id * stride_logits_row + col_offsets * stride_logits_col
     tl.store(logits_ptrs, scores, mask=valid_cols)
