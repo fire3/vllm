@@ -926,11 +926,18 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 envs.VLLM_DSV4_ATTN_AUDIT
                 and query_end - query_start > _DSV4_DECODE_MAX_TOKENS
             ):
-                logger.info(
+                # A >64-token prefill chunk coexisting with decode tokens in
+                # the same step is exactly the H1 incident window (second
+                # session's prefill interleaving with the first session's
+                # decode): flag it at WARNING with a greppable marker.
+                mixed_batch = num_decode_tokens > 0
+                message = (
                     "DSV4 SM89 sparse-MLA prefill chunk has %d tokens "
                     "(> %d cutoff): flashinfer routes it to the prefill "
                     "orchestrator (chunk %d/%d, num_prefills=%d, "
-                    "num_decode_tokens=%d).",
+                    "num_decode_tokens=%d)."
+                )
+                args = (
                     query_end - query_start,
                     _DSV4_DECODE_MAX_TOKENS,
                     chunk_idx + 1,
@@ -938,6 +945,13 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     num_prefills,
                     num_decode_tokens,
                 )
+                if mixed_batch:
+                    logger.warning(
+                        "DSV4_H1_WINDOW: %s",
+                        message % args,
+                    )
+                else:
+                    logger.info(message, *args)
 
             extra_sparse_indices_chunk = (
                 extra_sparse_indices[query_start:query_end]
