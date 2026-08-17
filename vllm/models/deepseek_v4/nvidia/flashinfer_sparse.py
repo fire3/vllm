@@ -852,6 +852,21 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         num_decode_tokens = swa_metadata.num_decode_tokens
         num_prefill_tokens = swa_metadata.num_prefill_tokens
 
+        # L0 mitigation (opt-in, default off): cap every flashinfer prefill
+        # call at this many tokens so the call stays within the decode-dsv4
+        # dispatch range and never silently reroutes to the prefill
+        # orchestrator. Values > 64 are clamped to the decode cutoff.
+        prefill_chunk_tokens = envs.VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS
+        if prefill_chunk_tokens > _DSV4_DECODE_MAX_TOKENS:
+            logger.warning_once(
+                "VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS=%d exceeds the "
+                "decode-dsv4 token cutoff %d; clamping to %d.",
+                prefill_chunk_tokens,
+                _DSV4_DECODE_MAX_TOKENS,
+                _DSV4_DECODE_MAX_TOKENS,
+            )
+            prefill_chunk_tokens = _DSV4_DECODE_MAX_TOKENS
+
         query_start_loc_cpu = swa_metadata.query_start_loc_cpu
         assert query_start_loc_cpu is not None
         prefill_token_base = query_start_loc_cpu[num_decodes]
@@ -922,66 +937,107 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             query_end = (
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
-            if (
-                envs.VLLM_DSV4_ATTN_AUDIT
-                and query_end - query_start > _DSV4_DECODE_MAX_TOKENS
-            ):
-                # A >64-token prefill chunk coexisting with decode tokens in
-                # the same step is exactly the H1 incident window (second
-                # session's prefill interleaving with the first session's
-                # decode): flag it at WARNING with a greppable marker.
-                mixed_batch = num_decode_tokens > 0
-                message = (
-                    "DSV4 SM89 sparse-MLA prefill chunk has %d tokens "
-                    "(> %d cutoff): flashinfer routes it to the prefill "
-                    "orchestrator (chunk %d/%d, num_prefills=%d, "
-                    "num_decode_tokens=%d)."
-                )
-                args = (
-                    query_end - query_start,
-                    _DSV4_DECODE_MAX_TOKENS,
-                    chunk_idx + 1,
-                    num_chunks,
-                    num_prefills,
-                    num_decode_tokens,
-                )
-                if mixed_batch:
-                    logger.warning(
-                        "DSV4_H1_WINDOW: %s",
-                        message % args,
+            if query_end <= query_start:
+                continue
+
+            if envs.VLLM_DSV4_ATTN_AUDIT:
+                if (
+                    prefill_chunk_tokens > 0
+                    and query_end - query_start > prefill_chunk_tokens
+                ):
+                    num_slices = (
+                        query_end - query_start + prefill_chunk_tokens - 1
+                    ) // prefill_chunk_tokens
+                    logger.info(
+                        "DSV4 SM89 sparse-MLA prefill chunk has %d tokens: "
+                        "split into %d slices of <= %d tokens (L0 mitigation "
+                        "VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS); every call "
+                        "dispatches to decode-dsv4, no orchestrator reroute "
+                        "(chunk %d/%d, num_prefills=%d, num_decode_tokens=%d).",
+                        query_end - query_start,
+                        num_slices,
+                        prefill_chunk_tokens,
+                        chunk_idx + 1,
+                        num_chunks,
+                        num_prefills,
+                        num_decode_tokens,
                     )
-                else:
-                    logger.info(message, *args)
+                elif query_end - query_start > _DSV4_DECODE_MAX_TOKENS:
+                    # L0 disabled: a >64-token prefill chunk coexisting with
+                    # decode tokens in the same step is exactly the H1
+                    # incident window (second session's prefill interleaving
+                    # with the first session's decode); flag it at WARNING
+                    # with a greppable marker.
+                    mixed_batch = num_decode_tokens > 0
+                    message = (
+                        "DSV4 SM89 sparse-MLA prefill chunk has %d tokens "
+                        "(> %d cutoff): flashinfer routes it to the prefill "
+                        "orchestrator (chunk %d/%d, num_prefills=%d, "
+                        "num_decode_tokens=%d)."
+                    )
+                    args = (
+                        query_end - query_start,
+                        _DSV4_DECODE_MAX_TOKENS,
+                        chunk_idx + 1,
+                        num_chunks,
+                        num_prefills,
+                        num_decode_tokens,
+                    )
+                    if mixed_batch:
+                        logger.warning(
+                            "DSV4_H1_WINDOW: %s",
+                            message % args,
+                        )
+                    else:
+                        logger.info(message, *args)
 
-            extra_sparse_indices_chunk = (
-                extra_sparse_indices[query_start:query_end]
-                if extra_sparse_indices is not None
-                else None
-            )
-            extra_sparse_lengths_chunk = (
-                extra_sparse_lengths[query_start:query_end]
-                if extra_sparse_lengths is not None
-                else None
-            )
+            # Token-slice bounds: with L0 active, cap each flashinfer call at
+            # prefill_chunk_tokens tokens (slices may cut across requests;
+            # every token is an independent q_len=1 item for the sparse-MLA
+            # backend); otherwise keep the whole request chunk as one call.
+            if prefill_chunk_tokens > 0:
+                slice_starts = range(query_start, query_end, prefill_chunk_tokens)
+            else:
+                slice_starts = (query_start,)
 
-            q_chunk = q[query_start:query_end]
-            swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
-            swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
-            if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
-                raise RuntimeError(
-                    "Compressed sparse MLA prefill requires compressed sparse indices."
+            for slice_start in slice_starts:
+                slice_end = (
+                    min(slice_start + prefill_chunk_tokens, query_end)
+                    if prefill_chunk_tokens > 0
+                    else query_end
                 )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_chunk,
-                swa_kv_cache=swa_kv_paged,
-                workspace_buffer=self._get_workspace(q.device),
-                sparse_indices=swa_indices_chunk,
-                compressed_kv_cache=extra_kv_paged,
-                out=output[query_start:query_end],
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens_chunk,
-                extra_sparse_indices=extra_sparse_indices_chunk,
-                extra_sparse_topk_lens=extra_sparse_lengths_chunk,
-            )
+                extra_sparse_indices_chunk = (
+                    extra_sparse_indices[slice_start:slice_end]
+                    if extra_sparse_indices is not None
+                    else None
+                )
+                extra_sparse_lengths_chunk = (
+                    extra_sparse_lengths[slice_start:slice_end]
+                    if extra_sparse_lengths is not None
+                    else None
+                )
+
+                q_chunk = q[slice_start:slice_end]
+                swa_indices_chunk = swa_metadata.prefill_swa_indices[
+                    slice_start:slice_end
+                ]
+                swa_lens_chunk = swa_metadata.prefill_swa_lens[slice_start:slice_end]
+                if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
+                    raise RuntimeError(
+                        "Compressed sparse MLA prefill requires compressed "
+                        "sparse indices."
+                    )
+                flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+                    query=q_chunk,
+                    swa_kv_cache=swa_kv_paged,
+                    workspace_buffer=self._get_workspace(q.device),
+                    sparse_indices=swa_indices_chunk,
+                    compressed_kv_cache=extra_kv_paged,
+                    out=output[slice_start:slice_end],
+                    bmm1_scale=self.scale,
+                    sinks=self.attn_sink,
+                    kv_layout="NHD",
+                    swa_topk_lens=swa_lens_chunk,
+                    extra_sparse_indices=extra_sparse_indices_chunk,
+                    extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+                )

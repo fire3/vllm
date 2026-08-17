@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     VLLM_DSV4_ATTN_AUDIT: bool = False
+    VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS: int = 0
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -755,6 +756,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # For incident-window debugging of SM89 long-running CUDA graph issues.
     "VLLM_DSV4_ATTN_AUDIT": lambda: (
         os.environ.get("VLLM_DSV4_ATTN_AUDIT", "0") == "1"
+    ),
+    # L0 mitigation for SM89: cap each DSV4 sparse-MLA prefill flashinfer call
+    # at this many tokens so the call stays within the decode-dsv4 dispatch
+    # range (<= 64) instead of silently rerouting to the prefill orchestrator.
+    # 0 = disabled (default); values > 64 are clamped to 64.
+    "VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS": lambda: int(
+        os.environ.get("VLLM_DSV4_SM89_PREFILL_CHUNK_TOKENS", "0")
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').
