@@ -499,6 +499,8 @@ class ResponsesRequest(OpenAIBaseModel):
         - reasoning     -> ResponseReasoningItem (auto-generates id)
         - message(role=assistant) -> ResponseOutputMessage (auto-generates
           id/status and annotations)
+        - messages whose ``content`` is a list of bare ``{"text": ...}`` items
+          -> coerce to ``{"type": "input_text", "text": ...}``
 
         Invalid structures are left for Pydantic to reject.
         """
@@ -579,6 +581,59 @@ class ResponsesRequest(OpenAIBaseModel):
                         "leaving for Pydantic validation"
                     )
                     processed_input.append(original_item)
+
+            elif item_type == "agent_message":
+                # Codex multi-agent message type: not a standard Responses
+                # item, so convert it to a message. The content may carry an
+                # "encrypted_content" part whose payload is plaintext here; read it
+                # the same as "text".
+                content = item.get("content")
+                texts = []
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, str):
+                            texts.append(c)
+                        elif isinstance(c, dict):
+                            text = c.get("text") or c.get("encrypted_content")
+                            if isinstance(text, str) and text:
+                                texts.append(text)
+                item = {
+                    "type": "message",
+                    "role": item.get("role", "assistant"),
+                    "content": [
+                        {"type": "input_text", "text": t} for t in texts
+                    ],
+                }
+                processed_input.append(item)
+
+            elif isinstance(item.get("content"), list):
+                # Some clients (e.g. Codex) send user/system messages with bare
+                # {"text": ...} content items that lack a `type` (and sometimes a
+                # top-level `type`/`role` too). Coerce them to the input_text
+                # variant so Pydantic's EasyInputMessageParam accepts the list.
+                new_content = []
+                changed = False
+                for c in item["content"]:
+                    if (isinstance(c, dict) and "type" not in c
+                            and "text" in c):
+                        c = {"type": "input_text", "text": c["text"]}
+                        changed = True
+                    new_content.append(c)
+                if changed:
+                    # Tag the bare blob as a user message so Pydantic can
+                    # disambiguate it in the input-item union.
+                    item = dict(item)
+                    if item.get("role") == "tool":
+                        # Tool content must be a string, not a content-item list.
+                        item["content"] = "".join(
+                            c.get("text", "") for c in new_content
+                            if isinstance(c, dict)
+                        )
+                    else:
+                        item.setdefault("type", "message")
+                        item.setdefault("role", "user")
+                        item["content"] = new_content
+                processed_input.append(item)
 
             else:
                 processed_input.append(item)
