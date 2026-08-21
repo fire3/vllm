@@ -35,6 +35,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.triton_fp8_mqa_logits import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -43,6 +47,10 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _use_sm89_mqa_fallback() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability((8, 9))
 
 
 def _assert_cutedsl_dcp_merge_supported(
@@ -497,14 +505,24 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                     )
                 else:
-                    logits = fp8_fp4_mqa_logits(
-                        (q_slice_cast, q_scale_slice),
-                        (k_quant_cast, k_scale_cast),
-                        weights[chunk.token_start : chunk.token_end],
-                        cu_seqlen_ks,
-                        cu_seqlen_ke,
-                        clean_logits=False,
-                    )
+                    if _use_sm89_mqa_fallback() and q_scale_slice is None:
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast,
+                            k_quant_cast,
+                            k_scale_cast,
+                            weights[chunk.token_start : chunk.token_end],
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                        )
+                    else:
+                        logits = fp8_fp4_mqa_logits(
+                            (q_slice_cast, q_scale_slice),
+                            (k_quant_cast, k_scale_cast),
+                            weights[chunk.token_start : chunk.token_end],
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                            clean_logits=False,
+                        )
                 num_rows = logits.shape[0]
                 ops.top_k_per_row_prefill(
                     logits,
@@ -600,16 +618,27 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-            )
+            if _use_sm89_mqa_fallback() and padded_q_scale is None:
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len,
+                    max_context_len=attn_metadata_narrowed.max_seq_len,
+                )
+            else:
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
@@ -770,10 +799,12 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not (
+            has_deep_gemm() or _use_sm89_mqa_fallback()
+        ):
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM support "
+                "or the SM89 fallback path in the current vLLM environment."
             )
 
     def forward_native(

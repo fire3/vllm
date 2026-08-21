@@ -112,7 +112,9 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [10, 12]
+        return capability.major in [10, 12] or (
+            capability.major == 8 and capability.minor == 9
+        )
 
     @classmethod
     def supports_combination(
@@ -136,6 +138,23 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
             if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
                 return "kv_cache_dtype not supported"
             return None
+        if device_capability.major == 8 and device_capability.minor == 9:
+            if kv_cache_dtype not in (
+                None,
+                "auto",
+                "fp8",
+                "fp8_e4m3",
+                "fp8_ds_mla",
+            ):
+                return "kv_cache_dtype not supported"
+            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm89
+
+            if not has_flashinfer_sparse_mla_sm89():
+                return (
+                    "FLASHINFER_MLA_SPARSE_DSV4 on SM89 requires a FlashInfer "
+                    "build with sparse MLA decode enabled for Ada."
+                )
+            return None
         if device_capability.major == 12:
             if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
                 return "kv_cache_dtype not supported"
@@ -147,7 +166,7 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
                     "sparse MLA decode API"
                 )
             return None
-        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x or SM12x"
+        return "FLASHINFER_MLA_SPARSE_DSV4 requires SM89, SM10x, or SM12x"
 
     @staticmethod
     def get_kv_cache_shape(
@@ -158,7 +177,10 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         device_capability = current_platform.get_device_capability()
-        if device_capability is not None and device_capability.major == 12:
+        if device_capability is not None and (
+            device_capability.major == 12
+            or (device_capability.major == 8 and device_capability.minor == 9)
+        ):
             return DeepseekV4FlashMLABackend.get_kv_cache_shape(
                 num_blocks,
                 block_size,
@@ -534,7 +556,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
 
 
 class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
-    """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
+    """DeepSeek V4 sparse MLA attention through FlashInfer's sparse kernels."""
 
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
@@ -573,13 +595,25 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+        device_capability = current_platform.get_device_capability()
+        if device_capability is not None and (
+            device_capability.major == 8 and device_capability.minor == 9
+        ):
+            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm89
 
-        if not has_flashinfer_sparse_mla_sm120():
-            raise RuntimeError(
-                "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires FlashInfer's "
-                "sparse MLA decode API."
-            )
+            if not has_flashinfer_sparse_mla_sm89():
+                raise RuntimeError(
+                    "FLASHINFER_MLA_SPARSE_DSV4 on SM89 requires a FlashInfer "
+                    "build with sparse MLA decode enabled for Ada."
+                )
+        else:
+            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+
+            if not has_flashinfer_sparse_mla_sm120():
+                raise RuntimeError(
+                    "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires FlashInfer's "
+                    "sparse MLA decode API."
+                )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
@@ -867,6 +901,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             query_end = (
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
+            if query_end <= query_start:
+                continue
 
             extra_sparse_indices_chunk = (
                 extra_sparse_indices[query_start:query_end]

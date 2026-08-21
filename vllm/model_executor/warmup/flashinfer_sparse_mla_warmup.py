@@ -12,8 +12,12 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     write_flashinfer_autotune_cache,
 )
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import autotune as flashinfer_autotune
-from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.flashinfer import (
+    autotune as flashinfer_autotune,
+    has_flashinfer,
+    has_flashinfer_sparse_mla_sm89,
+    has_flashinfer_sparse_mla_sm120,
+)
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
 if TYPE_CHECKING:
@@ -34,7 +38,7 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
 _FLASHINFER_MLA_SPARSE_BACKENDS = frozenset({"FLASHINFER_MLA_SPARSE_SM120"})
 _DEEPSEEK_V4_FLASHINFER_MLA_SPARSE_BACKENDS = frozenset({"FLASHINFER_MLA_SPARSE_DSV4"})
 
-_FLASHINFER_SM120_SPARSE_MLA_DECODE_LABELS = {
+_FLASHINFER_SPARSE_MLA_DECODE_LABELS = {
     "FLASHINFER_MLA_SPARSE_SM120": "DSv3.2",
     "FLASHINFER_MLA_SPARSE_DSV4": "DSv4",
 }
@@ -69,7 +73,7 @@ def _flashinfer_sparse_mla_decode_label(
         for group in groups:
             name = _attention_backend_name(getattr(group, "backend", None))
             if name in allowed_backends:
-                return _FLASHINFER_SM120_SPARSE_MLA_DECODE_LABELS.get(name)
+                return _FLASHINFER_SPARSE_MLA_DECODE_LABELS.get(name)
     return None
 
 
@@ -82,26 +86,43 @@ def _uses_v2_model_runner(runner: "GPUModelRunner") -> bool:
     return bool(getattr(vllm_config, "use_v2_model_runner", False))
 
 
+def _has_supported_flashinfer_sparse_decode_backend(
+    allowed_backends: frozenset[str],
+) -> bool:
+    if not has_flashinfer():
+        return False
+    if current_platform.is_device_capability((8, 9)):
+        return (
+            allowed_backends == _DEEPSEEK_V4_FLASHINFER_MLA_SPARSE_BACKENDS
+            and has_flashinfer_sparse_mla_sm89()
+        )
+    if current_platform.is_device_capability_family(120):
+        if allowed_backends == _DEEPSEEK_V4_FLASHINFER_MLA_SPARSE_BACKENDS:
+            return has_flashinfer_sparse_mla_sm120()
+        return True
+    return False
+
+
 def _run_flashinfer_sparse_mla_decode_autotune(
     worker: "Worker",
     num_tokens: int,
     allowed_backends: frozenset[str],
 ) -> bool:
-    """Autotune FlashInfer's SM120 sparse-MLA decode path."""
+    """Autotune FlashInfer sparse-MLA decode path."""
     runner = worker.model_runner
     log_label = _flashinfer_sparse_mla_decode_label(runner, allowed_backends)
     if log_label is None:
         return False
     if worker.vllm_config.kernel_config.enable_flashinfer_autotune is not True:
         return False
-    if not has_flashinfer() or not current_platform.is_device_capability_family(120):
+    if not _has_supported_flashinfer_sparse_decode_backend(allowed_backends):
         return False
 
     try:
         from flashinfer.autotuner import AutoTuner
     except ImportError:
         logger.warning(
-            "Skipping FlashInfer SM120 sparse MLA decode autotune because "
+            "Skipping FlashInfer sparse MLA decode autotune because "
             "FlashInfer autotuner is unavailable."
         )
         return False
@@ -122,7 +143,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
 
     if is_leader:
         logger.info(
-            "Autotuning FlashInfer SM120 sparse MLA %s decode with cache: %s",
+            "Autotuning FlashInfer sparse MLA %s decode with cache: %s",
             log_label,
             cache_path,
         )
@@ -167,7 +188,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
     tune_results = world.broadcast_object(tune_results, src=0)
     if tune_results is None:
         logger.warning(
-            "No FlashInfer SM120 sparse MLA %s decode autotune cache entries found. "
+            "No FlashInfer sparse MLA %s decode autotune cache entries found. "
             "Falling back to FlashInfer's default tactic heuristic.",
             log_label,
         )
@@ -179,7 +200,7 @@ def _run_flashinfer_sparse_mla_decode_autotune(
 
     AutoTuner.get().load_configs(str(cache_path))
     logger.info(
-        "FlashInfer SM120 sparse MLA %s decode autotune cache loaded on rank %d "
+        "FlashInfer sparse MLA %s decode autotune cache loaded on rank %d "
         "from %s.",
         log_label,
         world.rank_in_group,

@@ -13,6 +13,7 @@ from openai.types.chat.chat_completion_message_tool_call_param import (
     Function as FunctionCallTool,
 )
 from openai.types.responses import (
+    ResponseCustomToolCall,
     ResponseFunctionToolCall,
     ResponseOutputItem,
     ResponseOutputMessage,
@@ -230,7 +231,9 @@ def _construct_message_from_response_item(
     If `prev_msg` is `None`, a new message is always returned.
     """
     prev_assistant_msg = (
-        prev_msg if prev_msg and prev_msg.get("role") == "assistant" else None
+        prev_msg
+        if isinstance(prev_msg, dict) and prev_msg.get("role") == "assistant"
+        else None
     )
 
     if isinstance(item, ResponseFunctionToolCall):
@@ -242,6 +245,43 @@ def _construct_message_from_response_item(
             function=FunctionCallTool(
                 name=tool_name,
                 arguments=item.arguments,
+            ),
+            type="function",
+        )
+        if prev_assistant_msg:
+            tool_calls = prev_assistant_msg.get("tool_calls")
+            if tool_calls is None:
+                prev_assistant_msg["tool_calls"] = [tool_call]
+                return None
+            if isinstance(tool_calls, list):
+                tool_calls.append(tool_call)
+                return None
+            if isinstance(tool_calls, Iterable) and not isinstance(
+                tool_calls, (dict, str)
+            ):
+                tool_calls = list(tool_calls)
+                tool_calls.append(tool_call)
+                prev_assistant_msg["tool_calls"] = tool_calls
+                return None
+            logger.warning(
+                "Previous assistant message has unknown tool_calls format. "
+                "Tool call merging is skipped and a new assistant message is created. "
+                "Item %s",
+                item.id,
+            )
+        return ChatCompletionAssistantMessageParam(
+            role="assistant",
+            tool_calls=[tool_call],
+        )
+    elif isinstance(item, ResponseCustomToolCall):
+        # Custom tool calls (OpenAI Responses "custom_tool_call" items) map to
+        # an assistant message with a function tool_call entry. Their fields
+        # differ from ResponseFunctionToolCall: `input` instead of `arguments`.
+        tool_call = ChatCompletionMessageToolCallParam(
+            id=item.call_id,
+            function=FunctionCallTool(
+                name=item.name,
+                arguments=item.input,
             ),
             type="function",
         )
