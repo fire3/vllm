@@ -137,8 +137,15 @@ def _fp8_mqa_logits_kernel(
         kv_block = tl.load(kv_ptrs)
         kv_scales = tl.load(kv_scales_ptrs)
 
-        # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-        scores = tl.dot(q_block, kv_block, input_precision="ieee")
+        # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV].
+        # Upcast the FP8 operands to fp16 (lossless: fp16 mantissa >= fp8) so
+        # the MMA accumulates in fp32 through fp16 tensor cores. Doing the dot
+        # directly on FP8 with input_precision="ieee" would be a no-op (that
+        # flag only selects tf32 vs fp32 for fp32 inputs), leaving the result at
+        # the mercy of Triton's FP8 MMA lowering on a given arch.
+        scores = tl.dot(
+            q_block.to(tl.float16), kv_block.to(tl.float16), out_dtype=tl.float32
+        )
         if SCALE_AFTER_REDUCE:
             # DeepGEMM order: logit = (sum_h relu(q·k_h) * w_h) * s_kv.
             scores = tl.maximum(scores, 0.0)
@@ -167,8 +174,11 @@ def _fp8_mqa_logits_kernel(
     kv_block = tl.load(kv_ptrs, mask=kv_col_mask[None, :], other=0.0)
     kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
 
-    # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-    scores = tl.dot(q_block, kv_block, input_precision="ieee")
+    # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV].
+    # See the main loop for why we upcast to fp16 before the MMA.
+    scores = tl.dot(
+        q_block.to(tl.float16), kv_block.to(tl.float16), out_dtype=tl.float32
+    )
     if SCALE_AFTER_REDUCE:
         # DeepGEMM order: logit = (sum_h relu(q·k_h) * w_h) * s_kv.
         scores = tl.maximum(scores, 0.0)
@@ -468,7 +478,11 @@ def _fp8_paged_mqa_logits_kernel(
         other=0.0,
     )
 
-    scores = tl.dot(q_block, kv_block, input_precision="ieee")
+    # fp16 MMA (lossless upcast from fp8) with fp32 accumulation, matching the
+    # dense fallback and the DeepGEMM reference op order.
+    scores = tl.dot(
+        q_block.to(tl.float16), kv_block.to(tl.float16), out_dtype=tl.float32
+    )
     # DeepGEMM paged order: logit = (sum_h relu(q·k_h) * w_h) * s_kv.
     # (See _fp8_mqa_logits_kernel's SCALE_AFTER_REDUCE comment.)
     scores = tl.maximum(scores, 0.0)
