@@ -118,6 +118,10 @@ if TYPE_CHECKING:
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
+    # Opt in to Triton autotune for the DSv4 sparse-MLA decode kernel ported
+    # from SGLang. Default is a fixed config (deterministic, no runtime
+    # benchmark); set to 1 to mirror the upstream operator's autotune.
+    VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1143,6 +1147,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # performance and applied before running any kernel.
     "VLLM_TRITON_FORCE_FIRST_CONFIG": lambda: (
         os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE": lambda: (
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE", "0").strip().lower()
         in ("1", "true")
     ),
     # If set, allow loading or unloading lora adapters in runtime,

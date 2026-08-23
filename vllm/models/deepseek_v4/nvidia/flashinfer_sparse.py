@@ -560,6 +560,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # Subclasses that replace the decode kernel (e.g. the Triton port) can
+    # opt out of the FlashInfer sparse-MLA capability gate at init time.
+    _require_flashinfer_capability: ClassVar[bool] = True
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
@@ -595,25 +598,26 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        device_capability = current_platform.get_device_capability()
-        if device_capability is not None and (
-            device_capability.major == 8 and device_capability.minor == 9
-        ):
-            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm89
+        if self._require_flashinfer_capability:
+            device_capability = current_platform.get_device_capability()
+            if device_capability is not None and (
+                device_capability.major == 8 and device_capability.minor == 9
+            ):
+                from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm89
 
-            if not has_flashinfer_sparse_mla_sm89():
-                raise RuntimeError(
-                    "FLASHINFER_MLA_SPARSE_DSV4 on SM89 requires a FlashInfer "
-                    "build with sparse MLA decode enabled for Ada."
-                )
-        else:
-            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+                if not has_flashinfer_sparse_mla_sm89():
+                    raise RuntimeError(
+                        "FLASHINFER_MLA_SPARSE_DSV4 on SM89 requires a FlashInfer "
+                        "build with sparse MLA decode enabled for Ada."
+                    )
+            else:
+                from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
-            if not has_flashinfer_sparse_mla_sm120():
-                raise RuntimeError(
-                    "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires FlashInfer's "
-                    "sparse MLA decode API."
-                )
+                if not has_flashinfer_sparse_mla_sm120():
+                    raise RuntimeError(
+                        "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires FlashInfer's "
+                        "sparse MLA decode API."
+                    )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
@@ -922,17 +926,39 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."
                 )
-            flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
-                query=q_chunk,
+            self._launch_sparse_mla_prefill(
+                q=q_chunk,
                 swa_kv_cache=swa_kv_paged,
-                workspace_buffer=self._get_workspace(q.device),
-                sparse_indices=swa_indices_chunk,
-                compressed_kv_cache=extra_kv_paged,
+                swa_indices=swa_indices_chunk,
+                swa_lens=swa_lens_chunk,
+                extra_kv_cache=extra_kv_paged,
+                extra_indices=extra_sparse_indices_chunk,
+                extra_lens=extra_sparse_lengths_chunk,
                 out=output[query_start:query_end],
-                bmm1_scale=self.scale,
-                sinks=self.attn_sink,
-                kv_layout="NHD",
-                swa_topk_lens=swa_lens_chunk,
-                extra_sparse_indices=extra_sparse_indices_chunk,
-                extra_sparse_topk_lens=extra_sparse_lengths_chunk,
             )
+
+    def _launch_sparse_mla_prefill(
+        self,
+        q: torch.Tensor,  # [T, H, D] bf16, query padded to backend head count
+        swa_kv_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        extra_kv_cache: torch.Tensor | None,
+        extra_indices: torch.Tensor | None,
+        extra_lens: torch.Tensor | None,
+        out: torch.Tensor,  # [T, H, D], written in place
+    ) -> None:
+        flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
+            query=q,
+            swa_kv_cache=swa_kv_cache,
+            workspace_buffer=self._get_workspace(q.device),
+            sparse_indices=swa_indices,
+            compressed_kv_cache=extra_kv_cache,
+            out=out,
+            bmm1_scale=self.scale,
+            sinks=self.attn_sink,
+            kv_layout="NHD",
+            swa_topk_lens=swa_lens,
+            extra_sparse_indices=extra_indices,
+            extra_sparse_topk_lens=extra_lens,
+        )
