@@ -426,12 +426,28 @@ def _paged_cache_views(
     )
 
 
-_CSR_FLAT_BUFFERS: dict[tuple[int, int], torch.Tensor] = {}
+_CSR_FLAT_BUFFERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
-def _get_csr_flat_buffer(capacity: int, device: torch.device) -> torch.Tensor:
-    """Reusable max-capacity flat index buffer (no per-call allocation)."""
-    key = (device.index if device.index is not None else 0, capacity)
+def _get_csr_flat_buffer(
+    capacity: int, device: torch.device, slot: int = 0
+) -> torch.Tensor:
+    """Reusable max-capacity flat index buffer (no per-call allocation).
+
+    ``slot`` keeps the swa and extra CSR packs from aliasing the same buffer
+    when both sources have the same capacity; otherwise the second pack would
+    overwrite the first and both kernel pointers would see the extra rows.
+    The key also includes the current CUDA stream so concurrent calls on
+    different streams cannot race on one buffer (a pack on stream A would
+    otherwise be overwritten by stream B before A's fused kernel reads it).
+    """
+    stream = torch.cuda.current_stream(device)
+    key = (
+        device.index if device.index is not None else 0,
+        capacity,
+        slot,
+        stream.cuda_stream,
+    )
     buf = _CSR_FLAT_BUFFERS.get(key)
     if buf is None:
         buf = torch.empty(capacity, dtype=torch.int32, device=device)
@@ -442,6 +458,7 @@ def _get_csr_flat_buffer(capacity: int, device: torch.device) -> torch.Tensor:
 def _pack_sparse_rows(
     indices: torch.Tensor,  # [T, W] or [T, 1, W] int32 physical slots
     lens: torch.Tensor,  # [T] int32 valid prefix length per row
+    slot: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack dense padded rows into flat CSR lists (flat, indptr).
 
@@ -456,7 +473,7 @@ def _pack_sparse_rows(
     lens32 = lens.reshape(T).to(torch.int32)
     indptr = torch.zeros(T + 1, dtype=torch.int32, device=lens.device)
     torch.cumsum(lens32, dim=0, out=indptr[1:])
-    flat = _get_csr_flat_buffer(T * width, lens.device)
+    flat = _get_csr_flat_buffer(T * width, lens.device, slot)
     _pack_sparse_rows_kernel[(T, triton.cdiv(width, _PACK_BLOCK))](
         dense,
         lens32,
@@ -493,7 +510,7 @@ def triton_sparse_mla_prefill_vllm(
         swa_page_size,
         swa_page_bytes,
     ) = _paged_cache_views(swa_kv_cache)
-    swa_flat, swa_indptr = _pack_sparse_rows(swa_indices, swa_lens)
+    swa_flat, swa_indptr = _pack_sparse_rows(swa_indices, swa_lens, slot=0)
 
     has_extra = extra_kv_cache is not None
     if has_extra:
@@ -506,7 +523,9 @@ def triton_sparse_mla_prefill_vllm(
             extra_page_size,
             extra_page_bytes,
         ) = _paged_cache_views(extra_kv_cache)
-        extra_flat, extra_indptr = _pack_sparse_rows(extra_indices, extra_lens)
+        extra_flat, extra_indptr = _pack_sparse_rows(
+            extra_indices, extra_lens, slot=1
+        )
     else:
         empty_u8 = torch.empty(0, dtype=torch.uint8, device=q.device)
         empty_fp8 = torch.empty(0, dtype=torch.float8_e4m3fn, device=q.device)
