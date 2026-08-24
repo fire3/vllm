@@ -16,13 +16,14 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_sparse_mla_decode_concurrency import Case
+
 from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
-    _paged_cache_views,
-    _tiled_sparse_prefill_kernel,
     _GROUP_DIM,
     _NOPE_DIM,
     _SCALE_STRIDE,
     _TOKEN_DATA_STRIDE,
+    _paged_cache_views,
+    _tiled_sparse_prefill_kernel,
 )
 
 
