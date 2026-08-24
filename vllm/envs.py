@@ -126,6 +126,10 @@ if TYPE_CHECKING:
     # back to the phase-1 decode-wrapper launcher for A/B comparison.
     VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE: bool = False
     VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER: bool = False
+    # Split the SWA+extra token scan across (B, S) CTAs with a partial-LSE
+    # merge (flash-decoding style) to raise parallelism on small decode
+    # batches; opt-in until validated end-to-end.
+    VLLM_TRITON_SPARSE_MLA_KSPLIT: bool = False
     # Decode also routes through the tiled dual-source fused kernel by default;
     # set to 1 to fall back to the phase-1 elementwise two-pass kernel.
     VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY: bool = False
@@ -1161,9 +1165,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         in ("1", "true")
     ),
     "VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE", "0")
-        .strip()
-        .lower()
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE", "0").strip().lower()
         in ("1", "true")
     ),
     "VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER": lambda: (
@@ -1172,10 +1174,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         .lower()
         in ("1", "true")
     ),
+    "VLLM_TRITON_SPARSE_MLA_KSPLIT": lambda: (
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT", "0").strip().lower()
+        in ("1", "true")
+    ),
     "VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY", "0")
-        .strip()
-        .lower()
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY", "0").strip().lower()
         in ("1", "true")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
