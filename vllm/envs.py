@@ -122,6 +122,10 @@ if TYPE_CHECKING:
     # from SGLang. Default is a fixed config (deterministic, no runtime
     # benchmark); set to 1 to mirror the upstream operator's autotune.
     VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE: bool = False
+    # Phase-2A tiled sparse-MLA prefill kernel: opt-in autotune, and an opt-out
+    # back to the phase-1 decode-wrapper launcher for A/B comparison.
+    VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE: bool = False
+    VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1151,6 +1155,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE": lambda: (
         os.environ.get("VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE", "0").strip().lower()
+        in ("1", "true")
+    ),
+    "VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE": lambda: (
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE", "0")
+        .strip()
+        .lower()
+        in ("1", "true")
+    ),
+    "VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER": lambda: (
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER", "0")
+        .strip()
+        .lower()
         in ("1", "true")
     ),
     # If set, allow loading or unloading lora adapters in runtime,

@@ -21,6 +21,7 @@ import torch
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.envs import VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER
 from vllm.platforms.interface import DeviceCapability
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
@@ -29,6 +30,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_decode import (
     triton_sparse_mla_decode_vllm,
+)
+from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
+    triton_sparse_mla_prefill_vllm,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
 
@@ -180,8 +184,23 @@ class DeepseekV4TritonMLAAttention(DeepseekV4FlashInferSM120Attention):
         extra_lens: torch.Tensor | None,
         out: torch.Tensor,  # [T, H, D], written in place
     ) -> None:
-        triton_sparse_mla_decode_vllm(
-            q=q.unsqueeze(1),
+        if VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER:
+            # Phase-1 path: decode-style rows, two kernel passes + LSE merge.
+            triton_sparse_mla_decode_vllm(
+                q=q.unsqueeze(1),
+                swa_kv_cache=swa_kv_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                extra_kv_cache=extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_lens=extra_lens,
+                attn_sink=self.attn_sink,
+                softmax_scale=self.scale,
+                out=out,
+            )
+            return
+        triton_sparse_mla_prefill_vllm(
+            q=q,
             swa_kv_cache=swa_kv_cache,
             swa_indices=swa_indices,
             swa_lens=swa_lens,
