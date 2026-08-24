@@ -52,6 +52,12 @@ _DEFAULT_BLOCK_H = 8
 _DEFAULT_BLOCK_K = 32
 _DEFAULT_NUM_WARPS = 8
 _KSPLIT_CHUNK = 32
+# K-split is only useful when the batch is too small to fill the GPU on its
+# own (decode); prefill rows already give (T, 1) parallelism. The cutoff also
+# bounds the cached [T, S, H, D] partial buffers: at T=2048/S=68/H=8 the
+# bf16 partial out alone would be 1.1 GiB per (T, S) combo, accumulating
+# across chunked-prefill sizes and OOMing at high GPU-memory utilization.
+_KSPLIT_MAX_T = 64
 
 
 @triton.jit
@@ -971,10 +977,12 @@ def triton_sparse_mla_prefill_vllm(
     extra_scale_off = extra_page_size * _TOKEN_DATA_STRIDE
     lse = torch.empty(T, H, dtype=torch.float32, device=q.device)
 
-    if VLLM_TRITON_SPARSE_MLA_KSPLIT:
+    if VLLM_TRITON_SPARSE_MLA_KSPLIT and T <= _KSPLIT_MAX_T:
         # K-split path: (T, S, H-blocks) CTAs each scan one 32-token chunk of
         # one source, then a small merge kernel combines the partials with
-        # flash-decoding LSE weighting. Opt-in (env) until validated e2e.
+        # flash-decoding LSE weighting. Default on for decode-sized batches;
+        # VLLM_TRITON_SPARSE_MLA_KSPLIT=0 (or T > _KSPLIT_MAX_T) falls back to
+        # the single-CTA fused kernel.
         swa_width = swa_indices.reshape(T, -1).shape[1]
         extra_width = (
             extra_indices.reshape(T, -1).shape[1] if has_extra else 0

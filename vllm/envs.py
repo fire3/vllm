@@ -128,8 +128,8 @@ if TYPE_CHECKING:
     VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER: bool = False
     # Split the SWA+extra token scan across (B, S) CTAs with a partial-LSE
     # merge (flash-decoding style) to raise parallelism on small decode
-    # batches; opt-in until validated end-to-end.
-    VLLM_TRITON_SPARSE_MLA_KSPLIT: bool = False
+    # batches (e2e: 40 -> 54 TPS); set 0 to use the single-CTA fused kernel.
+    VLLM_TRITON_SPARSE_MLA_KSPLIT: bool = True
     # Decode also routes through the tiled dual-source fused kernel by default;
     # set to 1 to fall back to the phase-1 elementwise two-pass kernel.
     VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY: bool = False
@@ -1175,7 +1175,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         in ("1", "true")
     ),
     "VLLM_TRITON_SPARSE_MLA_KSPLIT": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT", "0").strip().lower()
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT", "1").strip().lower()
         in ("1", "true")
     ),
     "VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY": lambda: (
