@@ -45,8 +45,8 @@ _TOKEN_DATA_STRIDE = 576  # bytes per token in the data section
 _SCALE_STRIDE = 8  # bytes per token in the scale section
 
 _PACK_BLOCK = 128
-_DEFAULT_BLOCK_H = 16
-_DEFAULT_BLOCK_K = 16
+_DEFAULT_BLOCK_H = 8
+_DEFAULT_BLOCK_K = 32
 _DEFAULT_NUM_WARPS = 8
 
 
@@ -397,7 +397,8 @@ def _tiled_sparse_prefill_kernel(
 
 
 _TILED_SPARSE_PREFILL_CONFIGS = [
-    triton.Config({"BLOCK_H": 8, "BLOCK_K": 16}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_H": 8, "BLOCK_K": 32}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_H": 8, "BLOCK_K": 16}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_H": 16, "BLOCK_K": 16}, num_warps=8, num_stages=2),
     triton.Config({"BLOCK_H": 16, "BLOCK_K": 32}, num_warps=8, num_stages=2),
 ]
