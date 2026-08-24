@@ -25,7 +25,13 @@ from typing import Optional, Tuple
 
 import torch
 
-from vllm.envs import VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE
+from vllm.envs import (
+    VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE,
+    VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY,
+)
+from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
+    triton_sparse_mla_prefill_vllm,
+)
 from vllm.triton_utils import tl, triton
 
 LOG2E = tl.constexpr(1.4426950408889634)
@@ -452,17 +458,37 @@ def triton_sparse_mla_decode_vllm(
     softmax_scale: float,
     out: torch.Tensor,  # [B, H, D] bf16, written in place
 ) -> None:
-    """vLLM entry point for the DSv4 triton sparse-MLA decode path."""
-    out4, _ = flash_mla_sparse_decode_triton(
-        q=q,
-        k_cache=swa_kv_cache,
-        indices=swa_indices,
-        topk_length=swa_lens,
-        attn_sink=attn_sink,
-        head_dim_v=q.shape[-1],
-        softmax_scale=softmax_scale,
-        extra_k_cache=extra_kv_cache,
+    """vLLM entry point for the DSv4 triton sparse-MLA decode path.
+
+    Defaults to the tiled dual-source fused kernel shared with prefill
+    (head-blocked, per-64-dim-group ``tl.dot``, single launch replacing the
+    two-pass elementwise kernel + Python LSE merge). The phase-1 path stays
+    available via ``VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY=1`` for A/B.
+    """
+    if VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY:
+        out4, _ = flash_mla_sparse_decode_triton(
+            q=q,
+            k_cache=swa_kv_cache,
+            indices=swa_indices,
+            topk_length=swa_lens,
+            attn_sink=attn_sink,
+            head_dim_v=q.shape[-1],
+            softmax_scale=softmax_scale,
+            extra_k_cache=extra_kv_cache,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_lens,
+        )
+        out.copy_(out4.squeeze(1))
+        return
+    triton_sparse_mla_prefill_vllm(
+        q=q.squeeze(1),
+        swa_kv_cache=swa_kv_cache,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        extra_kv_cache=extra_kv_cache,
         extra_indices=extra_indices,
-        extra_topk_length=extra_lens,
+        extra_lens=extra_lens,
+        attn_sink=attn_sink,
+        softmax_scale=softmax_scale,
+        out=out,
     )
-    out.copy_(out4.squeeze(1))

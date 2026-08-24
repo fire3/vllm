@@ -126,6 +126,9 @@ if TYPE_CHECKING:
     # back to the phase-1 decode-wrapper launcher for A/B comparison.
     VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE: bool = False
     VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER: bool = False
+    # Decode also routes through the tiled dual-source fused kernel by default;
+    # set to 1 to fall back to the phase-1 elementwise two-pass kernel.
+    VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1165,6 +1168,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER": lambda: (
         os.environ.get("VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER", "0")
+        .strip()
+        .lower()
+        in ("1", "true")
+    ),
+    "VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY": lambda: (
+        os.environ.get("VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY", "0")
         .strip()
         .lower()
         in ("1", "true")

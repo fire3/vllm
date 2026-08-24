@@ -16,6 +16,9 @@ import torch
 from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
     _pack_sparse_rows,
 )
+from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_decode import (
+    triton_sparse_mla_decode_vllm,
+)
 from vllm.models.deepseek_v4.nvidia.triton_sparse import (
     DeepseekV4TritonMLAAttention,
 )
@@ -610,4 +613,123 @@ def test_tiled_prefill_matches_flashinfer():
         out_fi.float(),
         atol=5e-2,
         rtol=5e-2,
+    )
+
+
+def test_triton_decode_vllm_tiled_matches_reference():
+    """The decode entry now routes through the tiled fused kernel; it must
+    match the torch reference on decode-style rows with extra + sink."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda")
+    (
+        q,
+        sinks,
+        main_cache,
+        main_nope,
+        main_rope,
+        swa_indices,
+        swa_lens,
+        extra_cache,
+        extra_nope,
+        extra_rope,
+        extra_indices,
+        extra_lens,
+    ) = _make_prefill_inputs(device)
+    T, H, _ = q.shape
+    softmax_scale = _D ** -0.5
+
+    out = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
+    triton_sparse_mla_decode_vllm(
+        q=q.unsqueeze(1),
+        swa_kv_cache=main_cache,
+        swa_indices=swa_indices.unsqueeze(1),
+        swa_lens=swa_lens,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+        attn_sink=sinks,
+        softmax_scale=softmax_scale,
+        out=out,
+    )
+    ref = _reference_prefill(
+        q,
+        sinks,
+        main_nope,
+        main_rope,
+        swa_indices,
+        swa_lens,
+        extra_nope,
+        extra_rope,
+        extra_indices,
+        extra_lens,
+        softmax_scale,
+    )
+    torch.testing.assert_close(
+        out.float(),
+        ref.float(),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+
+def test_triton_decode_vllm_legacy_fallback(monkeypatch):
+    """VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY=1 keeps the phase-1 elementwise
+    two-pass path working through the same entry point."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda")
+    (
+        q,
+        sinks,
+        main_cache,
+        main_nope,
+        main_rope,
+        swa_indices,
+        swa_lens,
+        extra_cache,
+        extra_nope,
+        extra_rope,
+        extra_indices,
+        extra_lens,
+    ) = _make_prefill_inputs(device)
+    T, H, _ = q.shape
+    softmax_scale = _D ** -0.5
+
+    monkeypatch.setattr(
+        "vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_decode."
+        "VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY",
+        True,
+    )
+    out = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
+    triton_sparse_mla_decode_vllm(
+        q=q.unsqueeze(1),
+        swa_kv_cache=main_cache,
+        swa_indices=swa_indices.unsqueeze(1),
+        swa_lens=swa_lens,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+        attn_sink=sinks,
+        softmax_scale=softmax_scale,
+        out=out,
+    )
+    ref = _reference_prefill(
+        q,
+        sinks,
+        main_nope,
+        main_rope,
+        swa_indices,
+        swa_lens,
+        extra_nope,
+        extra_rope,
+        extra_indices,
+        extra_lens,
+        softmax_scale,
+    )
+    torch.testing.assert_close(
+        out.float(),
+        ref.float(),
+        atol=3e-2,
+        rtol=3e-2,
     )

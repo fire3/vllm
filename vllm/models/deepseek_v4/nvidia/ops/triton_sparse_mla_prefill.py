@@ -449,7 +449,7 @@ def _pack_sparse_rows(
     row is written, so no CPU/GPU sync is needed to learn the true nnz.
     """
     T = lens.shape[0]
-    dense = indices.reshape(T, -1) if indices.dim() == 3 else indices
+    dense = indices.reshape(T, -1)
     if not dense.is_contiguous():
         dense = dense.contiguous()
     width = dense.shape[1]
