@@ -314,10 +314,14 @@ def _tiled_sparse_prefill_kernel(
                 scores = tl.where(valid[None, :] & h_mask[:, None], scores, -1e30)
 
                 # Online softmax update (base-2, tile-level).
-                tile_max = tl.max(scores, axis=1)
+                # The accumulator runs in log2 space (like the decode kernel:
+                # ``scores_log2 = scores * LOG2E``); without the conversion the
+                # exp2 weights are flattened by 2^(s) instead of e^(s).
+                scores_log2 = scores * LOG2E
+                tile_max = tl.max(scores_log2, axis=1)
                 m_new = tl.maximum(m_i, tile_max)
                 alpha = tl.math.exp2(m_i - m_new)
-                p = tl.math.exp2(scores - m_new[:, None])
+                p = tl.math.exp2(scores_log2 - m_new[:, None])
                 p = tl.where(valid[None, :] & h_mask[:, None], p, 0.0)
                 l_i = l_i * alpha + tl.sum(p, axis=1)
                 p_bf16 = p.to(tl.bfloat16)
