@@ -63,13 +63,13 @@ _KSPLIT_CHUNK = 32
 # across chunked-prefill sizes and OOMing at high GPU-memory utilization.
 _KSPLIT_MAX_T = 64
 
-# A/B toggle: keep K-split inside FULL graph captures. Off by default because
-# a FULL graph bakes one chunk count S for the dynamic c128 width; when the
-# runtime width exceeds the baked S (requests past 64k tokens), replayed
-# K-split steps can drop compressed-attention chunks and degenerate. With
-# --max-model-len=65536 the width never exceeds the baked S=20 and K-split is
-# both fast and stable (see notes/2026-08-25-并发根因定位.md).
-_KSPLIT_FULL = os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL", "0") == "1"
+# A/B toggle: keep K-split inside FULL graph captures. On by default: the
+# K-split grid is now width-independent (fixed S_MAX derived from the max
+# buffer row capacity; per-CTA source/chunk selection reads the runtime CSR
+# lengths), so a FULL graph is correct for any c128 width up to max-model-len.
+# Set VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL=0 to force the fused kernel inside
+# FULL captures.
+_KSPLIT_FULL = os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL", "1") != "0"
 
 # Per-process capture-session counter: every CUDA graph capture gets a unique
 # token so scratch buffers are keyed per graph instance. Eager execution
@@ -89,14 +89,10 @@ def _capture_token() -> int:
 def _is_full_graph_capture() -> bool:
     """True when the current call is being captured into a FULL CUDA graph.
 
-    The K-split path bakes the per-chunk grid ``S`` (derived from the runtime
-    c128 topk width) and cached scratch buffers into the captured graph.  The
-    c128 width is dynamic (``next_power_of_2(max_seq_len / 128)``), so a FULL
-    graph captured at one width can replay against a wider runtime batch and
-    silently drop compressed-attention chunks.  The fused single-CTA kernel is
-    width-agnostic (it follows the CSR indptr), so FULL captures fall back to
-    it; K-split remains enabled for eager and PIECEWISE execution where the
-    launcher runs every step and recomputes ``S`` from the live widths.
+    K-split is width-independent (fixed grid/scratch sized to the max buffer
+    row capacity, runtime source selection from the CSR indptr), so it is safe
+    inside FULL captures. This helper is kept for the opt-out escape hatch
+    (``VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL=0``) and for A/B experiments.
     """
     if not torch.cuda.is_current_stream_capturing():
         return False
@@ -134,7 +130,6 @@ def _tiled_sparse_prefill_ksplit_kernel(
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
-    swa_chunks: tl.int32,
     stride_pt: tl.int32,  # S*H*D for partial out
     stride_ps: tl.int32,  # H*D
     stride_ph: tl.int32,  # D
@@ -147,19 +142,132 @@ def _tiled_sparse_prefill_ksplit_kernel(
     NOPE_DIM: tl.constexpr,
     TOKEN_DATA_STRIDE: tl.constexpr,
     SCALE_STRIDE: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
 ):
     """K-split variant: one (SWA|extra) chunk of ``CHUNK_SIZE`` tokens per CTA.
 
-    Grid: ``(T, S, ceil(H / BLOCK_H))`` where ``S = swa_chunks + extra_chunks``
-    and each CTA writes a partial (normalized output, natural-log LSE) that a
-    separate merge kernel combines with flash-decoding semantics. On small
-    decode batches this turns one long serial per-token scan into many
-    independent CTAs (measured: kernel time is flat up to ~128 CTAs).
+    Grid: ``(T, S_MAX, ceil(H / BLOCK_H))`` where ``S_MAX`` is the fixed chunk
+    count for the maximum possible row width (buffer capacity), independent of
+    the runtime width. Each CTA reads the runtime CSR row lengths and picks its
+    source (SWA first, then extra) and chunk index from them, so a FULL CUDA
+    graph replayed against any runtime width is correct: chunks beyond the
+    runtime length are no-ops and the merge masks them by runtime lens.
     """
     t = tl.program_id(0)
     pid_chunk = tl.program_id(1)
     pid_h = tl.program_id(2)
 
+    swa_start = tl.load(swa_indptr_ptr + t)
+    swa_end = tl.load(swa_indptr_ptr + t + 1)
+    swa_len = swa_end - swa_start
+    swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
+    if HAS_EXTRA:
+        extra_start = tl.load(extra_indptr_ptr + t)
+        extra_end = tl.load(extra_indptr_ptr + t + 1)
+        extra_len = extra_end - extra_start
+        extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
+    else:
+        extra_chunks = 0
+        extra_start = 0
+        extra_end = 0
+    total_chunks = swa_chunks + extra_chunks
+
+    if pid_chunk < total_chunks:
+        _ksplit_chunk_body(
+            Q_ptr,
+            partial_out_ptr,
+            partial_lse_ptr,
+            t,
+            pid_h,
+            swa_cache_fp8_ptr,
+            swa_cache_uint8_ptr,
+            swa_cache_bf16_ptr,
+            swa_idx_ptr,
+            swa_start,
+            swa_end,
+            extra_cache_fp8_ptr,
+            extra_cache_uint8_ptr,
+            extra_cache_bf16_ptr,
+            extra_idx_ptr,
+            extra_start,
+            extra_end,
+            sm_scale,
+            swa_page_size,
+            swa_page_bytes,
+            swa_layer_off,
+            swa_scale_off,
+            extra_page_size,
+            extra_page_bytes,
+            extra_layer_off,
+            extra_scale_off,
+            H,
+            stride_qb,
+            stride_qh,
+            swa_chunks,
+            pid_chunk,
+            stride_pt,
+            stride_ps,
+            stride_ph,
+            stride_lt,
+            stride_ls,
+            CHUNK_SIZE,
+            BLOCK_H,
+            BLOCK_K,
+            GROUP_DIM,
+            NOPE_DIM,
+            TOKEN_DATA_STRIDE,
+            SCALE_STRIDE,
+            HAS_EXTRA,
+        )
+
+
+@triton.jit
+def _ksplit_chunk_body(
+    Q_ptr,
+    partial_out_ptr,
+    partial_lse_ptr,
+    t: tl.int32,
+    pid_h: tl.int32,
+    swa_cache_fp8_ptr,
+    swa_cache_uint8_ptr,
+    swa_cache_bf16_ptr,
+    swa_idx_ptr,
+    swa_start: tl.int32,
+    swa_end: tl.int32,
+    extra_cache_fp8_ptr,
+    extra_cache_uint8_ptr,
+    extra_cache_bf16_ptr,
+    extra_idx_ptr,
+    extra_start: tl.int32,
+    extra_end: tl.int32,
+    sm_scale: tl.float32,
+    swa_page_size: tl.int32,
+    swa_page_bytes: tl.int64,
+    swa_layer_off: tl.int64,
+    swa_scale_off: tl.int64,
+    extra_page_size: tl.int32,
+    extra_page_bytes: tl.int64,
+    extra_layer_off: tl.int64,
+    extra_scale_off: tl.int64,
+    H: tl.int32,
+    stride_qb: tl.int32,
+    stride_qh: tl.int32,
+    swa_chunks: tl.int32,
+    pid_chunk: tl.int32,
+    stride_pt: tl.int32,
+    stride_ps: tl.int32,
+    stride_ph: tl.int32,
+    stride_lt: tl.int32,
+    stride_ls: tl.int32,
+    CHUNK_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    TOKEN_DATA_STRIDE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+):
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
     d_offs = tl.arange(0, GROUP_DIM)
@@ -219,21 +327,20 @@ def _tiled_sparse_prefill_ksplit_kernel(
     acc6 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
     acc_rope = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
 
-    # Select this CTA's source (SWA chunks first, then extra) and its range.
+    # Select this CTA's source (SWA chunks first, then extra) from the runtime
+    # CSR row lengths and its range within the row.
     is_extra = pid_chunk >= swa_chunks
     fp8_p = tl.where(is_extra, extra_cache_fp8_ptr, swa_cache_fp8_ptr)
     uint8_p = tl.where(is_extra, extra_cache_uint8_ptr, swa_cache_uint8_ptr)
     bf16_p = tl.where(is_extra, extra_cache_bf16_ptr, swa_cache_bf16_ptr)
     idx_p = tl.where(is_extra, extra_idx_ptr, swa_idx_ptr)
-    indptr_p = tl.where(is_extra, extra_indptr_ptr, swa_indptr_ptr)
     page_size = tl.where(is_extra, extra_page_size, swa_page_size)
     page_bytes = tl.where(is_extra, extra_page_bytes, swa_page_bytes)
     layer_off = tl.where(is_extra, extra_layer_off, swa_layer_off)
     scale_off = tl.where(is_extra, extra_scale_off, swa_scale_off)
+    start = tl.where(is_extra, extra_start, swa_start)
+    end = tl.where(is_extra, extra_end, swa_end)
     chunk_idx = pid_chunk - tl.where(is_extra, swa_chunks, 0)
-
-    start = tl.load(indptr_p + t)
-    end = tl.load(indptr_p + t + 1)
     length = end - start
     k_begin = chunk_idx * CHUNK_SIZE
     k_end = tl.minimum(k_begin + CHUNK_SIZE, length)
@@ -424,8 +531,6 @@ def _merge_ksplit_kernel(
     LSE_ptr,  # [T, H] f32
     swa_lens_ptr,  # [T] int32, runtime SWA row lengths
     extra_lens_ptr,  # [T] int32, runtime extra row lengths
-    S: tl.int32,
-    swa_chunks: tl.int32,
     H: tl.int32,
     stride_pt: tl.int32,
     stride_ps: tl.int32,
@@ -439,8 +544,14 @@ def _merge_ksplit_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
 ):
-    """Flash-decoding merge: combine per-chunk partials via LSE weighting."""
+    """Flash-decoding merge: combine per-chunk partials via LSE weighting.
+
+    The chunk count and source boundary are derived from the runtime row
+    lengths (swa chunks first, then extra), so the merge is independent of the
+    captured width; partial buffers beyond the runtime length are masked.
+    """
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
     pid_d = tl.program_id(2)
@@ -454,23 +565,27 @@ def _merge_ksplit_kernel(
     # (re)written by this step's ksplit kernel, so they must be masked instead
     # of trusting their (potentially stale) partial LSE.
     swa_len = tl.load(swa_lens_ptr + t)
-    extra_len = tl.load(extra_lens_ptr + t)
-    swa_chunks_valid = tl.cdiv(swa_len, CHUNK_SIZE)
-    extra_chunks_valid = tl.cdiv(extra_len, CHUNK_SIZE)
+    swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
+    if HAS_EXTRA:
+        extra_len = tl.load(extra_lens_ptr + t)
+        extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
+    else:
+        extra_chunks = 0
+    total_chunks = swa_chunks + extra_chunks
 
     # Pass 1: max LSE over chunks (per head).
     m = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
-    for s0 in tl.range(0, S, BLOCK_S):
+    for s0 in tl.range(0, total_chunks, BLOCK_S):
         s_offs = s0 + tl.arange(0, BLOCK_S)
-        smask = s_offs < S
+        smask = s_offs < total_chunks
         is_extra = s_offs >= swa_chunks
         chunk_in_source = tl.where(
             is_extra, s_offs - swa_chunks, s_offs
         )
         valid_chunk = tl.where(
             is_extra,
-            chunk_in_source < extra_chunks_valid,
-            chunk_in_source < swa_chunks_valid,
+            chunk_in_source < extra_chunks,
+            chunk_in_source < swa_chunks,
         )
         smask = smask & valid_chunk
         lse = tl.load(
@@ -485,17 +600,17 @@ def _merge_ksplit_kernel(
     # Pass 2: weighted sum over chunks.
     acc = tl.zeros([BLOCK_H, BLOCK_D], dtype=tl.float32)
     denom = tl.zeros([BLOCK_H], dtype=tl.float32)
-    for s0 in tl.range(0, S, BLOCK_S):
+    for s0 in tl.range(0, total_chunks, BLOCK_S):
         s_offs = s0 + tl.arange(0, BLOCK_S)
-        smask = s_offs < S
+        smask = s_offs < total_chunks
         is_extra = s_offs >= swa_chunks
         chunk_in_source = tl.where(
             is_extra, s_offs - swa_chunks, s_offs
         )
         valid_chunk = tl.where(
             is_extra,
-            chunk_in_source < extra_chunks_valid,
-            chunk_in_source < swa_chunks_valid,
+            chunk_in_source < extra_chunks,
+            chunk_in_source < swa_chunks,
         )
         smask = smask & valid_chunk
         lse = tl.load(
@@ -946,17 +1061,20 @@ def _pack_sparse_rows(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack dense padded rows into flat CSR lists (flat, indptr).
 
-    ``flat`` is a max-capacity cached buffer; only the valid prefix of each
-    row is written, so no CPU/GPU sync is needed to learn the true nnz.
+    ``flat`` is a max-capacity cached buffer (T * buffer-row-width); only the
+    valid prefix of each row is written, so no CPU/GPU sync is needed to learn
+    the true nnz. The grid covers the buffer row capacity (outer stride of the
+    sliced max-width buffer view), not the active width, so a FULL CUDA graph
+    packs every runtime row length up to the capacity.
     """
     T = lens.shape[0]
     dense = indices.reshape(T, -1)
-    width = dense.shape[1]
+    max_width = max(dense.stride(0), dense.shape[1])
     lens32 = lens.reshape(T).to(torch.int32)
     indptr = torch.zeros(T + 1, dtype=torch.int32, device=lens.device)
     torch.cumsum(lens32, dim=0, out=indptr[1:])
-    flat = _get_csr_flat_buffer(T * width, lens.device, slot)
-    _pack_sparse_rows_kernel[(T, triton.cdiv(width, _PACK_BLOCK))](
+    flat = _get_csr_flat_buffer(T * max_width, lens.device, slot)
+    _pack_sparse_rows_kernel[(T, triton.cdiv(max_width, _PACK_BLOCK))](
         dense,
         lens32,
         flat,
@@ -1061,18 +1179,30 @@ def triton_sparse_mla_prefill_vllm(
     if use_ksplit and _is_full_graph_capture() and not _KSPLIT_FULL:
         use_ksplit = False
     if use_ksplit:
-        # K-split path: (T, S, H-blocks) CTAs each scan one 32-token chunk of
-        # one source, then a small merge kernel combines the partials with
-        # flash-decoding LSE weighting. Default on for decode-sized batches;
-        # VLLM_TRITON_SPARSE_MLA_KSPLIT=0 (or T > _KSPLIT_MAX_T) falls back to
-        # the single-CTA fused kernel.
-        swa_width = swa_indices.reshape(T, -1).shape[1]
-        extra_width = (
-            extra_indices.reshape(T, -1).shape[1] if has_extra else 0
+        # K-split path: (T, S_MAX, H-blocks) CTAs each scan one 32-token chunk
+        # of one source, then a small merge kernel combines the partials with
+        # flash-decoding LSE weighting. S_MAX is the fixed chunk count for the
+        # max buffer row capacity (width-independent): every CTA selects its
+        # source/chunk from the runtime CSR lengths, so FULL-graph replay is
+        # correct for any runtime c128 width. Default on for decode-sized
+        # batches; VLLM_TRITON_SPARSE_MLA_KSPLIT=0 (or T > _KSPLIT_MAX_T)
+        # falls back to the single-CTA fused kernel.
+        swa_max_width = max(
+            swa_indices.reshape(T, -1).stride(0),
+            swa_indices.reshape(T, -1).shape[1],
         )
-        swa_chunks = triton.cdiv(swa_width, _KSPLIT_CHUNK)
-        extra_chunks = triton.cdiv(extra_width, _KSPLIT_CHUNK)
-        S = swa_chunks + extra_chunks
+        extra_max_width = (
+            max(
+                extra_indices.reshape(T, -1).stride(0),
+                extra_indices.reshape(T, -1).shape[1],
+            )
+            if has_extra
+            else 0
+        )
+        S = (
+            triton.cdiv(swa_max_width, _KSPLIT_CHUNK)
+            + triton.cdiv(extra_max_width, _KSPLIT_CHUNK)
+        )
         D = _NOPE_DIM + _ROPE_DIM
         partial_out, partial_lse = _get_ksplit_partial_buffers(T, S, H, q.device)
         grid = (T, S, triton.cdiv(H, _DEFAULT_BLOCK_H))
@@ -1102,7 +1232,6 @@ def triton_sparse_mla_prefill_vllm(
             H=H,
             stride_qb=q.stride(0),
             stride_qh=q.stride(1),
-            swa_chunks=swa_chunks,
             stride_pt=S * H * D,
             stride_ps=H * D,
             stride_ph=D,
@@ -1115,6 +1244,7 @@ def triton_sparse_mla_prefill_vllm(
             NOPE_DIM=_NOPE_DIM,
             TOKEN_DATA_STRIDE=_TOKEN_DATA_STRIDE,
             SCALE_STRIDE=_SCALE_STRIDE,
+            HAS_EXTRA=has_extra,
             num_warps=_DEFAULT_NUM_WARPS,
             num_stages=2,
         )
@@ -1125,8 +1255,6 @@ def triton_sparse_mla_prefill_vllm(
             lse,
             swa_lens,
             extra_lens if has_extra else swa_lens,
-            S=S,
-            swa_chunks=swa_chunks,
             H=H,
             stride_pt=S * H * D,
             stride_ps=H * D,
@@ -1140,6 +1268,7 @@ def triton_sparse_mla_prefill_vllm(
             BLOCK_S=8,
             BLOCK_D=128,
             CHUNK_SIZE=_KSPLIT_CHUNK,
+            HAS_EXTRA=has_extra,
             num_warps=8,
         )
     else:

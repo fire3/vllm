@@ -552,6 +552,131 @@ def scenario_transition() -> None:
     print(f"transition: {'PASS' if nfail == 0 else f'{nfail} FAIL'}")
 
 
+def scenario_wide_capture() -> None:
+    """Width-independent K-split: wide buffer views (stride W_MAX) with narrow
+    active rows must produce oracle output for any runtime row length.
+
+    Mirrors the production c128a metadata views: the tensors are slices of
+    max-width buffers (outer stride W_MAX) whose active width is small. The
+    K-split grid/scratch is sized to W_MAX while per-CTA source/chunk
+    selection comes from the runtime CSR lengths, so the result must equal
+    the reference for a mix of row lengths (including 0 and W_ACTIVE).
+    """
+    dev = torch.device("cuda:0")
+    nfail = 0
+    for seed in range(4):
+        c = Case(
+            9000 + seed,
+            B=8,
+            H=8,
+            swa_topk=128,
+            extra_topk=2048,
+            swa_page=64,
+            extra_page=64,
+            score_scale=500.0,
+            exp_range=0,
+        )
+        from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_vllm,
+        )
+
+        # Slice of a max-width buffer with the active view width, preserving
+        # the buffer stride (exactly what build_c128a_topk_metadata returns).
+        swa_wide = torch.full(
+            (c.B, 4096), -1, dtype=torch.int32, device=dev
+        )
+        extra_wide = torch.full(
+            (c.B, 4096), -1, dtype=torch.int32, device=dev
+        )
+        swa_wide[:, : c.swa_topk] = c.swa_idx.squeeze(1)
+        extra_wide[:, : c.extra_topk] = c.extra_idx.squeeze(1)
+        swa_view = swa_wide[:, : c.swa_topk].unsqueeze(1)
+        extra_view = extra_wide[:, : c.extra_topk].unsqueeze(1)
+
+        c.out.zero_()
+        triton_sparse_mla_decode_vllm(
+            q=c.q,
+            swa_kv_cache=c.swa_cache,
+            swa_indices=swa_view,
+            swa_lens=c.swa_lens,
+            extra_kv_cache=c.extra_cache,
+            extra_indices=extra_view,
+            extra_lens=c.extra_lens,
+            attn_sink=c.sinks,
+            softmax_scale=c.scale,
+            out=c.out,
+        )
+        torch.cuda.synchronize()
+        if not _close(c.out, c.ref):
+            nfail += 1
+            c.check(c.out, tag=f"wide seed={seed}")
+
+        # Same wide views, captured into a CUDA graph, replayed with mutated
+        # row lengths/contents (runtime width changes must not corrupt output).
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            triton_sparse_mla_decode_vllm(
+                q=c.q,
+                swa_kv_cache=c.swa_cache,
+                swa_indices=swa_view,
+                swa_lens=c.swa_lens,
+                extra_kv_cache=c.extra_cache,
+                extra_indices=extra_view,
+                extra_lens=c.extra_lens,
+                attn_sink=c.sinks,
+                softmax_scale=c.scale,
+                out=c.out,
+            )
+        torch.cuda.synchronize()
+        for rep in range(3):
+            gen = torch.Generator(device="cpu").manual_seed(9100 + seed * 10 + rep)
+            swa_lens = torch.randint(0, 129, (c.B,), generator=gen)
+            extra_lens = torch.randint(0, 257, (c.B,), generator=gen)
+            swa_wide.fill_(-1)
+            extra_wide.fill_(-1)
+            for b in range(c.B):
+                n = swa_lens[b].item()
+                if n:
+                    swa_wide[b, :n] = torch.randint(
+                        0,
+                        512,
+                        (n,),
+                        generator=torch.Generator().manual_seed(b * 13 + rep + seed),
+                    )
+                n = extra_lens[b].item()
+                if n:
+                    extra_wide[b, :n] = torch.randint(
+                        0,
+                        512,
+                        (n,),
+                        generator=torch.Generator().manual_seed(b * 13 + rep + seed + 50),
+                    )
+            c.swa_lens.copy_(swa_lens.to(dev))
+            c.extra_lens.copy_(extra_lens.to(dev))
+            c.swa_idx = swa_view.squeeze(1)
+            c.extra_idx = extra_view.squeeze(1)
+            c.ref = _reference(
+                c.q,
+                c.swa_nope,
+                c.swa_rope,
+                c.swa_idx,
+                c.swa_lens,
+                c.extra_nope,
+                c.extra_rope,
+                c.extra_idx,
+                c.extra_lens,
+                c.sinks,
+                c.scale,
+            )
+            c.out.zero_()
+            g.replay()
+            torch.cuda.synchronize()
+            if not _close(c.out, c.ref):
+                nfail += 1
+                c.check(c.out, tag=f"wide-graph seed={seed} rep={rep}")
+    print(f"wide_capture: {'PASS' if nfail == 0 else f'{nfail} FAIL'}")
+
+
 def scenario_reproduce_alias() -> None:
     """Reproduce the pre-fix swa/extra CSR aliasing (slot=0 for both packs)."""
     import triton
@@ -659,7 +784,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--scenario",
-        choices=["multibatch", "streams", "graph", "transition", "alias", "all"],
+        choices=[
+            "multibatch",
+            "streams",
+            "graph",
+            "transition",
+            "wide",
+            "alias",
+            "all",
+        ],
         default="all",
     )
     args = ap.parse_args()
@@ -677,6 +810,9 @@ def main() -> None:
     if sc in ("transition", "all"):
         print("== transition ==")
         scenario_transition()
+    if sc in ("wide", "all"):
+        print("== wide_capture ==")
+        scenario_wide_capture()
     if sc in ("alias", "all"):
         print("== reproduce-alias ==")
         scenario_reproduce_alias()
