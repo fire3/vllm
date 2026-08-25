@@ -47,9 +47,13 @@ def maybe_execute_in_parallel(
         Tuple of (fn0_result, fn1_result).
     """
     if aux_stream is not None:
-        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-
-        if BreakableCUDAGraphCapture.is_active():
+        # Cross-stream event synchronization must not be captured into a CUDA
+        # graph: the per-module Event objects are reused across eager steps and
+        # graph replays, and a captured event's completion state can be stale
+        # on replay, making the main stream skip the join and read partially
+        # written compressor/indexer outputs. Run serially during any capture
+        # (breakable or monolithic FULL); eager execution keeps the overlap.
+        if torch.cuda.is_current_stream_capturing():
             aux_stream = None
 
     if aux_stream is not None:
