@@ -29,6 +29,8 @@ heads is explicitly out of scope for 2A (see notes 2026-08-23, sec. 2.1-3).
 
 from typing import Optional
 
+import os
+
 import torch
 
 from vllm.config import CUDAGraphMode
@@ -60,6 +62,28 @@ _KSPLIT_CHUNK = 32
 # bf16 partial out alone would be 1.1 GiB per (T, S) combo, accumulating
 # across chunked-prefill sizes and OOMing at high GPU-memory utilization.
 _KSPLIT_MAX_T = 64
+
+# A/B toggle: keep K-split inside FULL graph captures. Off by default because
+# a FULL graph bakes one chunk count S for the dynamic c128 width; when the
+# runtime width exceeds the baked S (requests past 64k tokens), replayed
+# K-split steps can drop compressed-attention chunks and degenerate. With
+# --max-model-len=65536 the width never exceeds the baked S=20 and K-split is
+# both fast and stable (see notes/2026-08-25-并发根因定位.md).
+_KSPLIT_FULL = os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL", "0") == "1"
+
+# Per-process capture-session counter: every CUDA graph capture gets a unique
+# token so scratch buffers are keyed per graph instance. Eager execution
+# (token 0) never aliases any captured graph's scratch.
+_CAPTURE_SESSION = [0]
+_PREV_CAPTURING = [False]
+
+
+def _capture_token() -> int:
+    capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and not _PREV_CAPTURING[0]:
+        _CAPTURE_SESSION[0] += 1
+    _PREV_CAPTURING[0] = capturing
+    return _CAPTURE_SESSION[0] if capturing else 0
 
 
 def _is_full_graph_capture() -> bool:
@@ -330,54 +354,55 @@ def _tiled_sparse_prefill_ksplit_kernel(
 
     # Finalize: normalize and write this chunk's partial output + LSE.
     safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+    has_data = l_i > 0.0
     p_base = t * stride_pt + pid_chunk * stride_ps
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (0 * GROUP_DIM + d_offs)[None, :],
         (acc0 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (1 * GROUP_DIM + d_offs)[None, :],
         (acc1 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (2 * GROUP_DIM + d_offs)[None, :],
         (acc2 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (3 * GROUP_DIM + d_offs)[None, :],
         (acc3 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (4 * GROUP_DIM + d_offs)[None, :],
         (acc4 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (5 * GROUP_DIM + d_offs)[None, :],
         (acc5 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (6 * GROUP_DIM + d_offs)[None, :],
         (acc6 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
         + (NOPE_DIM + d_offs)[None, :],
         (acc_rope / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
+        mask=h_mask[:, None] & has_data[:, None],
     )
     lse = tl.where(
         l_i > 0.0,
@@ -387,7 +412,7 @@ def _tiled_sparse_prefill_ksplit_kernel(
     tl.store(
         partial_lse_ptr + t * stride_lt + pid_chunk * stride_ls + h_offs,
         lse,
-        mask=h_mask,
+        mask=h_mask & has_data,
     )
 
 
@@ -397,7 +422,10 @@ def _merge_ksplit_kernel(
     partial_lse_ptr,  # [T, S, H] f32
     O_ptr,  # [T, H, D] bf16
     LSE_ptr,  # [T, H] f32
+    swa_lens_ptr,  # [T] int32, runtime SWA row lengths
+    extra_lens_ptr,  # [T] int32, runtime extra row lengths
     S: tl.int32,
+    swa_chunks: tl.int32,
     H: tl.int32,
     stride_pt: tl.int32,
     stride_ps: tl.int32,
@@ -410,6 +438,7 @@ def _merge_ksplit_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
 ):
     """Flash-decoding merge: combine per-chunk partials via LSE weighting."""
     t = tl.program_id(0)
@@ -421,11 +450,29 @@ def _merge_ksplit_kernel(
     d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
 
+    # Per-row valid chunk range: chunks beyond the runtime row length were not
+    # (re)written by this step's ksplit kernel, so they must be masked instead
+    # of trusting their (potentially stale) partial LSE.
+    swa_len = tl.load(swa_lens_ptr + t)
+    extra_len = tl.load(extra_lens_ptr + t)
+    swa_chunks_valid = tl.cdiv(swa_len, CHUNK_SIZE)
+    extra_chunks_valid = tl.cdiv(extra_len, CHUNK_SIZE)
+
     # Pass 1: max LSE over chunks (per head).
     m = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
     for s0 in tl.range(0, S, BLOCK_S):
         s_offs = s0 + tl.arange(0, BLOCK_S)
         smask = s_offs < S
+        is_extra = s_offs >= swa_chunks
+        chunk_in_source = tl.where(
+            is_extra, s_offs - swa_chunks, s_offs
+        )
+        valid_chunk = tl.where(
+            is_extra,
+            chunk_in_source < extra_chunks_valid,
+            chunk_in_source < swa_chunks_valid,
+        )
+        smask = smask & valid_chunk
         lse = tl.load(
             partial_lse_ptr + t * stride_lt + s_offs[:, None] * stride_ls
             + h_offs[None, :],
@@ -441,6 +488,16 @@ def _merge_ksplit_kernel(
     for s0 in tl.range(0, S, BLOCK_S):
         s_offs = s0 + tl.arange(0, BLOCK_S)
         smask = s_offs < S
+        is_extra = s_offs >= swa_chunks
+        chunk_in_source = tl.where(
+            is_extra, s_offs - swa_chunks, s_offs
+        )
+        valid_chunk = tl.where(
+            is_extra,
+            chunk_in_source < extra_chunks_valid,
+            chunk_in_source < swa_chunks_valid,
+        )
+        smask = smask & valid_chunk
         lse = tl.load(
             partial_lse_ptr + t * stride_lt + s_offs[:, None] * stride_ls
             + h_offs[None, :],
@@ -852,7 +909,7 @@ def _paged_cache_views(
     )
 
 
-_CSR_FLAT_BUFFERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
+_CSR_FLAT_BUFFERS: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
 
 
 def _get_csr_flat_buffer(
@@ -873,6 +930,7 @@ def _get_csr_flat_buffer(
         capacity,
         slot,
         stream.cuda_stream,
+        _capture_token(),
     )
     buf = _CSR_FLAT_BUFFERS.get(key)
     if buf is None:
@@ -911,7 +969,7 @@ def _pack_sparse_rows(
     return flat, indptr
 
 
-_KSPLIT_PARTIAL_BUFFERS: dict[tuple[int, int, int, int, int], tuple] = {}
+_KSPLIT_PARTIAL_BUFFERS: dict[tuple[int, int, int, int, int, int], tuple] = {}
 
 
 def _get_ksplit_partial_buffers(
@@ -928,6 +986,7 @@ def _get_ksplit_partial_buffers(
         S,
         H,
         stream.cuda_stream,
+        _capture_token(),
     )
     buf = _KSPLIT_PARTIAL_BUFFERS.get(key)
     if buf is None:
@@ -1000,11 +1059,10 @@ def triton_sparse_mla_prefill_vllm(
     extra_scale_off = extra_page_size * _TOKEN_DATA_STRIDE
     lse = torch.empty(T, H, dtype=torch.float32, device=q.device)
 
-    if (
-        VLLM_TRITON_SPARSE_MLA_KSPLIT
-        and T <= _KSPLIT_MAX_T
-        and not _is_full_graph_capture()
-    ):
+    use_ksplit = VLLM_TRITON_SPARSE_MLA_KSPLIT and T <= _KSPLIT_MAX_T
+    if use_ksplit and _is_full_graph_capture() and not _KSPLIT_FULL:
+        use_ksplit = False
+    if use_ksplit:
         # K-split path: (T, S, H-blocks) CTAs each scan one 32-token chunk of
         # one source, then a small merge kernel combines the partials with
         # flash-decoding LSE weighting. Default on for decode-sized batches;
@@ -1067,7 +1125,10 @@ def triton_sparse_mla_prefill_vllm(
             partial_lse,
             out,
             lse,
+            swa_lens,
+            extra_lens if has_extra else swa_lens,
             S=S,
+            swa_chunks=swa_chunks,
             H=H,
             stride_pt=S * H * D,
             stride_ps=H * D,
@@ -1080,6 +1141,7 @@ def triton_sparse_mla_prefill_vllm(
             BLOCK_H=8,
             BLOCK_S=8,
             BLOCK_D=128,
+            CHUNK_SIZE=_KSPLIT_CHUNK,
             num_warps=8,
         )
     else:

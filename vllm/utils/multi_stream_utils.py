@@ -106,6 +106,20 @@ def execute_in_parallel(
         result of aux_fns[i] (or None when skipped).
     """
     aux_results: list[Any]
+    if enable:
+        from vllm.compilation.breakable_cudagraph import (
+            BreakableCUDAGraphCapture,
+        )
+
+        # Cross-stream event synchronization must not be captured into a CUDA
+        # graph: the per-module Event objects are reused across eager steps and
+        # graph replays, and a captured event's completion state can be stale
+        # on replay, making the main stream skip the join and read partially
+        # written indexer/compressor outputs. Run serially during capture;
+        # eager execution keeps the multi-stream overlap.
+        if BreakableCUDAGraphCapture.is_active():
+            enable = False
+
     if aux_streams is None or not enable:
         default_result = default_fn()
         aux_results = [fn() if fn is not None else None for fn in aux_fns]
