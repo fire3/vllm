@@ -68,8 +68,6 @@ def _find_first_mhc_layer(model: torch.nn.Module) -> torch.nn.Module | None:
         if all(
             hasattr(module, attr)
             for attr in (
-                "hc_pre",
-                "hc_post",
                 "hc_attn_fn",
                 "hc_attn_scale",
                 "hc_attn_base",
@@ -95,6 +93,16 @@ def _find_deepseek_v4_model(model: torch.nn.Module) -> torch.nn.Module | None:
 
 
 def _warmup_layer_mhc(
+    layer: torch.nn.Module,
+    token_sizes: list[int],
+) -> None:
+    if hasattr(layer, "hc_pre") and hasattr(layer, "hc_post"):
+        _warmup_layer_mhc_prepost(layer, token_sizes)
+    else:
+        _warmup_layer_mhc_nvidia(layer, token_sizes)
+
+
+def _warmup_layer_mhc_prepost(
     layer: torch.nn.Module,
     token_sizes: list[int],
 ) -> None:
@@ -125,6 +133,151 @@ def _warmup_layer_mhc(
             layer.hc_post(layer_input, residual_slice, post_mix, comb_mix)
 
 
+def _broadcast_nsplit_sizes(
+    max_tokens: int,
+    hidden_size: int,
+    n_sms: int,
+) -> list[int]:
+    """Token sizes that hit every ``n_splits`` bucket of the 2D broadcast mHC
+    pre kernel for M in [1, max_tokens].
+
+    ``mhc_pre_broadcast_tilelang`` derives ``n_splits`` from the runtime token
+    count (``n_sms // ceil(M / 64)`` capped by the hidden-size split budget),
+    and ``n_splits`` is a static TileLang compile key. Warming one M per
+    bucket (``M = 64 * grid``) covers every value inference can hit for
+    chunked prefill / prefix-cache delta sizes up to ``max_tokens``.
+    """
+    cap = max((hidden_size + 63) // 64 // 4, 1)
+    sizes: list[int] = []
+    prev = -1
+    for grid in range(1, (max_tokens + 63) // 64 + 1):
+        n_splits = min(n_sms // grid, cap)
+        if n_splits != prev:
+            sizes.append(min(grid * 64, max_tokens))
+            prev = n_splits
+    return sizes
+
+
+def _warmup_layer_mhc_nvidia(
+    layer: torch.nn.Module,
+    token_sizes: list[int],
+) -> None:
+    """Warm the SM89 nvidia mHC TileLang kernels.
+
+    The nvidia ``DeepseekV4DecoderLayer`` has no ``hc_pre``/``hc_post``
+    methods; its forward calls the tilelang module functions directly, so the
+    warmup mirrors those calls (2D broadcast pre, 3D pre, fused post-pre for
+    attn and ffn, standalone post) on one representative layer. TileLang
+    kernels use a dynamic token count, so one compile per static config covers
+    every chunk size; the broadcast pre additionally compiles per ``n_splits``
+    bucket, so the token list is extended to hit each bucket.
+    """
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        mhc_fused_post_pre_tilelang,
+        mhc_post_tilelang,
+        mhc_pre_broadcast_tilelang,
+        mhc_pre_tilelang,
+    )
+
+    max_tokens = max(token_sizes)
+    hidden_size = int(layer.hidden_size)
+    hc_mult = int(layer.hc_mult)
+    device = layer.hc_attn_fn.device
+    n_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    sizes = sorted(
+        set(token_sizes)
+        | set(_broadcast_nsplit_sizes(max_tokens, hidden_size, n_sms))
+    )
+
+    attn_norm_weight = layer.attn_norm.weight.data
+    attn_norm_eps = layer.attn_norm.variance_epsilon
+    ffn_norm_weight = layer.ffn_norm.weight.data
+    ffn_norm_eps = layer.ffn_norm.variance_epsilon
+    rms_eps = layer.rms_norm_eps
+    hc_eps = layer.hc_eps
+    hc_post_alpha = layer.hc_post_alpha
+    sinkhorn_iters = layer.hc_sinkhorn_iters
+
+    residual = torch.zeros(
+        max_tokens,
+        hc_mult,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    x = torch.zeros(max_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+
+    for size in sizes:
+        residual_slice = residual[:size]
+        x_slice = x[:size]
+        # First-layer standalone pre: 3D and 2D-broadcast variants.
+        post_mix, comb_mix, layer_input = mhc_pre_tilelang(
+            residual_slice,
+            layer.hc_attn_fn,
+            layer.hc_attn_scale,
+            layer.hc_attn_base,
+            rms_eps,
+            hc_eps,
+            hc_eps,
+            hc_post_alpha,
+            sinkhorn_iters,
+            norm_weight=attn_norm_weight,
+            norm_eps=attn_norm_eps,
+        )
+        if layer.hc_attn_fn_broadcast is not None:
+            mhc_pre_broadcast_tilelang(
+                x_slice,
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                rms_eps,
+                hc_eps,
+                hc_eps,
+                hc_post_alpha,
+                sinkhorn_iters,
+                norm_weight=attn_norm_weight,
+                norm_eps=attn_norm_eps,
+                fn_broadcast=layer.hc_attn_fn_broadcast,
+            )
+        # Fused post-pre used by every subsequent layer (attn and ffn).
+        for fn, scale, base, norm_weight, norm_eps in (
+            (
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                attn_norm_weight,
+                attn_norm_eps,
+            ),
+            (
+                layer.hc_ffn_fn,
+                layer.hc_ffn_scale,
+                layer.hc_ffn_base,
+                ffn_norm_weight,
+                ffn_norm_eps,
+            ),
+        ):
+            mhc_fused_post_pre_tilelang(
+                x_slice,
+                residual_slice,
+                post_mix,
+                comb_mix,
+                fn,
+                scale,
+                base,
+                rms_eps,
+                hc_eps,
+                hc_eps,
+                hc_post_alpha,
+                sinkhorn_iters,
+                n_splits=1,
+                tile_n=1,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+        # Standalone post (aux hidden-state reconstruction).
+        mhc_post_tilelang(x_slice, residual_slice, post_mix, comb_mix)
+
+
 def _warmup_hc_head(
     model: torch.nn.Module,
     token_sizes: list[int],
@@ -136,6 +289,13 @@ def _warmup_hc_head(
     # implementation as the inference path.
     hc_head_op = getattr(model, "hc_head_op", None)
     if hc_head_op is None:
+        if not (
+            hasattr(model, "hc_head_fn")
+            and hasattr(model, "hc_head_scale")
+            and hasattr(model, "hc_head_base")
+        ):
+            return
+        _warmup_hc_head_nvidia(model, token_sizes)
         return
 
     max_tokens = max(token_sizes)
@@ -152,6 +312,36 @@ def _warmup_hc_head(
 
     for size in token_sizes:
         hc_head_op(
+            hidden_states[:size],
+            model.hc_head_fn,
+            model.hc_head_scale,
+            model.hc_head_base,
+            model.rms_norm_eps,
+            model.hc_eps,
+        )
+
+
+def _warmup_hc_head_nvidia(
+    model: torch.nn.Module,
+    token_sizes: list[int],
+) -> None:
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        hc_head_fused_kernel_tilelang,
+    )
+
+    max_tokens = max(token_sizes)
+    hidden_size = int(model.config.hidden_size)
+    hc_mult = int(model.hc_mult)
+    device = model.hc_head_fn.device
+    hidden_states = torch.zeros(
+        max_tokens,
+        hc_mult,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for size in token_sizes:
+        hc_head_fused_kernel_tilelang(
             hidden_states[:size],
             model.hc_head_fn,
             model.hc_head_scale,
