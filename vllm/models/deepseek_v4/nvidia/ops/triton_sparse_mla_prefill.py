@@ -186,19 +186,28 @@ def _capture_host_state_copy(
     host_state: torch.Tensor,
 ) -> None:
     """Capturable device->host copy of the diff state on the current stream."""
-    cudart = torch.cuda.cudart()
+    import ctypes
+
+    try:
+        cudart = ctypes.CDLL("libcudart.so")
+    except OSError:
+        cudart = ctypes.CDLL("libcudart.so.12")
+    cudart.cudaMemcpyAsync.restype = ctypes.c_int
+    stream = torch.cuda.current_stream().cuda_stream
     for src, slot in (
         (max_diff, 0),
         (nan_cnt.to(torch.float32), 1),
         (layer_off_t.to(torch.float32), 2),
     ):
-        cudart.cudaMemcpyAsync(
-            host_state.data_ptr() + slot * 4,
-            src.data_ptr(),
-            4,
-            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
-            torch.cuda.current_stream().cuda_stream,
+        ret = cudart.cudaMemcpyAsync(
+            ctypes.c_void_p(host_state.data_ptr() + slot * 4),
+            ctypes.c_void_p(src.data_ptr()),
+            ctypes.c_size_t(4),
+            ctypes.c_int(2),  # cudaMemcpyDeviceToHost
+            ctypes.c_void_p(stream),
         )
+        if ret != 0:
+            raise RuntimeError(f"cudaMemcpyAsync failed with code {ret}")
 
 
 def _start_debug_diff_reader() -> None:
