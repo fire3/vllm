@@ -317,25 +317,24 @@ def build_c128a_topk_metadata(
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
 
-    # view(-1) as 1-d array and then expanded to
-    # [num_decode_tokens, max_compressed_tokens]
-    global_decode = global_decode_buffer.view(-1)[
-        : num_decode_tokens * max_compressed_tokens
-    ].view(num_decode_tokens, max_compressed_tokens)
+    # Rows use the pre-allocated buffer's full stride (not the active width),
+    # so the returned views keep a constant row stride across runtime width
+    # changes. A CUDA graph bakes the capture-time stride; if the runtime
+    # metadata were tight-packed with the active width, a replay at a smaller
+    # width would read rows with the baked stride and see wrong indices.
+    global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
-    prefill_local = prefill_buffer.view(-1)[
-        : num_prefill_tokens * max_compressed_tokens
-    ].view(num_prefill_tokens, max_compressed_tokens)
+    prefill_local = prefill_buffer[:num_prefill_tokens, :max_compressed_tokens]
 
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
 
     _build_c128a_topk_metadata_kernel[(num_tokens,)](
         global_decode_buffer,
-        max_compressed_tokens,
+        global_decode_buffer.stride(0),
         decode_lens_buffer,
         prefill_buffer,
-        max_compressed_tokens,
+        prefill_buffer.stride(0),
         positions,
         compress_ratio,
         max_compressed_tokens,

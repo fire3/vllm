@@ -951,8 +951,6 @@ def _pack_sparse_rows(
     """
     T = lens.shape[0]
     dense = indices.reshape(T, -1)
-    if not dense.is_contiguous():
-        dense = dense.contiguous()
     width = dense.shape[1]
     lens32 = lens.reshape(T).to(torch.int32)
     indptr = torch.zeros(T + 1, dtype=torch.int32, device=lens.device)

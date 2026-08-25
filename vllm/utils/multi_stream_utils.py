@@ -107,17 +107,13 @@ def execute_in_parallel(
     """
     aux_results: list[Any]
     if enable:
-        from vllm.compilation.breakable_cudagraph import (
-            BreakableCUDAGraphCapture,
-        )
-
         # Cross-stream event synchronization must not be captured into a CUDA
         # graph: the per-module Event objects are reused across eager steps and
         # graph replays, and a captured event's completion state can be stale
         # on replay, making the main stream skip the join and read partially
-        # written indexer/compressor outputs. Run serially during capture;
-        # eager execution keeps the multi-stream overlap.
-        if BreakableCUDAGraphCapture.is_active():
+        # written indexer/compressor outputs. Run serially during any capture
+        # (breakable or monolithic FULL); eager execution keeps the overlap.
+        if torch.cuda.is_current_stream_capturing():
             enable = False
 
     if aux_streams is None or not enable:
