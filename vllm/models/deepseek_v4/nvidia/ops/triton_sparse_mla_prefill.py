@@ -39,9 +39,12 @@ from vllm.envs import (
     VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
 LOG2E = tl.constexpr(1.4426950408889634)
+
+logger = init_logger(__name__)
 
 # DSv4 KV cache layout constants (shared with the decode kernel).
 _NOPE_DIM = 448
@@ -70,6 +73,8 @@ _KSPLIT_MAX_T = 64
 # Set VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL=0 to force the fused kernel inside
 # FULL captures.
 _KSPLIT_FULL = os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL", "1") != "0"
+_DEBUG = os.environ.get("VLLM_TRITON_SPARSE_MLA_DEBUG", "0") == "1"
+_DEBUG_SEEN: set[tuple] = set()
 
 # Per-process capture-session counter: every CUDA graph capture gets a unique
 # token so scratch buffers are keyed per graph instance. Eager execution
@@ -101,6 +106,14 @@ def _is_full_graph_capture() -> bool:
     except Exception:
         return False
     return ctx.cudagraph_runtime_mode == CUDAGraphMode.FULL
+
+
+def _debug_launch(tag: str, key: tuple) -> None:
+    """One-time per-shape launch logging for K-split A/B diagnostics."""
+    if not _DEBUG or key in _DEBUG_SEEN:
+        return
+    _DEBUG_SEEN.add(key)
+    logger.info("triton sparse MLA [%s] %s", tag, key)
 
 
 @triton.jit
@@ -1178,6 +1191,16 @@ def triton_sparse_mla_prefill_vllm(
     use_ksplit = VLLM_TRITON_SPARSE_MLA_KSPLIT and T <= _KSPLIT_MAX_T
     if use_ksplit and _is_full_graph_capture() and not _KSPLIT_FULL:
         use_ksplit = False
+    _debug_launch(
+        "ksplit" if use_ksplit else "fused",
+        (
+            T,
+            H,
+            has_extra,
+            _is_full_graph_capture(),
+            _KSPLIT_FULL,
+        ),
+    )
     if use_ksplit:
         # K-split path: (T, S_MAX, H-blocks) CTAs each scan one 32-token chunk
         # of one source, then a small merge kernel combines the partials with
