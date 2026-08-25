@@ -141,8 +141,8 @@ def _max_abs_diff_kernel(
     d = tl.abs(a - b)
     m = tl.max(d, axis=0)
     tl.atomic_max(max_diff_ptr, m)
-    nan = tl.sum((a != a).to(tl.int32), axis=0) + tl.sum(
-        (b != b).to(tl.int32), axis=0
+    nan = tl.sum(((a != a) & (b == b)).to(tl.int32), axis=0) + tl.sum(
+        ((b != b) & (a == a)).to(tl.int32), axis=0
     )
     tl.atomic_add(nan_ptr, nan)
     tl.store(layer_off_ptr, layer_off)
@@ -180,7 +180,9 @@ def _start_debug_diff_reader() -> None:
         while True:
             time.sleep(1.0)
             for key, layers in list(_DEBUG_DIFF_STATES.items()):
-                for layer_off, bufs in layers.items():
+                for layer_off, bufs in list(layers.items()):
+                    if torch.cuda.is_current_stream_capturing():
+                        break
                     max_diff, nan_cnt, layer_off_t = bufs[2], bufs[3], bufs[4]
                     md = max_diff.item()
                     nn = nan_cnt.item()
