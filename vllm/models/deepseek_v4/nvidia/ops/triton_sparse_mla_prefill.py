@@ -75,6 +75,11 @@ _KSPLIT_MAX_T = 64
 _KSPLIT_FULL = os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL", "1") != "0"
 _DEBUG = os.environ.get("VLLM_TRITON_SPARSE_MLA_DEBUG", "0") == "1"
 _DEBUG_SEEN: set[tuple] = set()
+_DEBUG_DIFF = os.environ.get("VLLM_TRITON_SPARSE_MLA_DEBUG_DIFF", "0") == "1"
+_DEBUG_DIFF_STATES: dict[tuple, dict[int, torch.Tensor]] = {}
+_DEBUG_DIFF_FIRED: set[int] = set()
+_DEBUG_DIFF_READER_STARTED = [False]
+_DEBUG_DIFF_THRESHOLD = 0.15
 
 # Per-process capture-session counter: every CUDA graph capture gets a unique
 # token so scratch buffers are keyed per graph instance. Eager execution
@@ -114,6 +119,84 @@ def _debug_launch(tag: str, key: tuple) -> None:
         return
     _DEBUG_SEEN.add(key)
     logger.info("triton sparse MLA [%s] %s", tag, key)
+
+
+@triton.jit
+def _max_abs_diff_kernel(
+    a_ptr,
+    b_ptr,
+    max_diff_ptr,
+    nan_ptr,
+    layer_off_ptr,
+    layer_off: tl.int64,
+    N: tl.int32,
+    BLOCK: tl.constexpr,
+):
+    """Max |a - b| + NaN/Inf count over one [T, H, D] output pair."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    d = tl.abs(a - b)
+    m = tl.max(d, axis=0)
+    tl.atomic_max(max_diff_ptr, m)
+    nan = tl.sum((a != a).to(tl.int32), axis=0) + tl.sum(
+        (b != b).to(tl.int32), axis=0
+    )
+    tl.atomic_add(nan_ptr, nan)
+    tl.store(layer_off_ptr, layer_off)
+
+
+def _debug_diff_buffers(
+    key: tuple,
+    layer_off: int,
+    T: int,
+    H: int,
+    D: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-(call, layer) fused reference + diff state for K-split A/B."""
+    state = _DEBUG_DIFF_STATES.setdefault(key, {})
+    if layer_off not in state:
+        out_ref = torch.empty(T, H, D, dtype=torch.bfloat16, device=device)
+        lse_ref = torch.empty(T, H, dtype=torch.float32, device=device)
+        max_diff = torch.zeros(1, dtype=torch.float32, device=device)
+        nan_cnt = torch.zeros(1, dtype=torch.int32, device=device)
+        layer_off_t = torch.zeros(1, dtype=torch.int64, device=device)
+        state[layer_off] = (out_ref, lse_ref, max_diff, nan_cnt, layer_off_t)
+    return state[layer_off]
+
+
+def _start_debug_diff_reader() -> None:
+    if not _DEBUG_DIFF or _DEBUG_DIFF_READER_STARTED[0]:
+        return
+    _DEBUG_DIFF_READER_STARTED[0] = True
+
+    import threading
+    import time
+
+    def _run() -> None:
+        while True:
+            time.sleep(1.0)
+            for key, layers in list(_DEBUG_DIFF_STATES.items()):
+                for layer_off, bufs in layers.items():
+                    max_diff, nan_cnt, layer_off_t = bufs[2], bufs[3], bufs[4]
+                    md = max_diff.item()
+                    nn = nan_cnt.item()
+                    if md > _DEBUG_DIFF_THRESHOLD or nn > 0:
+                        if layer_off not in _DEBUG_DIFF_FIRED:
+                            _DEBUG_DIFF_FIRED.add(layer_off)
+                            logger.warning(
+                                "MLA K-split vs fused DIVERGENCE: layer_off=%s "
+                                "max_abs_diff=%.4f nan=%d key=%s",
+                                layer_off_t.item(),
+                                md,
+                                nn,
+                                key,
+                            )
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 @triton.jit
@@ -1201,6 +1284,40 @@ def triton_sparse_mla_prefill_vllm(
             _KSPLIT_FULL,
         ),
     )
+    launch_args = dict(
+        Q_ptr=q,
+        O_ptr=out,
+        LSE_ptr=lse,
+        swa_cache_fp8_ptr=swa_fp8,
+        swa_cache_uint8_ptr=swa_uint8,
+        swa_cache_bf16_ptr=swa_bf16,
+        swa_idx_ptr=swa_flat,
+        swa_indptr_ptr=swa_indptr,
+        extra_cache_fp8_ptr=extra_fp8,
+        extra_cache_uint8_ptr=extra_uint8,
+        extra_cache_bf16_ptr=extra_bf16,
+        extra_idx_ptr=extra_flat,
+        extra_indptr_ptr=extra_indptr,
+        sm_scale=softmax_scale,
+        swa_page_size=swa_page_size,
+        swa_page_bytes=int(swa_page_bytes),
+        swa_layer_off=int(swa_layer_off),
+        swa_scale_off=int(swa_scale_off),
+        extra_page_size=extra_page_size,
+        extra_page_bytes=int(extra_page_bytes),
+        extra_layer_off=int(extra_layer_off),
+        extra_scale_off=int(extra_scale_off),
+        H=H,
+        stride_qb=q.stride(0),
+        stride_qh=q.stride(1),
+        stride_ob=out.stride(0),
+        stride_oh=out.stride(1),
+        HAS_EXTRA=has_extra,
+        GROUP_DIM=_GROUP_DIM,
+        NOPE_DIM=_NOPE_DIM,
+        TOKEN_DATA_STRIDE=_TOKEN_DATA_STRIDE,
+        SCALE_STRIDE=_SCALE_STRIDE,
+    )
     if use_ksplit:
         # K-split path: (T, S_MAX, H-blocks) CTAs each scan one 32-token chunk
         # of one source, then a small merge kernel combines the partials with
@@ -1294,46 +1411,55 @@ def triton_sparse_mla_prefill_vllm(
             HAS_EXTRA=has_extra,
             num_warps=8,
         )
+        if _DEBUG_DIFF:
+            _start_debug_diff_reader()
+            stream = torch.cuda.current_stream(q.device)
+            diff_key = (
+                q.device.index if q.device.index is not None else 0,
+                T,
+                H,
+                stream.cuda_stream,
+                _capture_token(),
+            )
+            out_ref, lse_ref, max_diff, nan_cnt, layer_off_t = (
+                _debug_diff_buffers(
+                    diff_key,
+                    int(swa_layer_off),
+                    T,
+                    H,
+                    D,
+                    q.device,
+                )
+            )
+            fused_grid = (T, triton.cdiv(H, _DEFAULT_BLOCK_H))
+            ref_args = dict(launch_args)
+            ref_args["O_ptr"] = out_ref
+            ref_args["LSE_ptr"] = lse_ref
+            _tiled_sparse_prefill_kernel[fused_grid](
+                **ref_args,
+                BLOCK_H=_DEFAULT_BLOCK_H,
+                BLOCK_K=_DEFAULT_BLOCK_K,
+                num_warps=_DEFAULT_NUM_WARPS,
+                num_stages=2,
+            )
+            _max_abs_diff_kernel[
+                (triton.cdiv(T * H * D, 1024),)
+            ](
+                out,
+                out_ref,
+                max_diff,
+                nan_cnt,
+                layer_off_t,
+                layer_off=int(swa_layer_off),
+                N=T * H * D,
+                BLOCK=1024,
+            )
     else:
         grid = (T, triton.cdiv(H, _DEFAULT_BLOCK_H))
         kernel = (
             _TILED_SPARSE_PREFILL_AUTOTUNED
             if VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE
             else _tiled_sparse_prefill_kernel
-        )
-        launch_args = dict(
-            Q_ptr=q,
-            O_ptr=out,
-            LSE_ptr=lse,
-            swa_cache_fp8_ptr=swa_fp8,
-            swa_cache_uint8_ptr=swa_uint8,
-            swa_cache_bf16_ptr=swa_bf16,
-            swa_idx_ptr=swa_flat,
-            swa_indptr_ptr=swa_indptr,
-            extra_cache_fp8_ptr=extra_fp8,
-            extra_cache_uint8_ptr=extra_uint8,
-            extra_cache_bf16_ptr=extra_bf16,
-            extra_idx_ptr=extra_flat,
-            extra_indptr_ptr=extra_indptr,
-            sm_scale=softmax_scale,
-            swa_page_size=swa_page_size,
-            swa_page_bytes=int(swa_page_bytes),
-            swa_layer_off=int(swa_layer_off),
-            swa_scale_off=int(swa_scale_off),
-            extra_page_size=extra_page_size,
-            extra_page_bytes=int(extra_page_bytes),
-            extra_layer_off=int(extra_layer_off),
-            extra_scale_off=int(extra_scale_off),
-            H=H,
-            stride_qb=q.stride(0),
-            stride_qh=q.stride(1),
-            stride_ob=out.stride(0),
-            stride_oh=out.stride(1),
-            HAS_EXTRA=has_extra,
-            GROUP_DIM=_GROUP_DIM,
-            NOPE_DIM=_NOPE_DIM,
-            TOKEN_DATA_STRIDE=_TOKEN_DATA_STRIDE,
-            SCALE_STRIDE=_SCALE_STRIDE,
         )
         if VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE:
             kernel[grid](**launch_args)
