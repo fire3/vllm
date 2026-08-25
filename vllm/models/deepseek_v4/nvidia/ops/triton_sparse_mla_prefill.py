@@ -31,10 +31,12 @@ from typing import Optional
 
 import torch
 
+from vllm.config import CUDAGraphMode
 from vllm.envs import (
     VLLM_TRITON_SPARSE_MLA_KSPLIT,
     VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE,
 )
+from vllm.forward_context import get_forward_context
 from vllm.triton_utils import tl, triton
 
 LOG2E = tl.constexpr(1.4426950408889634)
@@ -58,6 +60,27 @@ _KSPLIT_CHUNK = 32
 # bf16 partial out alone would be 1.1 GiB per (T, S) combo, accumulating
 # across chunked-prefill sizes and OOMing at high GPU-memory utilization.
 _KSPLIT_MAX_T = 64
+
+
+def _is_full_graph_capture() -> bool:
+    """True when the current call is being captured into a FULL CUDA graph.
+
+    The K-split path bakes the per-chunk grid ``S`` (derived from the runtime
+    c128 topk width) and cached scratch buffers into the captured graph.  The
+    c128 width is dynamic (``next_power_of_2(max_seq_len / 128)``), so a FULL
+    graph captured at one width can replay against a wider runtime batch and
+    silently drop compressed-attention chunks.  The fused single-CTA kernel is
+    width-agnostic (it follows the CSR indptr), so FULL captures fall back to
+    it; K-split remains enabled for eager and PIECEWISE execution where the
+    launcher runs every step and recomputes ``S`` from the live widths.
+    """
+    if not torch.cuda.is_current_stream_capturing():
+        return False
+    try:
+        ctx = get_forward_context()
+    except Exception:
+        return False
+    return ctx.cudagraph_runtime_mode == CUDAGraphMode.FULL
 
 
 @triton.jit
@@ -977,7 +1000,11 @@ def triton_sparse_mla_prefill_vllm(
     extra_scale_off = extra_page_size * _TOKEN_DATA_STRIDE
     lse = torch.empty(T, H, dtype=torch.float32, device=q.device)
 
-    if VLLM_TRITON_SPARSE_MLA_KSPLIT and T <= _KSPLIT_MAX_T:
+    if (
+        VLLM_TRITON_SPARSE_MLA_KSPLIT
+        and T <= _KSPLIT_MAX_T
+        and not _is_full_graph_capture()
+    ):
         # K-split path: (T, S, H-blocks) CTAs each scan one 32-token chunk of
         # one source, then a small merge kernel combines the partials with
         # flash-decoding LSE weighting. Default on for decode-sized batches;
