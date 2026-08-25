@@ -289,6 +289,12 @@ class DeepseekV4FlashMLAMetadataBuilder(
                 num_decode_tokens, 1, -1
             )
             result["c128a_decode_topk_lens"] = decode_lens
+            # Mirror the SWA builder (which zeroes decode_swa_lens beyond the
+            # real token count): stale non-zero lens on FULL-graph padding rows
+            # would make the packed CSR and K-split/fused attention process
+            # stale index rows for padding. The padding output is masked, but
+            # the extra work keeps the buffers dirty across steps.
+            self.c128a_decode_lens_buffer[num_decode_tokens:] = 0
         if num_prefill_tokens > 0:
             result["c128a_prefill_topk_indices"] = prefill_local
         return result
