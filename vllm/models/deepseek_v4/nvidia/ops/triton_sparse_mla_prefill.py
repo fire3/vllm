@@ -164,8 +164,41 @@ def _debug_diff_buffers(
         max_diff = torch.zeros(1, dtype=torch.float32, device=device)
         nan_cnt = torch.zeros(1, dtype=torch.int32, device=device)
         layer_off_t = torch.zeros(1, dtype=torch.int64, device=device)
-        state[layer_off] = (out_ref, lse_ref, max_diff, nan_cnt, layer_off_t)
+        # Pinned host mirrors updated by a capturable D2H copy inside the
+        # graph; the reader samples them without any CUDA interaction, so it
+        # can never invalidate an in-progress capture.
+        host_state = torch.zeros(3, dtype=torch.float32, pin_memory=True)
+        state[layer_off] = (
+            out_ref,
+            lse_ref,
+            max_diff,
+            nan_cnt,
+            layer_off_t,
+            host_state,
+        )
     return state[layer_off]
+
+
+def _capture_host_state_copy(
+    max_diff: torch.Tensor,
+    nan_cnt: torch.Tensor,
+    layer_off_t: torch.Tensor,
+    host_state: torch.Tensor,
+) -> None:
+    """Capturable device->host copy of the diff state on the current stream."""
+    cudart = torch.cuda.cudart()
+    for src, slot in (
+        (max_diff, 0),
+        (nan_cnt.to(torch.float32), 1),
+        (layer_off_t.to(torch.float32), 2),
+    ):
+        cudart.cudaMemcpyAsync(
+            host_state.data_ptr() + slot * 4,
+            src.data_ptr(),
+            4,
+            cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+            torch.cuda.current_stream().cuda_stream,
+        )
 
 
 def _start_debug_diff_reader() -> None:
@@ -181,18 +214,17 @@ def _start_debug_diff_reader() -> None:
             time.sleep(1.0)
             for key, layers in list(_DEBUG_DIFF_STATES.items()):
                 for layer_off, bufs in list(layers.items()):
-                    if torch.cuda.is_current_stream_capturing():
-                        break
-                    max_diff, nan_cnt, layer_off_t = bufs[2], bufs[3], bufs[4]
-                    md = max_diff.item()
-                    nn = nan_cnt.item()
+                    host_state = bufs[5]
+                    md = float(host_state[0].item())
+                    nn = int(round(host_state[1].item()))
+                    lo = int(round(host_state[2].item()))
                     if md > _DEBUG_DIFF_THRESHOLD or nn > 0:
                         if layer_off not in _DEBUG_DIFF_FIRED:
                             _DEBUG_DIFF_FIRED.add(layer_off)
                             logger.warning(
                                 "MLA K-split vs fused DIVERGENCE: layer_off=%s "
                                 "max_abs_diff=%.4f nan=%d key=%s",
-                                layer_off_t.item(),
+                                lo,
                                 md,
                                 nn,
                                 key,
@@ -1423,7 +1455,14 @@ def triton_sparse_mla_prefill_vllm(
                 stream.cuda_stream,
                 _capture_token(),
             )
-            out_ref, lse_ref, max_diff, nan_cnt, layer_off_t = (
+            (
+                out_ref,
+                lse_ref,
+                max_diff,
+                nan_cnt,
+                layer_off_t,
+                host_state,
+            ) = (
                 _debug_diff_buffers(
                     diff_key,
                     int(swa_layer_off),
@@ -1456,6 +1495,7 @@ def triton_sparse_mla_prefill_vllm(
                 N=T * H * D,
                 BLOCK=1024,
             )
+            _capture_host_state_copy(max_diff, nan_cnt, layer_off_t, host_state)
     else:
         grid = (T, triton.cdiv(H, _DEFAULT_BLOCK_H))
         kernel = (
