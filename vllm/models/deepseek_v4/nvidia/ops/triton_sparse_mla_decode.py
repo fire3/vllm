@@ -316,8 +316,14 @@ def _kv_watchdog_kernel(
         # Region assignment for change localization (logical slot -> region).
         rid = (off * N_REGIONS) // n
         rid_mask = rid[:, None] == tl.arange(0, N_REGIONS)[None, :]
+        b0_2d = tl.broadcast_to(b0[:, None], (BLOCK, N_REGIONS))
         region_acc += tl.sum(
-            tl.where(rid_mask, b0[:, None], 0), axis=0
+            tl.where(
+                rid_mask,
+                b0_2d,
+                tl.zeros([BLOCK, N_REGIONS], dtype=tl.int64),
+            ),
+            axis=0,
         )
         bad += tl.sum((1 - valid.to(tl.int32)) * mask.to(tl.int32), axis=0)
 
