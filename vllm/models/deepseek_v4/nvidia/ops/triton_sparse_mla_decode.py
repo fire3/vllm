@@ -73,6 +73,7 @@ _WATCHDOG_READER_STARTED = [False]
 _WATCHDOG_PREV: dict[int, dict] = {}
 _WATCHDOG_LAST_VIOL: dict[int, int] = {}
 _WATCHDOG_CORRUPT_LOG = 0
+_WATCHDOG_REC_W = 16  # (fp0, fp1, L, layer_off, row, computed, viol, rsv, 8 sample slots)
 
 
 @triton.jit
@@ -271,6 +272,7 @@ def _kv_watchdog_kernel(
     num_slots,  # total physical slots (num_pages * page_size)
     topk,  # row width
     BLOCK: tl.constexpr,
+    N_SAMPLES: tl.constexpr,
 ):
     """Per-row c128a KV fingerprint + index-bounds validation."""
     pid = tl.program_id(0)
@@ -279,11 +281,11 @@ def _kv_watchdog_kernel(
     L = tl.minimum(L, topk)
     n = L - 1  # exclude the newest compressed slot (legitimately written now)
 
-    tl.store(rec_ptr + pid * 7 + 2, L.to(tl.float32))
-    tl.store(rec_ptr + pid * 7 + 3, layer_offset.to(tl.float32))
-    tl.store(rec_ptr + pid * 7 + 4, pid.to(tl.float32))
+    tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 2, L.to(tl.float32))
+    tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 3, layer_offset.to(tl.float32))
+    tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 4, pid.to(tl.float32))
     if n <= 0:
-        tl.store(rec_ptr + pid * 7 + 5, 0.0)
+        tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 5, 0.0)
         return
 
     acc0 = tl.zeros((), dtype=tl.int64)
@@ -306,16 +308,70 @@ def _kv_watchdog_kernel(
         acc1 += tl.sum(b1, axis=0)
         bad += tl.sum((1 - valid.to(tl.int32)) * mask.to(tl.int32), axis=0)
 
-    tl.store(rec_ptr + pid * 7 + 0, acc0.to(tl.float32))
-    tl.store(rec_ptr + pid * 7 + 1, acc1.to(tl.float32))
-    tl.store(rec_ptr + pid * 7 + 5, 1.0)
+    # Sample a few individual slots (early system-prompt region, mid-history,
+    # and the tail of the stable range) so a fingerprint change can be
+    # pinpointed to a region. Each sample packs (data_byte, scale_byte).
+    sample_slots = tl.zeros([N_SAMPLES], dtype=tl.int32)
+    if N_SAMPLES >= 4:
+        sample_slots = tl.where(
+            tl.arange(0, N_SAMPLES) < 4,
+            tl.arange(0, N_SAMPLES),
+            sample_slots,
+        )
+    if N_SAMPLES >= 6:
+        sample_slots = tl.where(
+            tl.arange(0, N_SAMPLES) == 4,
+            (n // 2).to(tl.int32),
+            sample_slots,
+        )
+        sample_slots = tl.where(
+            tl.arange(0, N_SAMPLES) == 5,
+            (n // 2 + 1).to(tl.int32),
+            sample_slots,
+        )
+    if N_SAMPLES >= 8:
+        sample_slots = tl.where(
+            tl.arange(0, N_SAMPLES) == 6,
+            n - 1,
+            sample_slots,
+        )
+        sample_slots = tl.where(
+            tl.arange(0, N_SAMPLES) == 7,
+            n - 2,
+            sample_slots,
+        )
+    sample_slots = tl.maximum(sample_slots, 0)
+    s_idx = tl.load(
+        indices_ptr + pid * topk + sample_slots,
+        mask=sample_slots < n,
+        other=-1,
+    )
+    s_valid = (s_idx >= 0) & (s_idx < num_slots)
+    s_safe = tl.where(s_valid, s_idx, 0)
+    s_pages = (s_safe // page_size).to(tl.int64)
+    s_toffs = (s_safe % page_size).to(tl.int64)
+    s_base = s_pages * page_bytes + layer_offset + s_toffs * 576
+    sb0 = tl.load(cache_ptr + s_base, mask=s_valid, other=0).to(tl.int32)
+    sb1 = tl.load(
+        cache_ptr + s_base + scale_section_off, mask=s_valid, other=0
+    ).to(tl.int32)
+    packed = sb0 * 256 + sb1
+    tl.store(
+        rec_ptr + pid * _WATCHDOG_REC_W + 8 + tl.arange(0, N_SAMPLES),
+        packed.to(tl.float32),
+        mask=tl.arange(0, N_SAMPLES) < N_SAMPLES,
+    )
+
+    tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 0, acc0.to(tl.float32))
+    tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 1, acc1.to(tl.float32))
+    tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 5, 1.0)
     if bad > 0:
-        tl.store(rec_ptr + pid * 7 + 6, 2.0)
+        tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 6, 2.0)
         tl.atomic_add(viol_ptr + 0, 1.0)
         tl.store(viol_ptr + 1, pid.to(tl.float32))
         tl.store(viol_ptr + 2, 2.0)
     else:
-        tl.store(rec_ptr + pid * 7 + 6, 0.0)
+        tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 6, 0.0)
 
 
 def _watchdog_buffers(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -327,11 +383,11 @@ def _watchdog_buffers(device: torch.device) -> tuple[torch.Tensor, torch.Tensor,
     if key in _WATCHDOG_DEV:
         return _WATCHDOG_DEV[key]
     rec_dev = torch.zeros(
-        (_WATCHDOG_MAX_ROWS, 7), dtype=torch.float32, device=device
+        (_WATCHDOG_MAX_ROWS, _WATCHDOG_REC_W), dtype=torch.float32, device=device
     )
     viol_dev = torch.zeros(3, dtype=torch.float32, device=device)
     rec_host = torch.zeros(
-        (_WATCHDOG_MAX_ROWS, 7), dtype=torch.float32, pin_memory=True
+        (_WATCHDOG_MAX_ROWS, _WATCHDOG_REC_W), dtype=torch.float32, pin_memory=True
     )
     viol_host = torch.zeros(3, dtype=torch.float32, pin_memory=True)
     bufs = (rec_dev, viol_dev, rec_host, viol_host)
@@ -419,14 +475,22 @@ def _start_watchdog_reader() -> None:
                     if prev_fp is not None and (
                         prev_fp[0] != fp0 or prev_fp[1] != fp1
                     ):
-                        if _WATCHDOG_CORRUPT_LOG < 50:
+                        if _WATCHDOG_CORRUPT_LOG < 5000:
                             _WATCHDOG_CORRUPT_LOG += 1
                             from vllm.logger import init_logger
                             wlog = init_logger(__name__)
+                            samples = []
+                            for k in range(8):
+                                ov = rec[r, 8 + k].item()
+                                nv = prev_fp[2 + k] if len(prev_fp) > 2 + k else None
+                                if nv is not None and ov != nv:
+                                    samples.append(
+                                        f"s{k}={int(nv)}->{int(ov)}"
+                                    )
                             wlog.warning(
                                 "MLA watchdog KV-CONTENT CHANGE at same L: "
                                 "row=%d L=%d layer_off=%d "
-                                "fp=(%.0f,%.0f)->(%.0f,%.0f) "
+                                "fp=(%.0f,%.0f)->(%.0f,%.0f) %s "
                                 "viol_code=%d (count=%d)",
                                 r,
                                 L,
@@ -435,10 +499,22 @@ def _start_watchdog_reader() -> None:
                                 prev_fp[1],
                                 fp0,
                                 fp1,
+                                " ".join(samples),
                                 vcode,
                                 _WATCHDOG_CORRUPT_LOG,
                             )
-                    prev[ident] = (fp0, fp1)
+                    prev[ident] = (
+                        fp0,
+                        fp1,
+                        rec[r, 8].item(),
+                        rec[r, 9].item(),
+                        rec[r, 10].item(),
+                        rec[r, 11].item(),
+                        rec[r, 12].item(),
+                        rec[r, 13].item(),
+                        rec[r, 14].item(),
+                        rec[r, 15].item(),
+                    )
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -713,6 +789,7 @@ def triton_sparse_mla_decode_vllm(
                 num_slots,
                 flat_indices.shape[1],
                 BLOCK=64,
+                N_SAMPLES=8,
             )
             _watchdog_capture_host_copy(
                 rec_dev, viol_dev, rec_host, viol_host
