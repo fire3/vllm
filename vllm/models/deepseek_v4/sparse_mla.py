@@ -269,6 +269,28 @@ class DeepseekV4FlashMLAMetadataBuilder(
             self.c128a_max_compressed,
         )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
+        # Diagnostic (rate-limited): dump the c128a decode block-table rows so
+        # the decode watchdog's KV/remap events can be matched to physical
+        # block ownership.
+        if num_decode_tokens > 0:
+            try:
+                import time as _time
+
+                now = _time.time()
+                if now - getattr(self, "_last_bt_log_ts", 0.0) > 2.0:
+                    self._last_bt_log_ts = now
+                    from vllm.logger import init_logger
+
+                    logger = init_logger(__name__)
+                    bt = cm.block_table_tensor[:num_decode_tokens]
+                    logger.info(
+                        "C128A-BT dec=%d L=%d rows=%s",
+                        num_decode_tokens,
+                        cm.max_seq_len,
+                        str(bt.tolist()[:8]),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
             self.compress_ratio,
