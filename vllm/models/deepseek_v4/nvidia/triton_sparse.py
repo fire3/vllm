@@ -171,6 +171,7 @@ class DeepseekV4TritonMLAAttention(DeepseekV4FlashInferSM120Attention):
             attn_sink=self.attn_sink,
             softmax_scale=self.scale,
             out=output,
+            watchdog_c128a=self.compress_ratio == 128,
         )
 
     def _launch_sparse_mla_prefill(

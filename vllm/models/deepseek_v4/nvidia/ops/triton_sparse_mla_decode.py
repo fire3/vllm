@@ -23,6 +23,10 @@ continues to use the FlashInfer launcher.
 
 from typing import Optional, Tuple
 
+import os
+import threading
+import time
+
 import torch
 
 from vllm.envs import (
@@ -34,6 +38,8 @@ from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
 )
 from vllm.triton_utils import tl, triton
 
+logger = None  # bound lazily to avoid import cycles
+
 LOG2E = tl.constexpr(1.4426950408889634)
 
 # DSv4 KV cache layout constants.
@@ -41,6 +47,32 @@ _NOPE_DIM = 448
 _ROPE_DIM = 64
 _TOKEN_DATA_STRIDE = 576  # bytes per token in data section
 _SCALE_STRIDE = 8  # bytes per token in scale section
+
+# ---------------------------------------------------------------------------
+# Decode-time KV/input watchdog (VLLM_TRITON_SPARSE_MLA_WATCHDOG=1).
+#
+# Every decode step, for each batch row, a tiny Triton kernel checksums the
+# compressed (c128a) KV tokens that the row attends to (excluding the newest
+# compressed slot, which legitimately changes as the sequence grows) and
+# validates the sparse index rows for bounds. Results land in a persistent
+# device buffer that a background poller reads through a pinned host mirror
+# updated by a capturable D2H copy -- the poller never touches CUDA, so it
+# cannot perturb an in-progress capture or replay.
+#
+# The poller flags:
+#   * KV fingerprint change while the row's compressed length (L) is
+#     unchanged -- i.e. previously written KV content mutated under the row
+#     (block reuse / COW / concurrent-write corruption), and
+#   * out-of-range sparse indices (metadata corruption).
+# ---------------------------------------------------------------------------
+_WATCHDOG = os.environ.get("VLLM_TRITON_SPARSE_MLA_WATCHDOG", "0") == "1"
+_WATCHDOG_MAX_ROWS = 64  # >= max_num_seqs
+_WATCHDOG_DEV: dict[int, dict] = {}
+_WATCHDOG_HOST: dict[int, dict] = {}
+_WATCHDOG_READER_STARTED = [False]
+_WATCHDOG_PREV: dict[int, dict] = {}
+_WATCHDOG_LAST_VIOL: dict[int, int] = {}
+_WATCHDOG_CORRUPT_LOG = 0
 
 
 @triton.jit
@@ -223,6 +255,185 @@ _TILED_SPARSE_DECODE_AUTOTUNED = triton.autotune(
     configs=_TILED_SPARSE_DECODE_CONFIGS,
     key=["topk_rounded"],
 )(_tiled_sparse_decode_kernel)
+
+
+@triton.jit
+def _kv_watchdog_kernel(
+    cache_ptr,  # flat uint8 view of the layer's cache backing storage
+    indices_ptr,  # [B, topk] int32 physical slot ids (global)
+    lens_ptr,  # [B] int32 valid lengths
+    rec_ptr,  # [B, 7] f32: (fp0, fp1, L, layer_off, row, computed, viol_code)
+    viol_ptr,  # [3] f32: (count, row, code)
+    layer_offset,  # int64 byte offset of this layer's region in cache_ptr
+    page_size,  # tokens per page
+    page_bytes,  # bytes per page (uint8 elements == bytes)
+    scale_section_off,  # page_size * 576
+    num_slots,  # total physical slots (num_pages * page_size)
+    topk,  # row width
+    BLOCK: tl.constexpr,
+):
+    """Per-row c128a KV fingerprint + index-bounds validation."""
+    pid = tl.program_id(0)
+
+    L = tl.load(lens_ptr + pid).to(tl.int32)
+    L = tl.minimum(L, topk)
+    n = L - 1  # exclude the newest compressed slot (legitimately written now)
+
+    tl.store(rec_ptr + pid * 7 + 2, L.to(tl.float32))
+    tl.store(rec_ptr + pid * 7 + 3, layer_offset.to(tl.float32))
+    tl.store(rec_ptr + pid * 7 + 4, pid.to(tl.float32))
+    if n <= 0:
+        tl.store(rec_ptr + pid * 7 + 5, 0.0)
+        return
+
+    acc0 = tl.zeros((), dtype=tl.int64)
+    acc1 = tl.zeros((), dtype=tl.int64)
+    bad = tl.zeros((), dtype=tl.int32)
+    for i in range(0, n, BLOCK):
+        off = i + tl.arange(0, BLOCK)
+        mask = off < n
+        idx = tl.load(indices_ptr + pid * topk + off, mask=mask, other=-1)
+        valid = mask & (idx >= 0) & (idx < num_slots)
+        safe = tl.where(valid, idx, 0)
+        page_ids = (safe // page_size).to(tl.int64)
+        toffs = (safe % page_size).to(tl.int64)
+        base = page_ids * page_bytes + layer_offset + toffs * 576
+        b0 = tl.load(cache_ptr + base, mask=valid, other=0).to(tl.int64)
+        b1 = tl.load(
+            cache_ptr + base + scale_section_off, mask=valid, other=0
+        ).to(tl.int64)
+        acc0 += tl.sum(b0, axis=0)
+        acc1 += tl.sum(b1, axis=0)
+        bad += tl.sum((1 - valid.to(tl.int32)) * mask.to(tl.int32), axis=0)
+
+    tl.store(rec_ptr + pid * 7 + 0, acc0.to(tl.float32))
+    tl.store(rec_ptr + pid * 7 + 1, acc1.to(tl.float32))
+    tl.store(rec_ptr + pid * 7 + 5, 1.0)
+    if bad > 0:
+        tl.store(rec_ptr + pid * 7 + 6, 2.0)
+        tl.atomic_add(viol_ptr + 0, 1.0)
+        tl.store(viol_ptr + 1, pid.to(tl.float32))
+        tl.store(viol_ptr + 2, 2.0)
+    else:
+        tl.store(rec_ptr + pid * 7 + 6, 0.0)
+
+
+def _watchdog_buffers(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-device persistent watchdog buffers + pinned host mirrors."""
+    if device.index is None:
+        key = 0
+    else:
+        key = device.index
+    if key in _WATCHDOG_DEV:
+        return _WATCHDOG_DEV[key]
+    rec_dev = torch.zeros(
+        (_WATCHDOG_MAX_ROWS, 7), dtype=torch.float32, device=device
+    )
+    viol_dev = torch.zeros(3, dtype=torch.float32, device=device)
+    rec_host = torch.zeros(
+        (_WATCHDOG_MAX_ROWS, 7), dtype=torch.float32, pin_memory=True
+    )
+    viol_host = torch.zeros(3, dtype=torch.float32, pin_memory=True)
+    bufs = (rec_dev, viol_dev, rec_host, viol_host)
+    _WATCHDOG_DEV[key] = bufs
+    _WATCHDOG_HOST[key] = {"rec": rec_host, "viol": viol_host}
+    return bufs
+
+
+def _watchdog_capture_host_copy(
+    rec_dev: torch.Tensor, viol_dev: torch.Tensor,
+    rec_host: torch.Tensor, viol_host: torch.Tensor,
+) -> None:
+    """Capturable device->host copy of the watchdog state (stream-ordered)."""
+    import ctypes
+
+    try:
+        cudart = ctypes.CDLL("libcudart.so")
+    except OSError:
+        cudart = ctypes.CDLL("libcudart.so.12")
+    cudart.cudaMemcpyAsync.restype = ctypes.c_int
+    stream = torch.cuda.current_stream().cuda_stream
+    nbytes = rec_dev.numel() * rec_dev.element_size()
+    ret = cudart.cudaMemcpyAsync(
+        ctypes.c_void_p(rec_host.data_ptr()),
+        ctypes.c_void_p(rec_dev.data_ptr()),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(2),  # cudaMemcpyDeviceToHost
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        raise RuntimeError(f"watchdog rec copy failed: {ret}")
+    nbytes = viol_dev.numel() * viol_dev.element_size()
+    ret = cudart.cudaMemcpyAsync(
+        ctypes.c_void_p(viol_host.data_ptr()),
+        ctypes.c_void_p(viol_dev.data_ptr()),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(2),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        raise RuntimeError(f"watchdog viol copy failed: {ret}")
+
+
+def _start_watchdog_reader() -> None:
+    if not _WATCHDOG or _WATCHDOG_READER_STARTED[0]:
+        return
+    _WATCHDOG_READER_STARTED[0] = True
+
+    def _run() -> None:
+        global _WATCHDOG_CORRUPT_LOG
+        time.sleep(1.0)
+        while True:
+            time.sleep(0.5)
+            for key, host in list(_WATCHDOG_HOST.items()):
+                rec = host["rec"]
+                viol = host["viol"]
+                vcnt = int(round(viol[0].item()))
+                if vcnt != _WATCHDOG_LAST_VIOL.get(key, 0):
+                    _WATCHDOG_LAST_VIOL[key] = vcnt
+                    from vllm.logger import init_logger
+                    wlog = init_logger(__name__)
+                    wlog.warning(
+                        "MLA watchdog SPARSE-INDEX VIOLATION count=%d row=%d code=%d",
+                        vcnt,
+                        int(round(viol[1].item())),
+                        int(round(viol[2].item())),
+                    )
+                prev = _WATCHDOG_PREV.setdefault(key, {})
+                for r in range(_WATCHDOG_MAX_ROWS):
+                    computed = rec[r, 5].item()
+                    if computed <= 0:
+                        continue
+                    L = int(round(rec[r, 2].item()))
+                    layer_off = int(round(rec[r, 3].item()))
+                    fp0 = rec[r, 0].item()
+                    fp1 = rec[r, 1].item()
+                    vcode = int(round(rec[r, 6].item()))
+                    ident = (L, layer_off)
+                    prev_fp = prev.get(ident)
+                    if prev_fp is not None and (
+                        prev_fp[0] != fp0 or prev_fp[1] != fp1
+                    ):
+                        if _WATCHDOG_CORRUPT_LOG < 50:
+                            _WATCHDOG_CORRUPT_LOG += 1
+                            from vllm.logger import init_logger
+                            wlog = init_logger(__name__)
+                            wlog.warning(
+                                "MLA watchdog KV-CONTENT CHANGE at same L: "
+                                "L=%d layer_off=%d fp=(%.0f,%.0f)->(%.0f,%.0f) "
+                                "viol_code=%d (count=%d)",
+                                L,
+                                layer_off,
+                                prev_fp[0],
+                                prev_fp[1],
+                                fp0,
+                                fp1,
+                                vcode,
+                                _WATCHDOG_CORRUPT_LOG,
+                            )
+                    prev[ident] = (fp0, fp1)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _launch_tiled_sparse_decode_kernel(
@@ -457,6 +668,7 @@ def triton_sparse_mla_decode_vllm(
     attn_sink: Optional[torch.Tensor],  # [H] f32
     softmax_scale: float,
     out: torch.Tensor,  # [B, H, D] bf16, written in place
+    watchdog_c128a: bool = False,
 ) -> None:
     """vLLM entry point for the DSv4 triton sparse-MLA decode path.
 
@@ -465,6 +677,40 @@ def triton_sparse_mla_decode_vllm(
     two-pass elementwise kernel + Python LSE merge). The phase-1 path stays
     available via ``VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY=1`` for A/B.
     """
+    if _WATCHDOG and watchdog_c128a and extra_kv_cache is not None:
+        _start_watchdog_reader()
+        B = q.shape[0]
+        if B > 0 and extra_indices is not None and extra_lens is not None:
+            rec_dev, viol_dev, rec_host, viol_host = _watchdog_buffers(q.device)
+            if B < _WATCHDOG_MAX_ROWS:
+                # Zero stale rows so the poller never compares dead rows.
+                rec_dev[B:] = 0
+            flat_indices = extra_indices.reshape(B, -1).contiguous()
+            page_size = extra_kv_cache.shape[1]
+            num_slots = extra_kv_cache.shape[0] * page_size
+            storage_nbytes = extra_kv_cache.untyped_storage().nbytes()
+            raw_flat = extra_kv_cache.as_strided(
+                (storage_nbytes,), (1,), storage_offset=0
+            )
+            raw_uint8 = raw_flat.view(torch.uint8)
+            _kv_watchdog_kernel[(B,)](
+                raw_uint8,
+                flat_indices,
+                extra_lens,
+                rec_dev,
+                viol_dev,
+                extra_kv_cache.storage_offset(),
+                page_size,
+                extra_kv_cache.stride(0),
+                page_size * _TOKEN_DATA_STRIDE,
+                num_slots,
+                flat_indices.shape[1],
+                BLOCK=64,
+            )
+            _watchdog_capture_host_copy(
+                rec_dev, viol_dev, rec_host, viol_host
+            )
+
     if VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY:
         out4, _ = flash_mla_sparse_decode_triton(
             q=q,
