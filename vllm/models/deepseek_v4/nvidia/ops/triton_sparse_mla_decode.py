@@ -490,8 +490,15 @@ def _start_watchdog_reader() -> None:
             for key, host in list(_WATCHDOG_HOST.items()):
                 rec = host["rec"]
                 viol = host["viol"]
+                # Snapshot the epoch BEFORE and AFTER reading every field; any
+                # stream-ordered D2H copy completing in between makes the read
+                # suspect and the whole pass is discarded.
                 e0 = int(host["epoch"].item())
                 vcnt = int(round(viol[0].item()))
+                rows = [
+                    (r, [rec[r, k].item() for k in range(_WATCHDOG_REC_W)])
+                    for r in range(_WATCHDOG_MAX_ROWS)
+                ]
                 e1 = int(host["epoch"].item())
                 if e0 != e1:
                     # The mirror was being updated while we read: discard this
@@ -508,21 +515,21 @@ def _start_watchdog_reader() -> None:
                         int(round(viol[2].item())),
                     )
                 prev = _WATCHDOG_PREV.setdefault(key, {})
-                for r in range(_WATCHDOG_MAX_ROWS):
-                    computed = rec[r, 5].item()
+                for r, vals in rows:
+                    computed = vals[5]
                     if computed <= 0:
                         continue
-                    L = int(round(rec[r, 2].item()))
+                    L = int(round(vals[2]))
                     if L < 64:
                         # Short rows (small requests) churn rapidly through the
                         # padded batch; many same-length requests masquerade as
                         # KV changes. Only long-context rows carry the signal.
                         continue
-                    layer_off = int(round(rec[r, 3].item()))
-                    fp0 = rec[r, 0].item()
-                    fp1 = rec[r, 1].item()
-                    vcode = int(round(rec[r, 6].item()))
-                    idfp = int(round(rec[r, 7].item()))
+                    layer_off = int(round(vals[3]))
+                    fp0 = vals[0]
+                    fp1 = vals[1]
+                    vcode = int(round(vals[6]))
+                    idfp = int(round(vals[7]))
                     # Key on the physical row index AND a request-identity
                     # fingerprint: different requests can share the same
                     # compressed length (and the same padded row across
@@ -559,14 +566,14 @@ def _start_watchdog_reader() -> None:
                             wlog = init_logger(__name__)
                             samples = []
                             for k in range(8):
-                                ov = rec[r, 8 + k].item()
+                                ov = vals[8 + k]
                                 nv = prev_fp[2 + k] if len(prev_fp) > 2 + k else None
                                 oi = (
                                     prev_fp[10 + k]
                                     if len(prev_fp) > 10 + k
                                     else None
                                 )
-                                ni = int(rec[r, 16 + k].item())
+                                ni = int(vals[16 + k])
                                 if nv is not None and ov != nv:
                                     samples.append(
                                         f"s{k}@idx{oi}->{ni}"
@@ -591,22 +598,7 @@ def _start_watchdog_reader() -> None:
                     prev[ident] = (
                         fp0,
                         fp1,
-                        rec[r, 8].item(),
-                        rec[r, 9].item(),
-                        rec[r, 10].item(),
-                        rec[r, 11].item(),
-                        rec[r, 12].item(),
-                        rec[r, 13].item(),
-                        rec[r, 14].item(),
-                        rec[r, 15].item(),
-                        rec[r, 16].item(),
-                        rec[r, 17].item(),
-                        rec[r, 18].item(),
-                        rec[r, 19].item(),
-                        rec[r, 20].item(),
-                        rec[r, 21].item(),
-                        rec[r, 22].item(),
-                        rec[r, 23].item(),
+                        *vals[8:24],
                         float(idfp),
                     )
                     prev[ident_same_len] = prev[ident]
