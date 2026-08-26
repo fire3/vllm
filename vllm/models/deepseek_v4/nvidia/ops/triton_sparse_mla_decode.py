@@ -411,15 +411,27 @@ def _watchdog_buffers(device: torch.device) -> tuple[torch.Tensor, torch.Tensor,
         (_WATCHDOG_MAX_ROWS, _WATCHDOG_REC_W), dtype=torch.float32, pin_memory=True
     )
     viol_host = torch.zeros(3, dtype=torch.float32, pin_memory=True)
-    bufs = (rec_dev, viol_dev, rec_host, viol_host)
+    # Torn-read guard: the poller reads the pinned mirror without syncing with
+    # the stream-ordered D2H copies, so it can observe a half-copied record
+    # and mistake it for a KV-content change. The device bumps an epoch AFTER
+    # each copy; the poller snapshots the epoch before and after reading and
+    # discards the pass when it moved.
+    epoch_dev = torch.zeros(1, dtype=torch.int64, device=device)
+    epoch_host = torch.zeros(1, dtype=torch.int64, pin_memory=True)
+    bufs = (rec_dev, viol_dev, rec_host, viol_host, epoch_dev, epoch_host)
     _WATCHDOG_DEV[key] = bufs
-    _WATCHDOG_HOST[key] = {"rec": rec_host, "viol": viol_host}
+    _WATCHDOG_HOST[key] = {
+        "rec": rec_host,
+        "viol": viol_host,
+        "epoch": epoch_host,
+    }
     return bufs
 
 
 def _watchdog_capture_host_copy(
     rec_dev: torch.Tensor, viol_dev: torch.Tensor,
     rec_host: torch.Tensor, viol_host: torch.Tensor,
+    epoch_dev: torch.Tensor, epoch_host: torch.Tensor,
 ) -> None:
     """Capturable device->host copy of the watchdog state (stream-ordered)."""
     import ctypes
@@ -450,6 +462,19 @@ def _watchdog_capture_host_copy(
     )
     if ret != 0:
         raise RuntimeError(f"watchdog viol copy failed: {ret}")
+    # Bump the epoch on the device, then copy it to the pinned host mirror so
+    # the poller can detect a torn read of rec/viol.
+    epoch_dev[0] += 1
+    nbytes = epoch_dev.numel() * epoch_dev.element_size()
+    ret = cudart.cudaMemcpyAsync(
+        ctypes.c_void_p(epoch_host.data_ptr()),
+        ctypes.c_void_p(epoch_dev.data_ptr()),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(2),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        raise RuntimeError(f"watchdog epoch copy failed: {ret}")
 
 
 def _start_watchdog_reader() -> None:
@@ -465,7 +490,13 @@ def _start_watchdog_reader() -> None:
             for key, host in list(_WATCHDOG_HOST.items()):
                 rec = host["rec"]
                 viol = host["viol"]
+                e0 = int(host["epoch"].item())
                 vcnt = int(round(viol[0].item()))
+                e1 = int(host["epoch"].item())
+                if e0 != e1:
+                    # The mirror was being updated while we read: discard this
+                    # pass (torn read) instead of misreporting KV changes.
+                    continue
                 if vcnt != _WATCHDOG_LAST_VIOL.get(key, 0):
                     _WATCHDOG_LAST_VIOL[key] = vcnt
                     from vllm.logger import init_logger
@@ -828,7 +859,14 @@ def triton_sparse_mla_decode_vllm(
         _start_watchdog_reader()
         B = q.shape[0]
         if B > 0 and extra_indices is not None and extra_lens is not None:
-            rec_dev, viol_dev, rec_host, viol_host = _watchdog_buffers(q.device)
+            (
+                rec_dev,
+                viol_dev,
+                rec_host,
+                viol_host,
+                epoch_dev,
+                epoch_host,
+            ) = _watchdog_buffers(q.device)
             if B < _WATCHDOG_MAX_ROWS:
                 # Zero stale rows so the poller never compares dead rows.
                 rec_dev[B:] = 0
@@ -856,7 +894,7 @@ def triton_sparse_mla_decode_vllm(
                 N_SAMPLES=8,
             )
             _watchdog_capture_host_copy(
-                rec_dev, viol_dev, rec_host, viol_host
+                rec_dev, viol_dev, rec_host, viol_host, epoch_dev, epoch_host
             )
 
     if VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY:
