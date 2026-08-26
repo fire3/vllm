@@ -151,8 +151,20 @@ class Scheduler(SchedulerInterface):
             # still be writing a freed request's KV blocks. A consumer KV
             # Connector can reallocate and fill those blocks via a load that
             # isn't ordered against that write, so defer freeing them.
+            # The hazard is general (not connector-specific): with two batches
+            # in flight, a finished/aborted request's blocks are freed while
+            # the next scheduled batch (whose metadata was built before the
+            # free) may still read shared blocks that drop to ref_cnt == 0.
+            # VLLM_DEFER_BLOCK_FREE_ANY extends the fence to all overlapping
+            # batch deployments; safe because _drain_deferred_frees releases
+            # the blocks as soon as the fence step completes.
             multiple_inflight_batches = self.vllm_config.max_concurrent_batches > 1
-            if multiple_inflight_batches and kv_transfer_config.is_kv_consumer:
+            import os
+
+            if multiple_inflight_batches and (
+                kv_transfer_config.is_kv_consumer
+                or os.environ.get("VLLM_DEFER_BLOCK_FREE_ANY", "0") == "1"
+            ):
                 self.defer_block_free = True
 
             self.requires_kv_delivery = self.connector.requires_kv_delivery
