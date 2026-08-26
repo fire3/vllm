@@ -409,7 +409,12 @@ def _start_watchdog_reader() -> None:
                     fp0 = rec[r, 0].item()
                     fp1 = rec[r, 1].item()
                     vcode = int(round(rec[r, 6].item()))
-                    ident = (L, layer_off)
+                    # Key on the physical row index too: two different requests
+                    # can share the same compressed length in one batch, and
+                    # their KV fingerprints legitimately differ. Without the
+                    # row in the key, alternating rows masquerade as a
+                    # KV-content change.
+                    ident = (r, L, layer_off)
                     prev_fp = prev.get(ident)
                     if prev_fp is not None and (
                         prev_fp[0] != fp0 or prev_fp[1] != fp1
@@ -420,8 +425,10 @@ def _start_watchdog_reader() -> None:
                             wlog = init_logger(__name__)
                             wlog.warning(
                                 "MLA watchdog KV-CONTENT CHANGE at same L: "
-                                "L=%d layer_off=%d fp=(%.0f,%.0f)->(%.0f,%.0f) "
+                                "row=%d L=%d layer_off=%d "
+                                "fp=(%.0f,%.0f)->(%.0f,%.0f) "
                                 "viol_code=%d (count=%d)",
+                                r,
                                 L,
                                 layer_off,
                                 prev_fp[0],
