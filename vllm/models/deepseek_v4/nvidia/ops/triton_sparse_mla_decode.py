@@ -482,6 +482,11 @@ def _start_watchdog_reader() -> None:
                     if computed <= 0:
                         continue
                     L = int(round(rec[r, 2].item()))
+                    if L < 64:
+                        # Short rows (small requests) churn rapidly through the
+                        # padded batch; many same-length requests masquerade as
+                        # KV changes. Only long-context rows carry the signal.
+                        continue
                     layer_off = int(round(rec[r, 3].item()))
                     fp0 = rec[r, 0].item()
                     fp1 = rec[r, 1].item()
