@@ -575,6 +575,32 @@ class KVCacheManager:
         pins = self._partial_tail_pins.pop(request.request_id, None)
         if pins:
             self.block_pool.free_blocks(pins)
+        # Diagnostic (rate-limited): which request's blocks are freed, and
+        # which physical block ids, to correlate with the decode watchdog's
+        # KV-content/remap events and the ZEROING log.
+        try:
+            import time as _time
+
+            now = _time.time()
+            if now - getattr(self, "_last_free_log_ts", 0.0) > 1.0:
+                self._last_free_log_ts = now
+                groups = []
+                for mgr in self.coordinator.single_type_managers:
+                    blocks = mgr.req_to_blocks.get(request.request_id, [])
+                    groups.append(
+                        f"g{len(groups)}:"
+                        f"[{','.join(str(b.block_id) for b in blocks[:12])}]"
+                    )
+                from vllm.logger import init_logger
+
+                logger = init_logger(__name__)
+                logger.info(
+                    "FREE req=%s groups=%s",
+                    request.request_id[-10:],
+                    " ".join(groups),
+                )
+        except Exception:  # noqa: BLE001
+            pass
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
