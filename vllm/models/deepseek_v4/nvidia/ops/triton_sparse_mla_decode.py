@@ -497,8 +497,8 @@ def _start_watchdog_reader() -> None:
                     prev_same_len = prev.get(ident_same_len)
                     if (
                         prev_same_len is not None
-                        and len(prev_same_len) > 10
-                        and int(round(prev_same_len[10])) != idfp
+                        and len(prev_same_len) > 18
+                        and int(round(prev_same_len[18])) != idfp
                     ):
                         # Same row/compressed length but the physical index row
                         # changed: the request's block-table mapping was
@@ -511,7 +511,7 @@ def _start_watchdog_reader() -> None:
                             r,
                             L,
                             layer_off,
-                            int(round(prev_same_len[10])),
+                            int(round(prev_same_len[18])),
                             idfp,
                         )
                     if prev_fp is not None and (
@@ -525,9 +525,15 @@ def _start_watchdog_reader() -> None:
                             for k in range(8):
                                 ov = rec[r, 8 + k].item()
                                 nv = prev_fp[2 + k] if len(prev_fp) > 2 + k else None
+                                oi = (
+                                    prev_fp[10 + k]
+                                    if len(prev_fp) > 10 + k
+                                    else None
+                                )
+                                ni = int(rec[r, 16 + k].item())
                                 if nv is not None and ov != nv:
                                     samples.append(
-                                        f"s{k}@idx{int(rec[r, 16 + k].item())}"
+                                        f"s{k}@idx{oi}->{ni}"
                                         f"={int(nv)}->{int(ov)}"
                                     )
                             wlog.warning(
