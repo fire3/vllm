@@ -80,6 +80,12 @@ _DEBUG_DIFF_STATES: dict[tuple, dict[int, torch.Tensor]] = {}
 _DEBUG_DIFF_FIRED: set[int] = set()
 _DEBUG_DIFF_READER_STARTED = [False]
 _DEBUG_DIFF_THRESHOLD = 0.15
+# Bound the eager scratch caches so they cannot silently grow to gigabytes and
+# erode the GPU-memory headroom needed for transient peak allocations.
+# Captured-graph buffers (capture token != 0) are never evicted: their
+# addresses are baked into the CUDA graphs. Eager entries are recreated on
+# demand, so evicting them is safe.
+_MAX_SCRATCH_ENTRIES = 64
 
 # Per-process capture-session counter: every CUDA graph capture gets a unique
 # token so scratch buffers are keyed per graph instance. Eager execution
@@ -1166,6 +1172,16 @@ def _paged_cache_views(
 _CSR_FLAT_BUFFERS: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
 
 
+def _evict_eager_scratch(cache: dict) -> None:
+    if len(cache) <= _MAX_SCRATCH_ENTRIES:
+        return
+    for key in list(cache):
+        if key[-1] == 0:  # eager-only entries (capture token 0)
+            cache.pop(key, None)
+            if len(cache) <= _MAX_SCRATCH_ENTRIES:
+                return
+
+
 def _get_csr_flat_buffer(
     capacity: int, device: torch.device, slot: int = 0
 ) -> torch.Tensor:
@@ -1190,6 +1206,7 @@ def _get_csr_flat_buffer(
     if buf is None:
         buf = torch.empty(capacity, dtype=torch.int32, device=device)
         _CSR_FLAT_BUFFERS[key] = buf
+        _evict_eager_scratch(_CSR_FLAT_BUFFERS)
     return buf
 
 
@@ -1251,6 +1268,7 @@ def _get_ksplit_partial_buffers(
         )
         partial_lse = torch.empty(T, S, H, dtype=torch.float32, device=device)
         _KSPLIT_PARTIAL_BUFFERS[key] = (partial_out, partial_lse)
+        _evict_eager_scratch(_KSPLIT_PARTIAL_BUFFERS)
         buf = (partial_out, partial_lse)
     return buf
 
