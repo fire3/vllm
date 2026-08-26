@@ -73,7 +73,9 @@ _WATCHDOG_READER_STARTED = [False]
 _WATCHDOG_PREV: dict[int, dict] = {}
 _WATCHDOG_LAST_VIOL: dict[int, int] = {}
 _WATCHDOG_CORRUPT_LOG = 0
-_WATCHDOG_REC_W = 16  # (fp0, fp1, L, layer_off, row, computed, viol, rsv, 8 sample slots)
+# Must be a Triton-visible constexpr: the watchdog kernel indexes records with
+# it. (fp0, fp1, L, layer_off, row, computed, viol, rsv, 8 sample slots)
+_WATCHDOG_REC_W = tl.constexpr(16)
 
 
 @triton.jit
