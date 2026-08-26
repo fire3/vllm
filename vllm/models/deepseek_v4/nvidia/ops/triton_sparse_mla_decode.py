@@ -315,7 +315,10 @@ def _kv_watchdog_kernel(
         acc1 += tl.sum(b1, axis=0)
         # Region assignment for change localization (logical slot -> region).
         rid = (off * N_REGIONS) // n
-        region_acc += tl.histogram(b0.to(tl.int32), N_REGIONS, rid)
+        rid_mask = rid[:, None] == tl.arange(0, N_REGIONS)[None, :]
+        region_acc += tl.sum(
+            tl.where(rid_mask, b0[:, None], 0), axis=0
+        )
         bad += tl.sum((1 - valid.to(tl.int32)) * mask.to(tl.int32), axis=0)
 
     # Sample a few individual slots (early system-prompt region, mid-history,
