@@ -75,7 +75,10 @@ _WATCHDOG_LAST_VIOL: dict[int, int] = {}
 _WATCHDOG_CORRUPT_LOG = 0
 # Must be a Triton-visible constexpr: the watchdog kernel indexes records with
 # it. (fp0, fp1, L, layer_off, row, computed, viol, rsv, 8 sample slots)
-_WATCHDOG_REC_W = tl.constexpr(24)  # + 8 sample-slot physical ids
+_WATCHDOG_REGIONS = 16  # per-row region sums (fp0 only) to localize changes
+# (fp0, fp1, L, layer_off, row, computed, viol, idfp, 8 sample vals,
+#  8 sample idx, 16 region sums)
+_WATCHDOG_REC_W = tl.constexpr(40)
 
 
 @triton.jit
@@ -275,6 +278,7 @@ def _kv_watchdog_kernel(
     topk,  # row width
     BLOCK: tl.constexpr,
     N_SAMPLES: tl.constexpr,
+    N_REGIONS: tl.constexpr,
 ):
     """Per-row c128a KV fingerprint + index-bounds validation."""
     pid = tl.program_id(0)
@@ -292,6 +296,7 @@ def _kv_watchdog_kernel(
 
     acc0 = tl.zeros((), dtype=tl.int64)
     acc1 = tl.zeros((), dtype=tl.int64)
+    region_acc = tl.zeros([N_REGIONS], dtype=tl.int64)
     bad = tl.zeros((), dtype=tl.int32)
     for i in range(0, n, BLOCK):
         off = i + tl.arange(0, BLOCK)
@@ -308,6 +313,9 @@ def _kv_watchdog_kernel(
         ).to(tl.int64)
         acc0 += tl.sum(b0, axis=0)
         acc1 += tl.sum(b1, axis=0)
+        # Region assignment for change localization (logical slot -> region).
+        rid = (off * N_REGIONS) // n
+        region_acc += tl.histogram(b0.to(tl.int32), N_REGIONS, rid)
         bad += tl.sum((1 - valid.to(tl.int32)) * mask.to(tl.int32), axis=0)
 
     # Sample a few individual slots (early system-prompt region, mid-history,
@@ -385,6 +393,13 @@ def _kv_watchdog_kernel(
 
     tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 0, acc0.to(tl.float32))
     tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 1, acc1.to(tl.float32))
+    tl.store(
+        rec_ptr
+        + pid * _WATCHDOG_REC_W
+        + _WATCHDOG_REC_W
+        + tl.arange(0, N_REGIONS),
+        region_acc.to(tl.float32),
+    )
     tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 5, 1.0)
     if bad > 0:
         tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 6, 2.0)
@@ -579,10 +594,18 @@ def _start_watchdog_reader() -> None:
                                         f"s{k}@idx{oi}->{ni}"
                                         f"={int(nv)}->{int(ov)}"
                                     )
+                            regions = []
+                            for k in range(_WATCHDOG_REGIONS):
+                                ov = prev_fp[19 + k] if len(prev_fp) > 19 + k else None
+                                nv = vals[24 + k]
+                                if ov is not None and int(ov) != int(nv):
+                                    regions.append(
+                                        f"r{k}:{int(ov)}->{int(nv)}"
+                                    )
                             wlog.warning(
                                 "MLA watchdog KV-CONTENT CHANGE at same L: "
                                 "row=%d L=%d layer_off=%d "
-                                "fp=(%.0f,%.0f)->(%.0f,%.0f) %s "
+                                "fp=(%.0f,%.0f)->(%.0f,%.0f) %s | %s "
                                 "viol_code=%d (count=%d)",
                                 r,
                                 L,
@@ -592,6 +615,7 @@ def _start_watchdog_reader() -> None:
                                 fp0,
                                 fp1,
                                 " ".join(samples),
+                                " ".join(regions[:12]),
                                 vcode,
                                 _WATCHDOG_CORRUPT_LOG,
                             )
@@ -600,6 +624,7 @@ def _start_watchdog_reader() -> None:
                         fp1,
                         *vals[8:24],
                         float(idfp),
+                        *vals[24:40],
                     )
                     prev[ident_same_len] = prev[ident]
 
@@ -884,6 +909,7 @@ def triton_sparse_mla_decode_vllm(
                 flat_indices.shape[1],
                 BLOCK=64,
                 N_SAMPLES=8,
+                N_REGIONS=_WATCHDOG_REGIONS,
             )
             _watchdog_capture_host_copy(
                 rec_dev, viol_dev, rec_host, viol_host, epoch_dev, epoch_host
