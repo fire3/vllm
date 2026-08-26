@@ -75,7 +75,7 @@ _WATCHDOG_LAST_VIOL: dict[int, int] = {}
 _WATCHDOG_CORRUPT_LOG = 0
 # Must be a Triton-visible constexpr: the watchdog kernel indexes records with
 # it. (fp0, fp1, L, layer_off, row, computed, viol, rsv, 8 sample slots)
-_WATCHDOG_REC_W = tl.constexpr(16)
+_WATCHDOG_REC_W = tl.constexpr(24)  # + 8 sample-slot physical ids
 
 
 @triton.jit
@@ -363,6 +363,25 @@ def _kv_watchdog_kernel(
         packed.to(tl.float32),
         mask=tl.arange(0, N_SAMPLES) < N_SAMPLES,
     )
+    tl.store(
+        rec_ptr + pid * _WATCHDOG_REC_W + 16 + tl.arange(0, N_SAMPLES),
+        s_safe.to(tl.float32),
+        mask=tl.arange(0, N_SAMPLES) < N_SAMPLES,
+    )
+
+    # Request-identity fingerprint: many concurrent requests can share the
+    # same compressed length, so (row, L, layer) is not enough to tell two
+    # requests apart. Sum of the first few indices mod 1024 uniquely
+    # identifies a request's physical block layout with overwhelming
+    # probability (and stays exact in float32).
+    idf_n = tl.minimum(n, 16)
+    idx16 = tl.load(
+        indices_ptr + pid * topk + tl.arange(0, 16),
+        mask=tl.arange(0, 16) < idf_n,
+        other=0,
+    )
+    idf = tl.sum(idx16 % 1024, axis=0).to(tl.int32)
+    tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 7, idf.to(tl.float32))
 
     tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 0, acc0.to(tl.float32))
     tl.store(rec_ptr + pid * _WATCHDOG_REC_W + 1, acc1.to(tl.float32))
@@ -467,13 +486,34 @@ def _start_watchdog_reader() -> None:
                     fp0 = rec[r, 0].item()
                     fp1 = rec[r, 1].item()
                     vcode = int(round(rec[r, 6].item()))
-                    # Key on the physical row index too: two different requests
-                    # can share the same compressed length in one batch, and
-                    # their KV fingerprints legitimately differ. Without the
-                    # row in the key, alternating rows masquerade as a
-                    # KV-content change.
-                    ident = (r, L, layer_off)
+                    idfp = int(round(rec[r, 7].item()))
+                    # Key on the physical row index AND a request-identity
+                    # fingerprint: different requests can share the same
+                    # compressed length (and the same padded row across
+                    # polls), and their KV fingerprints legitimately differ.
+                    ident = (r, L, layer_off, idfp)
+                    ident_same_len = (r, L, layer_off)
                     prev_fp = prev.get(ident)
+                    prev_same_len = prev.get(ident_same_len)
+                    if (
+                        prev_same_len is not None
+                        and len(prev_same_len) > 10
+                        and int(round(prev_same_len[10])) != idfp
+                    ):
+                        # Same row/compressed length but the physical index row
+                        # changed: the request's block-table mapping was
+                        # remapped (COW / block reuse / stale metadata).
+                        from vllm.logger import init_logger
+                        wlog = init_logger(__name__)
+                        wlog.warning(
+                            "MLA watchdog INDEX-ROW CHANGE (block remap): "
+                            "row=%d L=%d layer_off=%d idfp=%d->%d",
+                            r,
+                            L,
+                            layer_off,
+                            int(round(prev_same_len[10])),
+                            idfp,
+                        )
                     if prev_fp is not None and (
                         prev_fp[0] != fp0 or prev_fp[1] != fp1
                     ):
@@ -487,7 +527,8 @@ def _start_watchdog_reader() -> None:
                                 nv = prev_fp[2 + k] if len(prev_fp) > 2 + k else None
                                 if nv is not None and ov != nv:
                                     samples.append(
-                                        f"s{k}={int(nv)}->{int(ov)}"
+                                        f"s{k}@idx{int(rec[r, 16 + k].item())}"
+                                        f"={int(nv)}->{int(ov)}"
                                     )
                             wlog.warning(
                                 "MLA watchdog KV-CONTENT CHANGE at same L: "
@@ -516,7 +557,17 @@ def _start_watchdog_reader() -> None:
                         rec[r, 13].item(),
                         rec[r, 14].item(),
                         rec[r, 15].item(),
+                        rec[r, 16].item(),
+                        rec[r, 17].item(),
+                        rec[r, 18].item(),
+                        rec[r, 19].item(),
+                        rec[r, 20].item(),
+                        rec[r, 21].item(),
+                        rec[r, 22].item(),
+                        rec[r, 23].item(),
+                        float(idfp),
                     )
+                    prev[ident_same_len] = prev[ident]
 
     threading.Thread(target=_run, daemon=True).start()
 
