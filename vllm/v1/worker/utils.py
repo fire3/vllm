@@ -193,20 +193,6 @@ class KVBlockZeroer:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        # Diagnostic (rate-limited): correlate the zeroed block ids with the
-        # watchdog's sampled physical slots. A block that is zeroed while a
-        # running request still references it (prefix-cache shared block
-        # freed and reallocated) shows up as KV content -> 0 at a fixed slot.
-        import time as _time
-
-        now = _time.time()
-        if now - getattr(self, "_last_zero_log_ts", 0.0) > 2.0:
-            self._last_zero_log_ts = now
-            logger.info(
-                "ZEROING %d blocks: %s",
-                len(block_ids),
-                str(block_ids[:32]),
-            )
         seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
