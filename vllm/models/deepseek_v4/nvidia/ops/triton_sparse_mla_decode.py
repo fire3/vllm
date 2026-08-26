@@ -405,7 +405,7 @@ def _kv_watchdog_kernel(
     tl.store(
         rec_ptr
         + pid * _WATCHDOG_REC_W
-        + _WATCHDOG_REC_W
+        + 24
         + tl.arange(0, N_REGIONS),
         region_acc.to(tl.float32),
     )
