@@ -257,6 +257,13 @@ class DeepseekV4SparseMLAMetadataBuilder(
         assert cm.positions is not None, (
             "positions is required for C128A metadata build"
         )
+        active_topk_width = min(
+            max(
+                triton.next_power_of_2(max(cm.max_seq_len // self.compress_ratio, 1)),
+                _C128A_TOPK_ALIGNMENT,
+            ),
+            self.c128a_max_compressed,
+        )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
@@ -269,7 +276,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
             self.c128a_global_decode_buffer,
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
-            max_compressed_tokens=self.c128a_max_compressed,
+            max_compressed_tokens=active_topk_width,
         )
 
         result: dict[str, torch.Tensor | None] = {}
@@ -278,6 +285,12 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 num_decode_tokens, 1, -1
             )
             result["c128a_decode_topk_lens"] = decode_lens
+            # Mirror the SWA builder (which zeroes decode_swa_lens beyond the
+            # real token count): stale non-zero lens on FULL-graph padding rows
+            # would make the packed CSR and K-split/fused attention process
+            # stale index rows for padding. The padding output is masked, but
+            # the extra work keeps the buffers dirty across steps.
+            self.c128a_decode_lens_buffer[num_decode_tokens:] = 0
         if num_prefill_tokens > 0:
             result["c128a_prefill_topk_indices"] = prefill_local
         return result
@@ -315,15 +328,19 @@ def build_c128a_topk_metadata(
     Decode tokens: position → block_table lookup → global slot ids + topk_lens.
     Prefill tokens: position → local indices [0, ..., n-1, -1, ...].
 
-    Writes into pre-allocated buffers for CUDA graph address stability.
-    Returns slices of the buffers.
+    Writes into packed views of pre-allocated buffers for CUDA graph stability.
     """
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
 
-    global_decode = global_decode_buffer[:num_decode_tokens]
+    # Rows use the pre-allocated buffer's full stride (not the active width),
+    # so the returned views keep a constant row stride across runtime width
+    # changes. A CUDA graph bakes the capture-time stride; if the runtime
+    # metadata were tight-packed with the active width, a replay at a smaller
+    # width would read rows with the baked stride and see wrong indices.
+    global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
-    prefill_local = prefill_buffer[:num_prefill_tokens]
+    prefill_local = prefill_buffer[:num_prefill_tokens, :max_compressed_tokens]
 
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local

@@ -77,6 +77,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
 )
+from vllm.models.deepseek_v4.nvidia.triton_sparse import (
+    DeepseekV4TritonMLAAttention,
+)
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
@@ -790,6 +793,16 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashInferSM120Attention
         return DeepseekV4FlashInferMLAAttention
+    if backend == AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4:
+        if device_capability is not None and (
+            device_capability.major == 12
+            or (device_capability.major == 8 and device_capability.minor == 9)
+        ):
+            return DeepseekV4TritonMLAAttention
+        raise ValueError(
+            "TRITON_MLA_SPARSE_DSV4 requires SM89 or SM120; got "
+            f"{device_capability}"
+        )
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
         AttentionBackendEnum.FLASHMLA_SPARSE_DSV4,
