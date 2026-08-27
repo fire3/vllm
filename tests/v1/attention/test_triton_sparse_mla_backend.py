@@ -101,7 +101,7 @@ def test_triton_backend_combination_does_not_require_flashinfer(
 def test_flashinfer_backend_remains_default(monkeypatch) -> None:
     """FLASHINFER_MLA_SPARSE_DSV4 must keep selecting the FlashInfer class."""
     from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
-        DeepseekV4FlashInferSM120Attention,
+        DeepseekV4FlashInferMLAAttention,
     )
     from vllm.models.deepseek_v4.nvidia.model import _select_dsv4_attn_cls
 
@@ -112,4 +112,10 @@ def test_flashinfer_backend_remains_default(monkeypatch) -> None:
     monkeypatch.setattr(
         current_platform, "get_device_capability", lambda: DeviceCapability(8, 9)
     )
-    assert _select_dsv4_attn_cls(vllm_config) is DeepseekV4FlashInferSM120Attention
+    # On SM89 upstream v0.28.0 still routes FLASHINFER_MLA_SPARSE_DSV4 to the
+    # generic FlashInfer MLA attention (the FlashInfer-on-SM89 enablement was
+    # intentionally not part of this Triton port). The assertion guards that
+    # the Triton backend never hijacks the FlashInfer selection.
+    assert (
+        _select_dsv4_attn_cls(vllm_config) is DeepseekV4FlashInferMLAAttention
+    )
