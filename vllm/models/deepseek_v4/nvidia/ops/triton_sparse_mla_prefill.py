@@ -1227,6 +1227,12 @@ def _pack_sparse_rows(
     dense = indices.reshape(T, -1)
     max_width = max(dense.stride(0), dense.shape[1])
     lens32 = lens.reshape(T).to(torch.int32)
+    # Defensive clamp: a stale/negative lens row (e.g. a padding row that was
+    # not rewritten this step, or a corrupted length from a batch transition)
+    # must never make indptr non-monotonic or drive the pack past the flat
+    # buffer. Valid lengths are always within [0, max_width] by construction,
+    # so this is a no-op for healthy metadata and only sanitizes garbage.
+    lens32 = torch.clamp(lens32, min=0, max=max_width)
     indptr = torch.zeros(T + 1, dtype=torch.int32, device=lens.device)
     torch.cumsum(lens32, dim=0, out=indptr[1:])
     flat = _get_csr_flat_buffer(T * max_width, lens.device, slot)
