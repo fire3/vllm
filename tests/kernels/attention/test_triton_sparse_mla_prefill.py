@@ -4,8 +4,8 @@
 
 The kernel fuses the SWA + compressed (c4/c128) sources into a single launch
 with CSR (flat indices + indptr) metadata and one shared online-softmax
-accumulator. Tests compare against the torch reference and the phase-1
-decode-wrapper launcher on identical inputs.
+accumulator. Tests compare against the torch reference and, when available,
+the FlashInfer DSv4 launcher on identical inputs.
 """
 
 from typing import Optional
@@ -304,60 +304,6 @@ def test_tiled_prefill_matches_reference(with_sink, with_extra):
     )
 
 
-def test_tiled_prefill_matches_phase1_launcher(monkeypatch):
-    """Phase-2A fused kernel vs the phase-1 decode-wrapper launcher."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    device = torch.device("cuda")
-    (
-        q,
-        sinks,
-        main_cache,
-        _,
-        _,
-        swa_indices,
-        swa_lens,
-        extra_cache,
-        _,
-        _,
-        extra_indices,
-        extra_lens,
-    ) = _make_prefill_inputs(device)
-    T, H, _ = q.shape
-    softmax_scale = _D ** -0.5
-    attn = _make_attn(sinks, softmax_scale)
-
-    def _run(out: torch.Tensor) -> None:
-        attn._launch_sparse_mla_prefill(
-            q=q,
-            swa_kv_cache=main_cache,
-            swa_indices=swa_indices.unsqueeze(1),
-            swa_lens=swa_lens,
-            extra_kv_cache=extra_cache,
-            extra_indices=extra_indices,
-            extra_lens=extra_lens,
-            out=out,
-        )
-
-    out_tiled = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
-    _run(out_tiled)
-
-    monkeypatch.setattr(
-        "vllm.models.deepseek_v4.nvidia.triton_sparse."
-        "VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER",
-        True,
-    )
-    out_phase1 = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
-    _run(out_phase1)
-
-    torch.testing.assert_close(
-        out_tiled.float(),
-        out_phase1.float(),
-        atol=3e-2,
-        rtol=3e-2,
-    )
-
-
 def test_tiled_prefill_edge_cases():
     """Empty extra region, sentinels inside the prefix, and T=1."""
     if not torch.cuda.is_available():
@@ -639,68 +585,6 @@ def test_triton_decode_vllm_tiled_matches_reference():
     T, H, _ = q.shape
     softmax_scale = _D ** -0.5
 
-    out = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
-    triton_sparse_mla_decode_vllm(
-        q=q.unsqueeze(1),
-        swa_kv_cache=main_cache,
-        swa_indices=swa_indices.unsqueeze(1),
-        swa_lens=swa_lens,
-        extra_kv_cache=extra_cache,
-        extra_indices=extra_indices,
-        extra_lens=extra_lens,
-        attn_sink=sinks,
-        softmax_scale=softmax_scale,
-        out=out,
-    )
-    ref = _reference_prefill(
-        q,
-        sinks,
-        main_nope,
-        main_rope,
-        swa_indices,
-        swa_lens,
-        extra_nope,
-        extra_rope,
-        extra_indices,
-        extra_lens,
-        softmax_scale,
-    )
-    torch.testing.assert_close(
-        out.float(),
-        ref.float(),
-        atol=3e-2,
-        rtol=3e-2,
-    )
-
-
-def test_triton_decode_vllm_legacy_fallback(monkeypatch):
-    """VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY=1 keeps the phase-1 elementwise
-    two-pass path working through the same entry point."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-    device = torch.device("cuda")
-    (
-        q,
-        sinks,
-        main_cache,
-        main_nope,
-        main_rope,
-        swa_indices,
-        swa_lens,
-        extra_cache,
-        extra_nope,
-        extra_rope,
-        extra_indices,
-        extra_lens,
-    ) = _make_prefill_inputs(device)
-    T, H, _ = q.shape
-    softmax_scale = _D ** -0.5
-
-    monkeypatch.setattr(
-        "vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_decode."
-        "VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY",
-        True,
-    )
     out = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
     triton_sparse_mla_decode_vllm(
         q=q.unsqueeze(1),

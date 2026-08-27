@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton sparse-MLA prefill kernel (phase 2A).
+"""Triton sparse-MLA fused kernel for DeepSeek V4 (Flash) prefill and decode.
 
-Phase 1 expands every prefill token into a decode-style row and runs the
-decode kernel twice (SWA cache and compressed cache), then merges the partial
-attentions in Python via LSE. That is correct but pays two full kernel passes
-plus a ``[T, H, D]`` merge round-trip per layer.
-
-Phase 2A replaces that path with a single tiled, query-major, head-blocked
-kernel that:
+The tiled, query-major, head-blocked kernel:
 
   * consumes per-query CSR metadata (flat physical-slot lists + indptr)
     instead of fixed-width padded rows, so short prefixes stop paying for the
@@ -20,33 +14,23 @@ kernel that:
     (fp8 -> bf16 upcast, fp32 accumulate -- the SM89 pattern established by
     the MQA-logits fix), applying the per-(token, group) UE8M0 scale after
     the score dot and pre-scaling the value operand;
-  * keeps attn-sink handling in Python (same semantics as the decode
-    wrapper) so the kernel numerics stay identical to the decode path.
+  * keeps attn-sink handling in Python so the kernel numerics stay identical
+    across prefill and decode rows.
 
-The kernel still runs on the padded head count like phase 1; removing padded
-heads is explicitly out of scope for 2A (see notes 2026-08-23, sec. 2.1-3).
+Decode (one query token per row) routes through this same kernel via
+``triton_sparse_mla_decode_vllm``. The kernel still runs on the padded head
+count; removing padded heads is explicitly out of scope.
 """
 
 from typing import Optional
 
-import os
-
 import torch
 
-from vllm.config import CUDAGraphMode
-from vllm.envs import (
-    VLLM_TRITON_SPARSE_MLA_KSPLIT,
-    VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE,
-)
-from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
-logger = init_logger(__name__)
-
-# DSv4 KV cache layout constants (shared with the decode kernel).
+# DSv4 KV cache layout constants.
 _NOPE_DIM = 448
 _ROPE_DIM = 64
 _GROUP_DIM = 64
@@ -66,20 +50,6 @@ _KSPLIT_CHUNK = 32
 # across chunked-prefill sizes and OOMing at high GPU-memory utilization.
 _KSPLIT_MAX_T = 64
 
-# A/B toggle: keep K-split inside FULL graph captures. On by default: the
-# K-split grid is now width-independent (fixed S_MAX derived from the max
-# buffer row capacity; per-CTA source/chunk selection reads the runtime CSR
-# lengths), so a FULL graph is correct for any c128 width up to max-model-len.
-# Set VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL=0 to force the fused kernel inside
-# FULL captures.
-_KSPLIT_FULL = os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL", "1") != "0"
-_DEBUG = os.environ.get("VLLM_TRITON_SPARSE_MLA_DEBUG", "0") == "1"
-_DEBUG_SEEN: set[tuple] = set()
-_DEBUG_DIFF = os.environ.get("VLLM_TRITON_SPARSE_MLA_DEBUG_DIFF", "0") == "1"
-_DEBUG_DIFF_STATES: dict[tuple, dict[int, torch.Tensor]] = {}
-_DEBUG_DIFF_FIRED: set[int] = set()
-_DEBUG_DIFF_READER_STARTED = [False]
-_DEBUG_DIFF_THRESHOLD = 0.15
 # Bound the eager scratch caches so they cannot silently grow to gigabytes and
 # erode the GPU-memory headroom needed for transient peak allocations.
 # Captured-graph buffers (capture token != 0) are never evicted: their
@@ -100,152 +70,6 @@ def _capture_token() -> int:
         _CAPTURE_SESSION[0] += 1
     _PREV_CAPTURING[0] = capturing
     return _CAPTURE_SESSION[0] if capturing else 0
-
-
-def _is_full_graph_capture() -> bool:
-    """True when the current call is being captured into a FULL CUDA graph.
-
-    K-split is width-independent (fixed grid/scratch sized to the max buffer
-    row capacity, runtime source selection from the CSR indptr), so it is safe
-    inside FULL captures. This helper is kept for the opt-out escape hatch
-    (``VLLM_TRITON_SPARSE_MLA_KSPLIT_FULL=0``) and for A/B experiments.
-    """
-    if not torch.cuda.is_current_stream_capturing():
-        return False
-    try:
-        ctx = get_forward_context()
-    except Exception:
-        return False
-    return ctx.cudagraph_runtime_mode == CUDAGraphMode.FULL
-
-
-def _debug_launch(tag: str, key: tuple) -> None:
-    """One-time per-shape launch logging for K-split A/B diagnostics."""
-    if not _DEBUG or key in _DEBUG_SEEN:
-        return
-    _DEBUG_SEEN.add(key)
-    logger.info("triton sparse MLA [%s] %s", tag, key)
-
-
-@triton.jit
-def _max_abs_diff_kernel(
-    a_ptr,
-    b_ptr,
-    max_diff_ptr,
-    nan_ptr,
-    layer_off_ptr,
-    layer_off: tl.int64,
-    N: tl.int32,
-    BLOCK: tl.constexpr,
-):
-    """Max |a - b| + NaN/Inf count over one [T, H, D] output pair."""
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N
-    a = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    d = tl.abs(a - b)
-    m = tl.max(d, axis=0)
-    tl.atomic_max(max_diff_ptr, m)
-    nan = tl.sum(((a != a) & (b == b)).to(tl.int32), axis=0) + tl.sum(
-        ((b != b) & (a == a)).to(tl.int32), axis=0
-    )
-    tl.atomic_add(nan_ptr, nan)
-    tl.store(layer_off_ptr, layer_off)
-
-
-def _debug_diff_buffers(
-    key: tuple,
-    layer_off: int,
-    T: int,
-    H: int,
-    D: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-(call, layer) fused reference + diff state for K-split A/B."""
-    state = _DEBUG_DIFF_STATES.setdefault(key, {})
-    if layer_off not in state:
-        out_ref = torch.empty(T, H, D, dtype=torch.bfloat16, device=device)
-        lse_ref = torch.empty(T, H, dtype=torch.float32, device=device)
-        max_diff = torch.zeros(1, dtype=torch.float32, device=device)
-        nan_cnt = torch.zeros(1, dtype=torch.int32, device=device)
-        layer_off_t = torch.zeros(1, dtype=torch.int64, device=device)
-        # Pinned host mirrors updated by a capturable D2H copy inside the
-        # graph; the reader samples them without any CUDA interaction, so it
-        # can never invalidate an in-progress capture.
-        host_state = torch.zeros(3, dtype=torch.float32, pin_memory=True)
-        state[layer_off] = (
-            out_ref,
-            lse_ref,
-            max_diff,
-            nan_cnt,
-            layer_off_t,
-            host_state,
-        )
-    return state[layer_off]
-
-
-def _capture_host_state_copy(
-    max_diff: torch.Tensor,
-    nan_cnt: torch.Tensor,
-    layer_off_t: torch.Tensor,
-    host_state: torch.Tensor,
-) -> None:
-    """Capturable device->host copy of the diff state on the current stream."""
-    import ctypes
-
-    try:
-        cudart = ctypes.CDLL("libcudart.so")
-    except OSError:
-        cudart = ctypes.CDLL("libcudart.so.12")
-    cudart.cudaMemcpyAsync.restype = ctypes.c_int
-    stream = torch.cuda.current_stream().cuda_stream
-    for src, slot in (
-        (max_diff, 0),
-        (nan_cnt.to(torch.float32), 1),
-        (layer_off_t.to(torch.float32), 2),
-    ):
-        ret = cudart.cudaMemcpyAsync(
-            ctypes.c_void_p(host_state.data_ptr() + slot * 4),
-            ctypes.c_void_p(src.data_ptr()),
-            ctypes.c_size_t(4),
-            ctypes.c_int(2),  # cudaMemcpyDeviceToHost
-            ctypes.c_void_p(stream),
-        )
-        if ret != 0:
-            raise RuntimeError(f"cudaMemcpyAsync failed with code {ret}")
-
-
-def _start_debug_diff_reader() -> None:
-    if not _DEBUG_DIFF or _DEBUG_DIFF_READER_STARTED[0]:
-        return
-    _DEBUG_DIFF_READER_STARTED[0] = True
-
-    import threading
-    import time
-
-    def _run() -> None:
-        while True:
-            time.sleep(1.0)
-            for key, layers in list(_DEBUG_DIFF_STATES.items()):
-                for layer_off, bufs in list(layers.items()):
-                    host_state = bufs[5]
-                    md = float(host_state[0].item())
-                    nn = int(round(host_state[1].item()))
-                    lo = int(round(host_state[2].item()))
-                    if md > _DEBUG_DIFF_THRESHOLD or nn > 0:
-                        if layer_off not in _DEBUG_DIFF_FIRED:
-                            _DEBUG_DIFF_FIRED.add(layer_off)
-                            logger.warning(
-                                "MLA K-split vs fused DIVERGENCE: layer_off=%s "
-                                "max_abs_diff=%.4f nan=%d key=%s",
-                                lo,
-                                md,
-                                nn,
-                                key,
-                            )
-
-    threading.Thread(target=_run, daemon=True).start()
 
 
 @triton.jit
@@ -1138,22 +962,6 @@ def _tiled_sparse_prefill_kernel(
     tl.store(LSE_ptr + t * H + h_offs, lse, mask=h_mask)
 
 
-_TILED_SPARSE_PREFILL_CONFIGS = [
-    triton.Config({"BLOCK_H": 8, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_H": 8, "BLOCK_K": 16}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_H": 16, "BLOCK_K": 16}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_H": 16, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-]
-
-# Autotune is opt-in (same policy as the decode kernel): the default fixed
-# config keeps first-call latency and results deterministic. The kernel is
-# gather-bound, so num_stages is left out of the search.
-_TILED_SPARSE_PREFILL_AUTOTUNED = triton.autotune(
-    configs=_TILED_SPARSE_PREFILL_CONFIGS,
-    key=["H"],
-)(_tiled_sparse_prefill_kernel)
-
-
 def _paged_cache_views(
     kv_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
@@ -1348,19 +1156,7 @@ def triton_sparse_mla_prefill_vllm(
     extra_scale_off = extra_page_size * _TOKEN_DATA_STRIDE
     lse = torch.empty(T, H, dtype=torch.float32, device=q.device)
 
-    use_ksplit = VLLM_TRITON_SPARSE_MLA_KSPLIT and T <= _KSPLIT_MAX_T
-    if use_ksplit and _is_full_graph_capture() and not _KSPLIT_FULL:
-        use_ksplit = False
-    _debug_launch(
-        "ksplit" if use_ksplit else "fused",
-        (
-            T,
-            H,
-            has_extra,
-            _is_full_graph_capture(),
-            _KSPLIT_FULL,
-        ),
-    )
+    use_ksplit = T <= _KSPLIT_MAX_T
     launch_args = dict(
         Q_ptr=q,
         O_ptr=out,
@@ -1402,8 +1198,7 @@ def triton_sparse_mla_prefill_vllm(
         # max buffer row capacity (width-independent): every CTA selects its
         # source/chunk from the runtime CSR lengths, so FULL-graph replay is
         # correct for any runtime c128 width. Default on for decode-sized
-        # batches; VLLM_TRITON_SPARSE_MLA_KSPLIT=0 (or T > _KSPLIT_MAX_T)
-        # falls back to the single-CTA fused kernel.
+        # batches; T > _KSPLIT_MAX_T falls back to the single-CTA fused kernel.
         swa_max_width = max(
             swa_indices.reshape(T, -1).stride(0),
             swa_indices.reshape(T, -1).shape[1],
@@ -1488,74 +1283,15 @@ def triton_sparse_mla_prefill_vllm(
             HAS_EXTRA=has_extra,
             num_warps=8,
         )
-        if _DEBUG_DIFF:
-            _start_debug_diff_reader()
-            stream = torch.cuda.current_stream(q.device)
-            diff_key = (
-                q.device.index if q.device.index is not None else 0,
-                T,
-                H,
-                stream.cuda_stream,
-                _capture_token(),
-            )
-            (
-                out_ref,
-                lse_ref,
-                max_diff,
-                nan_cnt,
-                layer_off_t,
-                host_state,
-            ) = (
-                _debug_diff_buffers(
-                    diff_key,
-                    int(swa_layer_off),
-                    T,
-                    H,
-                    D,
-                    q.device,
-                )
-            )
-            fused_grid = (T, triton.cdiv(H, _DEFAULT_BLOCK_H))
-            ref_args = dict(launch_args)
-            ref_args["O_ptr"] = out_ref
-            ref_args["LSE_ptr"] = lse_ref
-            _tiled_sparse_prefill_kernel[fused_grid](
-                **ref_args,
-                BLOCK_H=_DEFAULT_BLOCK_H,
-                BLOCK_K=_DEFAULT_BLOCK_K,
-                num_warps=_DEFAULT_NUM_WARPS,
-                num_stages=2,
-            )
-            _max_abs_diff_kernel[
-                (triton.cdiv(T * H * D, 1024),)
-            ](
-                out,
-                out_ref,
-                max_diff,
-                nan_cnt,
-                layer_off_t,
-                layer_off=int(swa_layer_off),
-                N=T * H * D,
-                BLOCK=1024,
-            )
-            _capture_host_state_copy(max_diff, nan_cnt, layer_off_t, host_state)
     else:
         grid = (T, triton.cdiv(H, _DEFAULT_BLOCK_H))
-        kernel = (
-            _TILED_SPARSE_PREFILL_AUTOTUNED
-            if VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE
-            else _tiled_sparse_prefill_kernel
+        _tiled_sparse_prefill_kernel[grid](
+            **launch_args,
+            BLOCK_H=_DEFAULT_BLOCK_H,
+            BLOCK_K=_DEFAULT_BLOCK_K,
+            num_warps=_DEFAULT_NUM_WARPS,
+            num_stages=2,
         )
-        if VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE:
-            kernel[grid](**launch_args)
-        else:
-            kernel[grid](
-                **launch_args,
-                BLOCK_H=_DEFAULT_BLOCK_H,
-                BLOCK_K=_DEFAULT_BLOCK_K,
-                num_warps=_DEFAULT_NUM_WARPS,
-                num_stages=2,
-            )
 
     if attn_sink is not None:
         combined = torch.logaddexp(lse, attn_sink.view(1, -1).expand_as(lse))

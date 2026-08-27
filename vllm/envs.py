@@ -122,21 +122,6 @@ if TYPE_CHECKING:
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
-    # Opt in to Triton autotune for the DSv4 sparse-MLA decode kernel ported
-    # from SGLang. Default is a fixed config (deterministic, no runtime
-    # benchmark); set to 1 to mirror the upstream operator's autotune.
-    VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE: bool = False
-    # Phase-2A tiled sparse-MLA prefill kernel: opt-in autotune, and an opt-out
-    # back to the phase-1 decode-wrapper launcher for A/B comparison.
-    VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE: bool = False
-    VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER: bool = False
-    # Split the SWA+extra token scan across (B, S) CTAs with a partial-LSE
-    # merge (flash-decoding style) to raise parallelism on small decode
-    # batches; set 0 to use the single-CTA fused kernel.
-    VLLM_TRITON_SPARSE_MLA_KSPLIT: bool = True
-    # Decode also routes through the tiled dual-source fused kernel by default;
-    # set to 1 to fall back to the phase-1 elementwise two-pass kernel.
-    VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1195,28 +1180,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # performance and applied before running any kernel.
     "VLLM_TRITON_FORCE_FIRST_CONFIG": lambda: (
         os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower()
-        in ("1", "true")
-    ),
-    "VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_DECODE_AUTOTUNE", "0").strip().lower()
-        in ("1", "true")
-    ),
-    "VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_PREFILL_AUTOTUNE", "0").strip().lower()
-        in ("1", "true")
-    ),
-    "VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER", "0")
-        .strip()
-        .lower()
-        in ("1", "true")
-    ),
-    "VLLM_TRITON_SPARSE_MLA_KSPLIT": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_KSPLIT", "1").strip().lower()
-        in ("1", "true")
-    ),
-    "VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY": lambda: (
-        os.environ.get("VLLM_TRITON_SPARSE_MLA_DECODE_LEGACY", "0").strip().lower()
         in ("1", "true")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
