@@ -2,17 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton sparse-MLA backend for DeepSeek V4 (Flash).
 
-This backend replaces FlashInfer's DSv4 sparse-MLA *decode* kernel with the
-Triton kernel ported from SGLang's SM120 FlashMLA implementation
-(``flash_mla_sparse_decode_triton``). It consumes the same packed
-``fp8_ds_mla`` page layout and the same sparse-index metadata as
-``FLASHINFER_MLA_SPARSE_DSV4``, so it is a drop-in swap for the decode path:
+This backend replaces FlashInfer's DSv4 sparse-MLA path with the Triton
+dual-source fused kernel (``triton_sparse_mla_prefill_vllm``) shared by
+prefill and decode. It consumes the same packed ``fp8_ds_mla`` page layout
+and the same sparse-index metadata as ``FLASHINFER_MLA_SPARSE_DSV4``, so it
+is a drop-in swap:
 
     --attention-backend TRITON_MLA_SPARSE_DSV4
 
-The DSv4 prefill launcher is not covered by the ported operator (it is a
-decode-only kernel); prefill continues to use FlashInfer when prefill tokens
-are present, so FlashInfer is still required for mixed-batch steps.
+No FlashInfer kernel is required by this backend.
 """
 
 from typing import ClassVar
@@ -21,7 +19,6 @@ import torch
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.envs import VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER
 from vllm.platforms.interface import DeviceCapability
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
@@ -184,21 +181,6 @@ class DeepseekV4TritonMLAAttention(DeepseekV4FlashInferSM120Attention):
         extra_lens: torch.Tensor | None,
         out: torch.Tensor,  # [T, H, D], written in place
     ) -> None:
-        if VLLM_TRITON_SPARSE_MLA_PREFILL_DECODE_WRAPPER:
-            # Phase-1 path: decode-style rows, two kernel passes + LSE merge.
-            triton_sparse_mla_decode_vllm(
-                q=q.unsqueeze(1),
-                swa_kv_cache=swa_kv_cache,
-                swa_indices=swa_indices,
-                swa_lens=swa_lens,
-                extra_kv_cache=extra_kv_cache,
-                extra_indices=extra_indices,
-                extra_lens=extra_lens,
-                attn_sink=self.attn_sink,
-                softmax_scale=self.scale,
-                out=out,
-            )
-            return
         triton_sparse_mla_prefill_vllm(
             q=q,
             swa_kv_cache=swa_kv_cache,
