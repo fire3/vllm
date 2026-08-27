@@ -674,8 +674,8 @@ def _merge_ksplit_kernel(
     partial_lse_ptr,  # [T, S, H] f32
     O_ptr,  # [T, H, D] bf16
     LSE_ptr,  # [T, H] f32
-    swa_lens_ptr,  # [T] int32, runtime SWA row lengths
-    extra_lens_ptr,  # [T] int32, runtime extra row lengths
+    swa_indptr_ptr,  # [T+1] int32, runtime SWA CSR indptr
+    extra_indptr_ptr,  # [T+1] int32, runtime extra CSR indptr
     H: tl.int32,
     stride_pt: tl.int32,
     stride_ps: tl.int32,
@@ -694,8 +694,10 @@ def _merge_ksplit_kernel(
     """Flash-decoding merge: combine per-chunk partials via LSE weighting.
 
     The chunk count and source boundary are derived from the runtime row
-    lengths (swa chunks first, then extra), so the merge is independent of the
-    captured width; partial buffers beyond the runtime length are masked.
+    CSR indptr (swa chunks first, then extra), so the merge is independent of
+    the captured width and -- critically -- reads the exact same row lengths
+    that the ksplit kernel used to write the partials. A stale/oversized lens
+    row cannot make the merge trust a chunk the ksplit kernel did not write.
     """
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -709,10 +711,12 @@ def _merge_ksplit_kernel(
     # Per-row valid chunk range: chunks beyond the runtime row length were not
     # (re)written by this step's ksplit kernel, so they must be masked instead
     # of trusting their (potentially stale) partial LSE.
-    swa_len = tl.load(swa_lens_ptr + t)
+    swa_len = tl.load(swa_indptr_ptr + t + 1) - tl.load(swa_indptr_ptr + t)
     swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
     if HAS_EXTRA:
-        extra_len = tl.load(extra_lens_ptr + t)
+        extra_len = (
+            tl.load(extra_indptr_ptr + t + 1) - tl.load(extra_indptr_ptr + t)
+        )
         extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
     else:
         extra_chunks = 0
@@ -1269,10 +1273,16 @@ def _get_ksplit_partial_buffers(
     buf = _KSPLIT_PARTIAL_BUFFERS.get(key)
     if buf is None:
         d = _NOPE_DIM + _ROPE_DIM
-        partial_out = torch.empty(
+        partial_out = torch.zeros(
             T, S, H, d, dtype=torch.bfloat16, device=device
         )
-        partial_lse = torch.empty(T, S, H, dtype=torch.float32, device=device)
+        # Initialize the LSE slab to -inf so a chunk that is ever (mistakenly)
+        # read outside the runtime write range contributes zero weight instead
+        # of stale finite logits. The merge masks by runtime CSR lengths, so
+        # this is belt-and-suspenders, but it makes a logic hole benign.
+        partial_lse = torch.full(
+            (T, S, H), float("-inf"), dtype=torch.float32, device=device
+        )
         _KSPLIT_PARTIAL_BUFFERS[key] = (partial_out, partial_lse)
         _evict_eager_scratch(_KSPLIT_PARTIAL_BUFFERS)
         buf = (partial_out, partial_lse)
@@ -1460,8 +1470,8 @@ def triton_sparse_mla_prefill_vllm(
             partial_lse,
             out,
             lse,
-            swa_lens,
-            extra_lens if has_extra else swa_lens,
+            swa_indptr,
+            extra_indptr if has_extra else swa_indptr,
             H=H,
             stride_pt=S * H * D,
             stride_ps=H * D,
