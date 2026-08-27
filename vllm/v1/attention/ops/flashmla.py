@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
 
+from dataclasses import dataclass
+from typing import Optional
+
 import torch
 
 from vllm.logger import init_logger
@@ -95,15 +98,21 @@ if _is_flashmla_available()[0]:
     )
 else:
 
+    @dataclass
     class FlashMLASchedMeta:  # type: ignore[no-redef]
-        pass
+        """Empty tile-scheduler container used when FlashMLA C++ is absent."""
+
+        have_initialized: bool = False
+        config: object = None
+        tile_scheduler_metadata: Optional[torch.Tensor] = None
+        num_splits: Optional[torch.Tensor] = None
 
     flash_attn_varlen_func = _raise_flashmla_unavailable  # type: ignore[assignment]
     flash_attn_varlen_kvpacked_func = _raise_flashmla_unavailable  # type: ignore[assignment]
     flash_attn_varlen_qkvpacked_func = _raise_flashmla_unavailable  # type: ignore[assignment]
     flash_mla_sparse_fwd = _raise_flashmla_unavailable  # type: ignore[assignment]
     flash_mla_with_kvcache = _raise_flashmla_unavailable  # type: ignore[assignment]
-    get_mla_metadata = _raise_flashmla_unavailable  # type: ignore[assignment]
+    get_mla_metadata = lambda *args, **kwargs: (FlashMLASchedMeta(), None)  # noqa: E731
 
 
 def get_mla_metadata_dense_fp8(
