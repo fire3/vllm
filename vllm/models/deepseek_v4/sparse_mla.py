@@ -9,7 +9,6 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
-from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -22,7 +21,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    split_decodes_and_prefills,
+    zero_decode_padding_rows,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
@@ -89,6 +91,21 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major in [9, 10]
 
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
+            # head_size passed in is the semantic head_dim (512).
+            return (num_blocks, block_size, 584)
+        else:
+            return (num_blocks, block_size, head_size)
+
 
 @dataclass
 class DeepseekV4FlashMLAMetadata(AttentionMetadata):
@@ -137,8 +154,8 @@ class DeepseekV4SparseMLAMetadataBuilder(
             (max_num_batched_tokens,), dtype=torch.int32, device=device
         )
 
-        assert isinstance(self.kv_cache_spec.tokens_per_state, int)
-        self.compress_ratio = self.kv_cache_spec.tokens_per_state
+        assert hasattr(self.kv_cache_spec, "compress_ratio")
+        self.compress_ratio = self.kv_cache_spec.compress_ratio
 
         # Pre-allocate compressed slot mapping buffer for CUDA graph address
         # stability when compress_ratio > 1.
@@ -192,7 +209,7 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 cm.query_start_loc,
                 cm.seq_lens,
                 cm.block_table_tensor.clamp_(min=0),
-                int(self.kv_cache_spec.num_states),
+                int(self.kv_cache_spec.storage_block_size),
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
             )
@@ -250,8 +267,6 @@ class DeepseekV4SparseMLAMetadataBuilder(
             ),
             self.c128a_max_compressed,
         )
-        assert active_topk_width >= cm.max_seq_len // self.compress_ratio
-        assert active_topk_width % _C128A_TOPK_ALIGNMENT == 0
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
         global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
             cm.positions[:num_total],
@@ -273,6 +288,14 @@ class DeepseekV4SparseMLAMetadataBuilder(
                 num_decode_tokens, 1, -1
             )
             result["c128a_decode_topk_lens"] = decode_lens
+            # Mirror the SWA builder (which zeroes decode_swa_lens beyond the
+            # real token count): stale non-zero lens on FULL-graph padding rows
+            # would make the packed CSR and K-split/fused attention process
+            # stale index rows for padding. The padding output is masked, but
+            # the extra work keeps the buffers dirty across steps.
+            zero_decode_padding_rows(
+                (self.c128a_decode_lens_buffer,), num_decode_tokens
+            )
         if num_prefill_tokens > 0:
             result["c128a_prefill_topk_indices"] = prefill_local
         return result
@@ -310,30 +333,19 @@ def build_c128a_topk_metadata(
     Decode tokens: position → block_table lookup → global slot ids + topk_lens.
     Prefill tokens: position → local indices [0, ..., n-1, -1, ...].
 
-    Writes into pre-allocated buffers for CUDA graph address stability.
-    Returns views of the buffers.
+    Writes into packed views of pre-allocated buffers for CUDA graph stability.
     """
     num_tokens = positions.shape[0]
     num_prefill_tokens = num_tokens - num_decode_tokens
-    assert max_compressed_tokens % _C128A_TOPK_ALIGNMENT == 0
-    assert (
-        0
-        < max_compressed_tokens
-        <= min(global_decode_buffer.shape[1], prefill_buffer.shape[1])
-    )
-    assert global_decode_buffer.stride(-1) == prefill_buffer.stride(-1) == 1
 
-    # TODO: support adaptive-width decode on SM120 (needs the FlashInfer
-    # SM120 kernel to accept a real row stride for eidx).
-    capability = current_platform.get_device_capability()
-    if capability is not None and capability.major == 12:
-        global_decode = global_decode_buffer[:num_decode_tokens]
-    else:
-        global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
+    # Rows use the pre-allocated buffer's full stride (not the active width),
+    # so the returned views keep a constant row stride across runtime width
+    # changes. A CUDA graph bakes the capture-time stride; if the runtime
+    # metadata were tight-packed with the active width, a replay at a smaller
+    # width would read rows with the baked stride and see wrong indices.
+    global_decode = global_decode_buffer[:num_decode_tokens, :max_compressed_tokens]
     decode_lens = decode_lens_buffer[:num_decode_tokens]
     prefill_local = prefill_buffer[:num_prefill_tokens, :max_compressed_tokens]
-    assert global_decode.stride(0) == global_decode_buffer.stride(0)
-    assert prefill_local.stride(0) == prefill_buffer.stride(0)
 
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
