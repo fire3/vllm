@@ -57,19 +57,35 @@ _KSPLIT_MAX_T = 64
 # demand, so evicting them is safe.
 _MAX_SCRATCH_ENTRIES = 64
 
-# Per-process capture-session counter: every CUDA graph capture gets a unique
-# token so scratch buffers are keyed per graph instance. Eager execution
-# (token 0) never aliases any captured graph's scratch.
-_CAPTURE_SESSION = [0]
-_PREV_CAPTURING = [False]
+# Per-(device, stream) capture-session counter: every CUDA graph capture gets
+# a unique token so scratch buffers are keyed per graph instance. The counter
+# is scoped exactly like the scratch-cache keys below, so concurrent captures
+# on different devices/streams cannot share a session number and alias each
+# other's captured scratch. Eager execution (token 0) never aliases any
+# captured graph's scratch.
+#
+# The scratch caches themselves are only ever touched by the model runner's
+# single worker thread and captures are serialized per stream; keep that
+# assumption explicit so any future concurrency work re-scopes the dicts
+# together with this counter.
+_CAPTURE_SESSION: dict[tuple[int, int], int] = {}
+_PREV_CAPTURING: dict[tuple[int, int], bool] = {}
 
 
 def _capture_token() -> int:
     capturing = torch.cuda.is_current_stream_capturing()
-    if capturing and not _PREV_CAPTURING[0]:
-        _CAPTURE_SESSION[0] += 1
-    _PREV_CAPTURING[0] = capturing
-    return _CAPTURE_SESSION[0] if capturing else 0
+    stream = torch.cuda.current_stream()
+    key = (
+        stream.device.index if stream.device.index is not None else 0,
+        stream.cuda_stream,
+    )
+    if capturing:
+        if not _PREV_CAPTURING.get(key, False):
+            _CAPTURE_SESSION[key] = _CAPTURE_SESSION.get(key, 0) + 1
+        _PREV_CAPTURING[key] = True
+        return _CAPTURE_SESSION[key]
+    _PREV_CAPTURING[key] = False
+    return 0
 
 
 @triton.jit
@@ -976,7 +992,33 @@ def _tiled_sparse_prefill_kernel(
 def _paged_cache_views(
     kv_cache: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
-    """Flat fp8/uint8/bf16 views over a packed fp8_ds_mla cache slab view."""
+    """Flat fp8/uint8/bf16 views over a packed fp8_ds_mla cache slab view.
+
+    The fused kernel addresses cache pages in bytes: ``page_bytes`` is the
+    page stride and ``layer_off`` is the layer's storage offset, both fed
+    straight into byte arithmetic, and the RoPE bf16 slice is located with
+    ``(byte_off + NOPE_DIM) // 2``. Every page must therefore start at an
+    even byte offset, and the slab must be 1-byte-element backed, or the
+    ``//2`` lands inside a bf16 element and RoPE reads are silently shifted.
+    Assert the layout invariants here instead of relying on the current
+    packed layout happening to be even.
+    """
+    elem_size = kv_cache.element_size()
+    assert elem_size == 1, (
+        "TRITON sparse-MLA cache views are byte-addressed (page stride and "
+        "layer offset are consumed as byte offsets by the fused kernel); got "
+        f"element size {elem_size}."
+    )
+    assert (kv_cache.stride(0) * elem_size) % 2 == 0, (
+        "TRITON sparse-MLA KV slab page stride must be even in bytes for the "
+        f"RoPE bf16 slice lookup; got stride(0)={kv_cache.stride(0)} "
+        f"(elem_size={elem_size})."
+    )
+    assert (kv_cache.storage_offset() * elem_size) % 2 == 0, (
+        "TRITON sparse-MLA KV layer storage offset must be even in bytes for "
+        "the RoPE bf16 slice lookup; got "
+        f"storage_offset()={kv_cache.storage_offset()} (elem_size={elem_size})."
+    )
     storage_nbytes = kv_cache.untyped_storage().nbytes()
     raw_flat = kv_cache.as_strided((storage_nbytes,), (1,), storage_offset=0)
     raw_uint8 = raw_flat.view(torch.uint8)
