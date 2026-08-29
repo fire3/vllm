@@ -25,7 +25,10 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    split_decodes_and_prefills,
+    zero_decode_padding_rows,
+)
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -549,7 +552,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         )
         decode_swa_indices = self.decode_swa_indices
         if num_decode_tokens > 0:
-            self.decode_swa_lens[num_decode_tokens:] = 0
+            zero_decode_padding_rows((self.decode_swa_lens,), num_decode_tokens)
             if non_causal:
                 assert self.is_dspark, (
                     "Non-causal DeepseekV4 SWA is only supported for the DSpark "

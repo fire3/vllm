@@ -21,7 +21,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    split_decodes_and_prefills,
+    zero_decode_padding_rows,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
@@ -290,7 +293,9 @@ class DeepseekV4SparseMLAMetadataBuilder(
             # would make the packed CSR and K-split/fused attention process
             # stale index rows for padding. The padding output is masked, but
             # the extra work keeps the buffers dirty across steps.
-            self.c128a_decode_lens_buffer[num_decode_tokens:] = 0
+            zero_decode_padding_rows(
+                (self.c128a_decode_lens_buffer,), num_decode_tokens
+            )
         if num_prefill_tokens > 0:
             result["c128a_prefill_topk_indices"] = prefill_local
         return result

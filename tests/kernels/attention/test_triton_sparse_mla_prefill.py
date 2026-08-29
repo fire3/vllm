@@ -617,3 +617,93 @@ def test_triton_decode_vllm_tiled_matches_reference():
         atol=3e-2,
         rtol=3e-2,
     )
+
+
+def test_stale_padding_lens_are_masked_by_consumer():
+    """Stale lens on padding rows must not leak into output.
+
+    FULL decode graphs replay a fixed captured row prefix, so rows beyond the
+    runtime token count can carry stale lens values if a metadata builder
+    forgot its tail zeroing. The consumer side (pack lens clamp + PAD slot
+    mask) must keep such rows from producing non-zero output, and the pack
+    clamp must bound a stale oversized lens to the row capacity.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda")
+    T, W, E = 8, 128, 128
+    (
+        q,
+        sinks,
+        main_cache,
+        main_nope,
+        main_rope,
+        swa_indices,
+        swa_lens,
+        extra_cache,
+        extra_nope,
+        extra_rope,
+        extra_indices,
+        extra_lens,
+    ) = _make_prefill_inputs(device, T=T, H=16, W=W, E=E)
+    _, H, _ = q.shape
+    softmax_scale = _D ** -0.5
+
+    # Simulate a producer that forgot to zero the decode tail: rows past the
+    # real token count keep a stale, oversized lens (clamped by the pack to
+    # the row capacity) and PAD slots (-1), which the fused kernel masks.
+    num_real = 1
+    stale_swa_lens = swa_lens.clone()
+    stale_swa_lens[num_real:] = 4096
+    stale_swa_indices = swa_indices.clone()
+    stale_swa_indices[num_real:] = -1
+    stale_extra_lens = extra_lens.clone()
+    stale_extra_lens[num_real:] = 4096
+    stale_extra_indices = extra_indices.clone()
+    stale_extra_indices[num_real:] = -1
+
+    out = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
+    attn = _make_attn(sinks, softmax_scale)
+    attn._launch_sparse_mla_prefill(
+        q=q,
+        swa_kv_cache=main_cache,
+        swa_indices=stale_swa_indices.unsqueeze(1),
+        swa_lens=stale_swa_lens,
+        extra_kv_cache=extra_cache,
+        extra_indices=stale_extra_indices,
+        extra_lens=stale_extra_lens,
+        out=out,
+    )
+
+    # Padding rows must produce zero output even with stale positive lens.
+    assert torch.equal(out[num_real:], torch.zeros_like(out[num_real:])), (
+        "stale padding lens leaked into output"
+    )
+
+    # The valid row must still match the reference computed from its own lens.
+    ref = _reference_prefill(
+        q[:num_real],
+        sinks,
+        main_nope,
+        main_rope,
+        swa_indices[:num_real],
+        swa_lens[:num_real],
+        extra_nope,
+        extra_rope,
+        extra_indices[:num_real],
+        extra_lens[:num_real],
+        softmax_scale,
+    )
+    torch.testing.assert_close(
+        out[:num_real].float(),
+        ref.float(),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+    # The pack clamp must bound the stale oversized lens to the row capacity.
+    flat, indptr = _pack_sparse_rows(
+        stale_swa_indices.unsqueeze(1), stale_swa_lens, slot=0
+    )
+    deltas = indptr[1:] - indptr[:-1]
+    assert bool((deltas <= W).all()), "stale lens not clamped to row capacity"

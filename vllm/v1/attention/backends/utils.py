@@ -46,6 +46,27 @@ PAD_SLOT_ID = -1
 NULL_BLOCK_ID = 0
 
 
+def zero_decode_padding_rows(
+    buffers: tuple[torch.Tensor, ...],
+    num_decode_tokens: int,
+) -> None:
+    """Zero per-row decode metadata beyond the active token prefix.
+
+    FULL CUDA graphs capture a fixed decode row count and replay reads the
+    whole captured prefix (no Python runs at replay), so rows between the
+    runtime ``num_decode_tokens`` and the captured count must never retain a
+    stale valid length from an earlier step. Every metadata builder that feeds
+    such row buffers must call this once after refreshing the active prefix;
+    keeping the tail-zeroing in one place prevents a future builder from
+    relying on the consumer-side clamp alone and silently leaving dirty
+    padding rows in the captured buffers.
+    """
+    if num_decode_tokens <= 0:
+        return
+    for buf in buffers:
+        buf[num_decode_tokens:].zero_()
+
+
 def compute_mm_prefix_range_tensor(
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None,
     num_seqs: int,
