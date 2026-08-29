@@ -17,8 +17,13 @@ from typing import ClassVar
 
 import torch
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
@@ -110,6 +115,45 @@ class DeepseekV4TritonMLAAttention(DeepseekV4FlashInferSM120Attention):
     ) -> None:
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
+
+        # The decode/prefill token split is baked into FULL CUDA graphs at
+        # capture time (no Python runs on replay), so the kernel boundary must
+        # fail loudly if the slice no longer matches the metadata, or if a
+        # mixed/non-uniform batch is ever captured into a FULL graph -- the
+        # replay would otherwise silently mis-assign tokens to decode rows.
+        assert q.shape[0] == num_decode_tokens, (
+            "TRITON_MLA_SPARSE_DSV4 decode slice mismatch: q has "
+            f"{q.shape[0]} rows but metadata reports {num_decode_tokens} "
+            "decode tokens; a mixed batch was routed into the decode path."
+        )
+        if (
+            torch.cuda.is_current_stream_capturing()
+            and is_forward_context_available()
+        ):
+            forward_context = get_forward_context()
+            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE:
+                # FULL-graph capture: the captured graph can only be replayed
+                # against the same pure, uniform decode batch. Reject anything
+                # else at capture time instead of mis-slicing on replay.
+                assert swa_metadata.num_prefills == 0, (
+                    "TRITON_MLA_SPARSE_DSV4 FULL-graph capture requires a pure "
+                    "decode batch, but metadata contains "
+                    f"{swa_metadata.num_prefills} prefill rows."
+                )
+                # Per-request query lengths are bounded by
+                # max_decode_query_len; a decode token count above the bound
+                # means the split accounting drifted from the batch shape.
+                # (Uniform decode satisfies the bound with equality; varlen
+                # decode is allowed to be below it.)
+                max_decode_tokens = (
+                    num_decodes * swa_metadata.max_decode_query_len
+                )
+                assert num_decode_tokens <= max_decode_tokens, (
+                    "TRITON_MLA_SPARSE_DSV4 FULL-graph capture decode token "
+                    f"count {num_decode_tokens} exceeds the batch bound "
+                    f"{max_decode_tokens} (num_decodes={num_decodes}, "
+                    f"max_decode_query_len={swa_metadata.max_decode_query_len})."
+                )
 
         extra_sparse_indices = None
         extra_sparse_lengths = None
