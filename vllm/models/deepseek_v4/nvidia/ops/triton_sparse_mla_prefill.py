@@ -92,10 +92,12 @@ def _tiled_sparse_prefill_ksplit_kernel(
     swa_page_bytes: tl.int64,
     swa_layer_off: tl.int64,
     swa_scale_off: tl.int64,
+    swa_num_slots: tl.int32,
     extra_page_size: tl.int32,
     extra_page_bytes: tl.int64,
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
+    extra_num_slots: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -165,10 +167,12 @@ def _tiled_sparse_prefill_ksplit_kernel(
             swa_page_bytes,
             swa_layer_off,
             swa_scale_off,
+            swa_num_slots,
             extra_page_size,
             extra_page_bytes,
             extra_layer_off,
             extra_scale_off,
+            extra_num_slots,
             H,
             stride_qb,
             stride_qh,
@@ -214,10 +218,12 @@ def _ksplit_chunk_body(
     swa_page_bytes: tl.int64,
     swa_layer_off: tl.int64,
     swa_scale_off: tl.int64,
+    swa_num_slots: tl.int32,
     extra_page_size: tl.int32,
     extra_page_bytes: tl.int64,
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
+    extra_num_slots: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -307,6 +313,7 @@ def _ksplit_chunk_body(
     page_bytes = tl.where(is_extra, extra_page_bytes, swa_page_bytes)
     layer_off = tl.where(is_extra, extra_layer_off, swa_layer_off)
     scale_off = tl.where(is_extra, extra_scale_off, swa_scale_off)
+    num_slots = tl.where(is_extra, extra_num_slots, swa_num_slots)
     start = tl.where(is_extra, extra_start, swa_start)
     end = tl.where(is_extra, extra_end, swa_end)
     chunk_idx = pid_chunk - tl.where(is_extra, swa_chunks, 0)
@@ -319,8 +326,8 @@ def _ksplit_chunk_body(
         pos = k_start + k_offs
         in_range = pos < k_end
         slot = tl.load(idx_p + start + pos, mask=in_range, other=-1)
-        valid = in_range & (slot >= 0)
-        safe_slot = tl.maximum(slot, 0)
+        valid = in_range & (slot >= 0) & (slot < num_slots)
+        safe_slot = tl.minimum(tl.maximum(slot, 0), num_slots - 1)
         page_ids = (safe_slot // page_size).to(tl.int64)
         page_offs = (safe_slot % page_size).to(tl.int64)
         data_base = (
@@ -656,10 +663,12 @@ def _tiled_sparse_prefill_kernel(
     swa_page_bytes: tl.int64,
     swa_layer_off: tl.int64,
     swa_scale_off: tl.int64,
+    swa_num_slots: tl.int32,
     extra_page_size: tl.int32,
     extra_page_bytes: tl.int64,
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
+    extra_num_slots: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -756,6 +765,7 @@ def _tiled_sparse_prefill_kernel(
             page_bytes = swa_page_bytes
             layer_off = swa_layer_off
             scale_off = swa_scale_off
+            num_slots = swa_num_slots
         else:
             fp8_p = extra_cache_fp8_ptr
             uint8_p = extra_cache_uint8_ptr
@@ -766,6 +776,7 @@ def _tiled_sparse_prefill_kernel(
             page_bytes = extra_page_bytes
             layer_off = extra_layer_off
             scale_off = extra_scale_off
+            num_slots = extra_num_slots
 
         if src == 0 or HAS_EXTRA:
             start = tl.load(indptr_p + t)
@@ -776,8 +787,8 @@ def _tiled_sparse_prefill_kernel(
                 pos = k_start + k_offs
                 in_range = pos < length
                 slot = tl.load(idx_p + start + pos, mask=in_range, other=-1)
-                valid = in_range & (slot >= 0)
-                safe_slot = tl.maximum(slot, 0)
+                valid = in_range & (slot >= 0) & (slot < num_slots)
+                safe_slot = tl.minimum(tl.maximum(slot, 0), num_slots - 1)
                 page_ids = (safe_slot // page_size).to(tl.int64)
                 page_offs = (safe_slot % page_size).to(tl.int64)
                 data_base = (
@@ -1122,6 +1133,7 @@ def triton_sparse_mla_prefill_vllm(
         swa_page_size,
         swa_page_bytes,
     ) = _paged_cache_views(swa_kv_cache)
+    swa_num_slots = swa_kv_cache.shape[0] * swa_page_size
     swa_flat, swa_indptr = _pack_sparse_rows(swa_indices, swa_lens, slot=0)
 
     has_extra = extra_kv_cache is not None
@@ -1138,6 +1150,7 @@ def triton_sparse_mla_prefill_vllm(
         extra_flat, extra_indptr = _pack_sparse_rows(
             extra_indices, extra_lens, slot=1
         )
+        extra_num_slots = extra_kv_cache.shape[0] * extra_page_size
     else:
         empty_u8 = torch.empty(0, dtype=torch.uint8, device=q.device)
         empty_fp8 = torch.empty(0, dtype=torch.float8_e4m3fn, device=q.device)
@@ -1151,6 +1164,7 @@ def triton_sparse_mla_prefill_vllm(
         extra_page_bytes = 0
         extra_flat = empty_i32
         extra_indptr = empty_i32
+        extra_num_slots = 0
 
     swa_scale_off = swa_page_size * _TOKEN_DATA_STRIDE
     extra_scale_off = extra_page_size * _TOKEN_DATA_STRIDE
@@ -1176,10 +1190,12 @@ def triton_sparse_mla_prefill_vllm(
         swa_page_bytes=int(swa_page_bytes),
         swa_layer_off=int(swa_layer_off),
         swa_scale_off=int(swa_scale_off),
+        swa_num_slots=swa_num_slots,
         extra_page_size=extra_page_size,
         extra_page_bytes=int(extra_page_bytes),
         extra_layer_off=int(extra_layer_off),
         extra_scale_off=int(extra_scale_off),
+        extra_num_slots=extra_num_slots,
         H=H,
         stride_qb=q.stride(0),
         stride_qh=q.stride(1),
@@ -1237,10 +1253,12 @@ def triton_sparse_mla_prefill_vllm(
             swa_page_bytes=int(swa_page_bytes),
             swa_layer_off=int(swa_layer_off),
             swa_scale_off=int(swa_scale_off),
+            swa_num_slots=swa_num_slots,
             extra_page_size=extra_page_size,
             extra_page_bytes=int(extra_page_bytes),
             extra_layer_off=int(extra_layer_off),
             extra_scale_off=int(extra_scale_off),
+            extra_num_slots=extra_num_slots,
             H=H,
             stride_qb=q.stride(0),
             stride_qh=q.stride(1),
