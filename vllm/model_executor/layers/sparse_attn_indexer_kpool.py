@@ -22,7 +22,7 @@ elif current_platform.is_rocm():
 else:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 
-from vllm.utils.deep_gemm import has_deep_gemm
+from vllm.utils.deep_gemm import _sparse_indexer_triton_fallback_enabled, has_deep_gemm
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -810,6 +810,11 @@ def sparse_attn_indexer_kpool(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
                 clean_logits=False,
+                # Host-side bound from the metadata build (no D2H sync), so
+                # the Triton fallback can size its dense logits buffer during
+                # CUDA graph capture. Token-granular max_seq_len is an upper
+                # bound on the pool-granular context_lens the kernel consumes.
+                max_context_len=attn_metadata_narrowed.max_seq_len,
             )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
@@ -974,9 +979,15 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and not _sparse_indexer_triton_fallback_enabled()
+        ):
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+                "Sparse Attention Indexer CUDA op requires DeepGEMM to be "
+                "installed (or set VLLM_ENABLE_SPARSE_INDEXER_TRITON_FALLBACK=1 "
+                "to use the Triton MQA-logits fallback)."
             )
 
     def forward_native(

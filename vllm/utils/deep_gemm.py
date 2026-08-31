@@ -51,6 +51,25 @@ def should_auto_disable_deep_gemm(model_type: str | None) -> bool:
     return model_type in _DEEPGEMM_BLACKWELL_EXCLUDED_MODEL_TYPES
 
 
+def _sparse_indexer_triton_fallback_enabled() -> bool:
+    """Whether the sparse-attention indexer may run its Triton MQA-logits
+    fallback instead of the DeepGEMM kernels.
+
+    The Triton fallback (``vllm.v1.attention.ops.triton_fp8_mqa_logits``)
+    implements the same per-token top-k logits semantics on platforms where
+    DeepGEMM is not available (SM89 / Ada). It is also available on any
+    platform via ``VLLM_ENABLE_SPARSE_INDEXER_TRITON_FALLBACK=1``, which is
+    mainly useful for debugging and for CPU-only environments that exercise
+    the sparse indexer's metadata path.
+    """
+    if envs.VLLM_ENABLE_SPARSE_INDEXER_TRITON_FALLBACK:
+        return True
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(89)
+    )
+
+
 class DeepGemmQuantScaleFMT(Enum):
     # Float32 scales in Float32 tensor
     FLOAT32 = 0
@@ -546,6 +565,21 @@ def fp8_fp4_mqa_logits(
     """
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
+        if _sparse_indexer_triton_fallback_enabled():
+            from vllm.v1.attention.ops.triton_fp8_mqa_logits import (
+                fp8_mqa_logits_triton,
+            )
+
+            q_values, _ = q
+            k_values, k_scales = kv
+            return fp8_mqa_logits_triton(
+                q_values,
+                k_values,
+                k_scales,
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+            )
         return _missing()
     return _fp8_fp4_mqa_logits_impl(
         q,
@@ -620,6 +654,7 @@ def fp8_fp4_paged_mqa_logits(
     max_model_len: int,
     clean_logits: bool,
     indices: torch.Tensor | None = None,
+    max_context_len: int | None = None,
 ) -> torch.Tensor:
     """Compute MQA logits using a paged KV-cache.
 
@@ -645,6 +680,11 @@ def fp8_fp4_paged_mqa_logits(
         max_model_len: Maximum sequence length used to size the logits output.
         clean_logits: Whether to clean the unfilled logits into `-inf`.
         indices: Optional request index for each varlen row.
+        max_context_len: Optional host-side upper bound on the effective
+            context length (in the same units as ``context_lens``) used to
+            size/clip the dense logits buffer. Passing a trusted bound avoids
+            a device->host sync inside CUDA graph capture; when omitted the
+            Triton fallback derives it from the device tensor.
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -652,6 +692,21 @@ def fp8_fp4_paged_mqa_logits(
     """
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
+        if _sparse_indexer_triton_fallback_enabled():
+            from vllm.v1.attention.ops.triton_fp8_mqa_logits import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            q_values, _ = q
+            return fp8_paged_mqa_logits_triton(
+                q_values,
+                kv_cache,
+                weights,
+                context_lens,
+                block_tables,
+                max_model_len,
+                max_context_len=max_context_len,
+            )
         return _missing()
     # DeepGEMM asserts block_tables.stride(-1)==1. A trailing size-1 dim
     # (e.g. block_table shape [B,1] for short seqs under a large block_size)

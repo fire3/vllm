@@ -138,6 +138,17 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASH_ATTN_MLA_SPARSE,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
+            if (
+                device_capability.major == 8
+                and device_capability.minor == 9
+                and head_size == 512
+            ):
+                # SM89/Ada (L40S etc.): the FlashInfer/FlashMLA sparse
+                # backends require SM90+, so the Triton top-k sparse MLA
+                # backend is the only candidate once non-sparse backends are
+                # rejected for use_sparse. Head size 512 = GLM-5.3-Flash NoPE
+                # (kv_lora_rank=512, qk_rope_head_dim=0).
+                sparse_tail.insert(0, AttentionBackendEnum.TRITON_MLA_SPARSE_SM89)
             flashinfer_sparse = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90
             if head_size == 512:
                 sparse_tail.insert(0, flashinfer_sparse)

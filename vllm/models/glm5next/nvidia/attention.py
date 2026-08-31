@@ -132,16 +132,29 @@ class Glm5NextIndexerCache(DeepseekV32IndexerCache):
         # DeepGEMM paged-MQA takes block_kv in {32, 64}; the storage block
         # (= block_size // index_kpool) is virtually split into pool pages of
         # the largest such size that tiles it, so it must be a multiple of 32.
+        # On SM89 (Triton MQA-logits fallback) the paged kernel reads the
+        # block table directly and only needs pool-aligned storage blocks.
         storage_block_size = spec.block_size // self._index_kpool
-        assert (
-            spec.block_size % self._index_kpool == 0 and storage_block_size % 32 == 0
-        ), (
-            "Glm5NextIndexerCache: kpool indexer requires cache block_size to "
-            f"be a multiple of index_kpool * 32 ({self._index_kpool * 32}) so "
-            "that DeepGEMM paged-MQA pool pages (32 or 64 entries) tile the "
-            f"storage block, got block_size={spec.block_size} -> "
-            f"storage_block_size={storage_block_size}."
-        )
+        from vllm.utils.deep_gemm import _sparse_indexer_triton_fallback_enabled
+
+        if _sparse_indexer_triton_fallback_enabled():
+            assert spec.block_size % self._index_kpool == 0, (
+                "Glm5NextIndexerCache: kpool indexer requires cache "
+                "block_size to be a multiple of index_kpool "
+                f"({self._index_kpool}), got block_size={spec.block_size}."
+            )
+        else:
+            assert (
+                spec.block_size % self._index_kpool == 0
+                and storage_block_size % 32 == 0
+            ), (
+                "Glm5NextIndexerCache: kpool indexer requires cache block_size "
+                "to be a multiple of index_kpool * 32 "
+                f"({self._index_kpool * 32}) so that DeepGEMM paged-MQA pool "
+                f"pages (32 or 64 entries) tile the storage block, got "
+                f"block_size={spec.block_size} -> "
+                f"storage_block_size={storage_block_size}."
+            )
         max_page_size = max(PAGED_MQA_PAGE_SIZES)
         min_page_size = min(PAGED_MQA_PAGE_SIZES)
         if storage_block_size <= max_page_size:
