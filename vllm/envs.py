@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_ENABLE_SPARSE_INDEXER_TRITON_FALLBACK: bool = False
+    VLLM_SPARSE_INDEXER_WORKSPACE_TOKENS: int = 0
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -1081,6 +1082,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM89/Ada where DeepGEMM cannot run).
     "VLLM_ENABLE_SPARSE_INDEXER_TRITON_FALLBACK": lambda: bool(
         int(os.getenv("VLLM_ENABLE_SPARSE_INDEXER_TRITON_FALLBACK", "0"))
+    ),
+    # Override for the sparse-indexer prefill K-gather workspace size (in
+    # tokens). Default 0 keeps the historical max_model_len * 40 heuristic;
+    # long-context (256K) GLM-5.3-Flash deployments set it to max_model_len
+    # to save ~1.3 GiB/GPU of fixed workspace memory.
+    "VLLM_SPARSE_INDEXER_WORKSPACE_TOKENS": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_WORKSPACE_TOKENS", "0")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

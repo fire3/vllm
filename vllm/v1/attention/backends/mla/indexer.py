@@ -514,6 +514,11 @@ def compute_kpool_tail_slot_mapping(
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
     out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    # Padded rows beyond the actual tokens keep whatever the reused buffer
+    # held before (stale slots from a previous larger batch). The kpool
+    # indexer's tail-seed kernel indexes the tail cache with these slots, so
+    # stale garbage there faults the GPU; mask them out explicitly.
+    out[num_actual_tokens:].fill_(-1)
     return out
 
 
@@ -566,7 +571,15 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+    import vllm.envs as envs
+
     max_model_len = vllm_config.model_config.max_model_len
+    override = envs.VLLM_SPARSE_INDEXER_WORKSPACE_TOKENS
+    if override > 0:
+        # The workspace holds one chunk's gathered K at a time; a single
+        # request's full context (up to max_model_len) must fit, so never go
+        # below max_model_len.
+        return max(override, max_model_len)
     # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
     # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.

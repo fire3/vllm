@@ -12,6 +12,8 @@ helpers (select pools -> expand to tokens -> append tail).
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -378,6 +380,7 @@ def _kpool_tail_seed_kernel(
     HEAD_DIM: tl.constexpr,
     KPOOL: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
 ):
     """Copy token ``i``'s raw K + gate into its request's tail block.
 
@@ -391,6 +394,9 @@ def _kpool_tail_seed_kernel(
     if t < 0:
         return
     blk = t // KPOOL  # t >= 0 here, so trunc == floor
+    # Clamp a stale/out-of-range tail slot so it cannot fault the cache; the
+    # Python caller logs the mismatch (VLLM_DEBUG_TAIL_SLOTS) when it happens.
+    blk = tl.minimum(blk, NUM_BLOCKS - 1)
     ahead = tl.load(tslot_ptr + i + KPOOL, mask=i + KPOOL < n_tokens, other=-1).to(
         tl.int64
     )
@@ -422,6 +428,21 @@ def kpool_seed_tail_cache(
     n = tslot.shape[0]
     if n == 0:
         return
+    if os.environ.get("VLLM_DEBUG_TAIL_SLOTS"):
+        import torch as _torch
+
+        nblocks = tail_kv_cache.shape[0]
+        mt = int(tslot.max().item()) if tslot.numel() else -1
+        bad = mt // kpool >= nblocks
+        print(
+            f"[kpool_seed_tail_cache] n={n} kpool={kpool} tail_blocks={nblocks} "
+            f"tail_shape={tuple(tail_kv_cache.shape)} max_tslot={mt} "
+            f"max_blk={mt // kpool if mt >= 0 else -1} OOB={bad}",
+            flush=True,
+        )
+    # Defensive: clamp the derived block id to the tail cache's block count so
+    # an out-of-range slot cannot fault the GPU (debug output above reports it).
+    num_blocks = tail_kv_cache.shape[0]
     _kpool_tail_seed_kernel[(n,)](
         key,
         gate_score,
@@ -431,6 +452,7 @@ def kpool_seed_tail_cache(
         HEAD_DIM=head_dim,
         KPOOL=kpool,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        NUM_BLOCKS=num_blocks,
     )
 
 

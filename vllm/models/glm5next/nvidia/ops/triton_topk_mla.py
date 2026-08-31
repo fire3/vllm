@@ -38,6 +38,7 @@ def _triton_topk_mla_kernel(
     sm_scale,  # fp32
     kv_scale,  # fp32 (1.0 for bf16 caches)
     H,  # runtime head count (may be smaller than BLOCK_H on TP8)
+    num_rows,  # runtime row count of the flat KV view
     stride_qb: tl.int64,
     stride_qh: tl.int64,
     stride_ob: tl.int64,
@@ -123,8 +124,12 @@ def _triton_topk_mla_kernel(
         kmask = pos < valid_len
         idx = tl.load(IDX_ptr + t * NUM_TOPK + pos, mask=kmask, other=-1)
         valid = kmask & (idx >= 0)
-        # Clamp masked tails to a legal slot; scores/values are masked off.
-        safe_idx = tl.where(valid, idx, 0)
+        # Clamp masked tails and any out-of-range slot to a legal address;
+        # scores/values are masked off for invalid lanes, so the clamped
+        # index is never dereferenced for them.
+        safe_idx = tl.maximum(
+            tl.minimum(tl.where(valid, idx, 0), num_rows - 1), 0
+        )
         kbase = KV_ptr + safe_idx[:, None] * (NGROUPS * GROUP_DIM)
 
         kv0 = tl.load(
@@ -297,6 +302,7 @@ def triton_topk_mla_forward(
         sm_scale=sm_scale,
         kv_scale=kv_scale,
         H=H,
+        num_rows=num_rows,
         stride_qb=q.stride(0),
         stride_qh=q.stride(1),
         stride_ob=out.stride(0),
