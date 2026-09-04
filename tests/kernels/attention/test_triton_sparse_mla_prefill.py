@@ -707,3 +707,179 @@ def test_stale_padding_lens_are_masked_by_consumer():
     )
     deltas = indptr[1:] - indptr[:-1]
     assert bool((deltas <= W).all()), "stale lens not clamped to row capacity"
+
+
+def test_shared_partial_buffer_reuse_does_not_leak_stale_chunks():
+    """Reused eager partial buffers must never leak previously written chunks.
+
+    Eager K-split calls now share one grow-only [64, S, H, D] partial buffer
+    across every row count T instead of allocating a fresh slab per T. A
+    padding row whose metadata still carries a stale positive lens (PAD slots
+    only, so the chunk CTA computes no data) must not pick up finite LSE /
+    partial output left by an earlier call that used the same buffer slots.
+    The consumer-side mask relies on every chunk slot the merge can read
+    having been (re)written this step, so this is a two-call regression test:
+    the first call dirties the shared slots with real data, the second call
+    replays the stale-padding scenario over the same buffer.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda")
+    T, W, E = 8, 128, 128
+    (
+        q,
+        sinks,
+        main_cache,
+        main_nope,
+        main_rope,
+        swa_indices,
+        swa_lens,
+        extra_cache,
+        extra_nope,
+        extra_rope,
+        extra_indices,
+        extra_lens,
+    ) = _make_prefill_inputs(device, T=T, H=16, W=W, E=E)
+    _, H, _ = q.shape
+    softmax_scale = _D ** -0.5
+    attn = _make_attn(sinks, softmax_scale)
+
+    # First call: all rows valid. This writes finite LSE / partial output into
+    # the shared buffer slots that the second call will (incorrectly, per its
+    # stale metadata) still believe belong to padding rows.
+    out_first = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
+    attn._launch_sparse_mla_prefill(
+        q=q,
+        swa_kv_cache=main_cache,
+        swa_indices=swa_indices.unsqueeze(1),
+        swa_lens=swa_lens,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+        out=out_first,
+    )
+
+    # Second call over the same eager buffer: rows beyond num_real are stale
+    # padding (PAD slots + oversized lens) and must produce zero output.
+    num_real = 1
+    stale_swa_lens = swa_lens.clone()
+    stale_swa_lens[num_real:] = 4096
+    stale_swa_indices = swa_indices.clone()
+    stale_swa_indices[num_real:] = -1
+    stale_extra_lens = extra_lens.clone()
+    stale_extra_lens[num_real:] = 4096
+    stale_extra_indices = extra_indices.clone()
+    stale_extra_indices[num_real:] = -1
+
+    out = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
+    attn._launch_sparse_mla_prefill(
+        q=q,
+        swa_kv_cache=main_cache,
+        swa_indices=stale_swa_indices.unsqueeze(1),
+        swa_lens=stale_swa_lens,
+        extra_kv_cache=extra_cache,
+        extra_indices=stale_extra_indices,
+        extra_lens=stale_extra_lens,
+        out=out,
+    )
+    assert torch.equal(out[num_real:], torch.zeros_like(out[num_real:])), (
+        "stale chunks from a previous call leaked through the shared partial "
+        "buffer"
+    )
+
+    ref = _reference_prefill(
+        q[:num_real],
+        sinks,
+        main_nope,
+        main_rope,
+        swa_indices[:num_real],
+        swa_lens[:num_real],
+        extra_nope,
+        extra_rope,
+        extra_indices[:num_real],
+        extra_lens[:num_real],
+        softmax_scale,
+    )
+    torch.testing.assert_close(
+        out[:num_real].float(),
+        ref.float(),
+        atol=3e-2,
+        rtol=3e-2,
+    )
+
+
+def test_ksplit_eager_scratch_converges_and_is_bounded():
+    """Eager K-split scratch must converge instead of stacking per-T slabs.
+
+    Before the cache-key convergence, visiting every decode row count 1..64
+    created 64 live [T, S, H, D] partial buffers whose sizes summed to ~1.1
+    GiB at S=68/H=8 (TP=8 rank) -- the source of sudden per-card reserved
+    growth during serving. The eager cache must instead hold one grow-only
+    slab per (S, H) and slice it down per call.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.deepseek_v4.nvidia.ops import (
+        triton_sparse_mla_prefill as _mod,
+    )
+
+    device = torch.device("cuda")
+    S, H = 68, 8
+    cache = _mod._KSPLIT_PARTIAL_BUFFERS
+    cache.clear()
+    try:
+        reserved_before = torch.cuda.memory_reserved()
+        for T in range(1, 65):
+            out, lse = _mod._get_ksplit_partial_buffers(T, S, H, device)
+            assert out.shape == (T, S, H, _D)
+            assert lse.shape == (T, S, H)
+        eager_keys = [key for key in cache if key[-1] == 0]
+        assert len(eager_keys) == 1, (
+            f"expected one shared eager entry, found {len(eager_keys)}"
+        )
+        out_base, lse_base = cache[eager_keys[0]]
+        assert out_base.shape[0] == _mod._KSPLIT_MAX_T, (
+            "eager partial buffer should be sized to the K-split capacity"
+        )
+        held_bytes = (
+            out_base.numel() * out_base.element_size()
+            + lse_base.numel() * lse_base.element_size()
+        )
+        grown = torch.cuda.memory_reserved() - reserved_before
+        assert grown <= held_bytes + (16 << 20), (
+            "eager scratch reserved far more than one capacity-bounded slab: "
+            f"grown={grown}, held={held_bytes}"
+        )
+    finally:
+        cache.clear()
+        torch.cuda.empty_cache()
+
+
+def test_csr_eager_scratch_converges_per_slot():
+    """Eager CSR flat buffers must converge per slot instead of per capacity."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.deepseek_v4.nvidia.ops import (
+        triton_sparse_mla_prefill as _mod,
+    )
+
+    device = torch.device("cuda")
+    cache = _mod._CSR_FLAT_BUFFERS
+    cache.clear()
+    try:
+        requested = []
+        for T in range(1, 65):
+            capacity = T * 2048
+            requested.append(capacity)
+            buf = _mod._get_csr_flat_buffer(capacity, device, slot=1)
+            assert buf.numel() == capacity
+        eager_keys = [key for key in cache if key[-1] == 0]
+        assert len(eager_keys) == 1, (
+            f"expected one shared eager CSR entry, found {len(eager_keys)}"
+        )
+        assert cache[eager_keys[0]].numel() == max(requested), (
+            "eager CSR buffer should hold the largest capacity requested"
+        )
+    finally:
+        cache.clear()
+        torch.cuda.empty_cache()
