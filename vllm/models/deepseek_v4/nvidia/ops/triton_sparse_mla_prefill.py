@@ -50,11 +50,11 @@ _KSPLIT_CHUNK = 32
 # across chunked-prefill sizes and OOMing at high GPU-memory utilization.
 _KSPLIT_MAX_T = 64
 
-# Bound the eager scratch caches so they cannot silently grow to gigabytes and
-# erode the GPU-memory headroom needed for transient peak allocations.
-# Captured-graph buffers (capture token != 0) are never evicted: their
-# addresses are baked into the CUDA graphs. Eager entries are recreated on
-# demand, so evicting them is safe.
+# Bound the number of scratch-cache entries so a pathological many-keys model
+# cannot silently grow the cache without limit. Captured-graph buffers
+# (capture token != 0) are never evicted: their addresses are baked into the
+# CUDA graphs. Eager entries are recreated on demand, so evicting them is
+# safe.
 _MAX_SCRATCH_ENTRIES = 64
 
 # Per-(device, stream) capture-session counter: every CUDA graph capture gets
@@ -511,7 +511,13 @@ def _ksplit_chunk_body(
     tl.store(
         partial_lse_ptr + t * stride_lt + pid_chunk * stride_ls + h_offs,
         lse,
-        mask=h_mask & has_data,
+        # Store unconditionally (per head) whenever this chunk CTA runs: the
+        # merge only reads chunk slots whose CTA ran, and a no-data chunk must
+        # land -inf here rather than leave whatever a previous step wrote in a
+        # shared/reused partial buffer. A stale finite LSE from an earlier
+        # call would otherwise give the chunk real weight in the merge and
+        # leak stale partial output into the result.
+        mask=h_mask,
     )
 
 
@@ -1050,7 +1056,7 @@ def _evict_eager_scratch(cache: dict) -> None:
 def _get_csr_flat_buffer(
     capacity: int, device: torch.device, slot: int = 0
 ) -> torch.Tensor:
-    """Reusable max-capacity flat index buffer (no per-call allocation).
+    """Reusable flat CSR index buffer (no per-call allocation).
 
     ``slot`` keeps the swa and extra CSR packs from aliasing the same buffer
     when both sources have the same capacity; otherwise the second pack would
@@ -1058,20 +1064,37 @@ def _get_csr_flat_buffer(
     The key also includes the current CUDA stream so concurrent calls on
     different streams cannot race on one buffer (a pack on stream A would
     otherwise be overwritten by stream B before A's fused kernel reads it).
+
+    Eager calls (capture token 0) share one grow-only buffer per
+    (device, slot, stream) instead of one buffer per distinct ``capacity``.
+    Decode/chunked-prefill row counts vary over time, and a per-capacity cache
+    silently reserves a fresh slab for every batch size ever seen -- dozens of
+    entries whose sizes sum far beyond the active request -- which shows up as
+    sudden ``memory_reserved`` growth during serving and can OOM the GPU near
+    full KV-cache utilization. Callers only ever write the valid prefix of the
+    returned slice (bounded by the requested ``capacity``), so a shared
+    larger-capacity base buffer is safe. Captured-graph calls keep their
+    exact-capacity, per-graph-instance entry because those addresses are baked
+    into the CUDA graph and must stay tied to the graph's lifetime.
     """
     stream = torch.cuda.current_stream(device)
+    token = _capture_token()
     key = (
         device.index if device.index is not None else 0,
-        capacity,
+        capacity if token != 0 else 0,
         slot,
         stream.cuda_stream,
-        _capture_token(),
+        token,
     )
     buf = _CSR_FLAT_BUFFERS.get(key)
-    if buf is None:
-        buf = torch.empty(capacity, dtype=torch.int32, device=device)
-        _CSR_FLAT_BUFFERS[key] = buf
-        _evict_eager_scratch(_CSR_FLAT_BUFFERS)
+    if buf is not None and buf.numel() >= capacity:
+        return buf[:capacity]
+    # Grow-only eager entries: keep the largest capacity ever requested for
+    # this (device, slot, stream) and slice down per call. Captured entries
+    # are exact-capacity misses, so they always take this branch too.
+    buf = torch.empty(capacity, dtype=torch.int32, device=device)
+    _CSR_FLAT_BUFFERS[key] = buf
+    _evict_eager_scratch(_CSR_FLAT_BUFFERS)
     return buf
 
 
@@ -1121,33 +1144,51 @@ def _get_ksplit_partial_buffers(
     H: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Static [T, S, H, D] partial buffers for the K-split path."""
+    """Static [T, S, H, D] partial buffers for the K-split path.
+
+    Eager calls (capture token 0) converge on one grow-only buffer per
+    (device, S, H, stream) and return an [:T] slice. Without the convergence,
+    every distinct decode/chunked-prefill row count ``T`` in 1..64 allocated
+    its own [T, S, H, D] slab, so a server that sees many batch sizes over
+    time reserved up to ``sum(1..64)`` rows of scratch (~1.1 GiB at S=68,
+    H=8 on a TP=8 rank, and far more at lower TP) while never evicting enough
+    to matter. The K-split path only runs for T <= _KSPLIT_MAX_T, so the
+    eager cache is bounded by one full-capacity slab per (S, H).
+
+    Captured-graph calls keep exact [T, S, H, D] buffers keyed by the capture
+    session: their addresses are baked into the CUDA graphs, so they must not
+    be shared with eager execution or another graph instance whose lifetime
+    differs. Capture buckets already allocate exactly the bucket row count,
+    so this does not inflate graph memory.
+    """
     stream = torch.cuda.current_stream(device)
+    token = _capture_token()
     key = (
         device.index if device.index is not None else 0,
-        T,
+        T if token != 0 else 0,
         S,
         H,
         stream.cuda_stream,
-        _capture_token(),
+        token,
     )
     buf = _KSPLIT_PARTIAL_BUFFERS.get(key)
-    if buf is None:
-        d = _NOPE_DIM + _ROPE_DIM
-        partial_out = torch.zeros(
-            T, S, H, d, dtype=torch.bfloat16, device=device
-        )
-        # Initialize the LSE slab to -inf so a chunk that is ever (mistakenly)
-        # read outside the runtime write range contributes zero weight instead
-        # of stale finite logits. The merge masks by runtime CSR lengths, so
-        # this is belt-and-suspenders, but it makes a logic hole benign.
-        partial_lse = torch.full(
-            (T, S, H), float("-inf"), dtype=torch.float32, device=device
-        )
-        _KSPLIT_PARTIAL_BUFFERS[key] = (partial_out, partial_lse)
-        _evict_eager_scratch(_KSPLIT_PARTIAL_BUFFERS)
-        buf = (partial_out, partial_lse)
-    return buf
+    if buf is not None:
+        return buf[0][:T], buf[1][:T]
+    # Eager entries are shared across every decode row count, so allocate the
+    # full K-split capacity once instead of growing one slab per distinct T.
+    rows = T if token != 0 else max(T, _KSPLIT_MAX_T)
+    d = _NOPE_DIM + _ROPE_DIM
+    partial_out = torch.zeros(rows, S, H, d, dtype=torch.bfloat16, device=device)
+    # Initialize the LSE slab to -inf so a chunk that is ever (mistakenly)
+    # read outside the runtime write range contributes zero weight instead
+    # of stale finite logits. The merge masks by runtime CSR lengths, so
+    # this is belt-and-suspenders, but it makes a logic hole benign.
+    partial_lse = torch.full(
+        (rows, S, H), float("-inf"), dtype=torch.float32, device=device
+    )
+    _KSPLIT_PARTIAL_BUFFERS[key] = (partial_out, partial_lse)
+    _evict_eager_scratch(_KSPLIT_PARTIAL_BUFFERS)
+    return partial_out[:T], partial_lse[:T]
 
 
 def triton_sparse_mla_prefill_vllm(
