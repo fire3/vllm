@@ -20,6 +20,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
+    _sparse_indexer_triton_fallback_enabled,
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
     native_next_n_supported,
@@ -571,6 +572,11 @@ def compute_kpool_tail_slot_mapping(
     else:
         assert out.shape == slot_mapping.shape
         out.copy_(slot_mapping)
+    # Padded rows beyond the actual tokens keep whatever the reused buffer
+    # held before (stale slots from a previous larger batch). The kpool
+    # indexer's tail-seed kernel indexes the tail cache with these slots, so
+    # stale garbage there faults the GPU; mask them out explicitly.
+    out[num_actual_tokens:].fill_(-1)
     if num_actual_tokens == 0:
         return out
     tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
@@ -640,7 +646,15 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+    import vllm.envs as envs
+
     max_model_len = vllm_config.model_config.max_model_len
+    override = envs.VLLM_SPARSE_INDEXER_WORKSPACE_TOKENS
+    if override > 0:
+        # The workspace holds one chunk's gathered K at a time; a single
+        # request's full context (up to max_model_len) must fit, so never go
+        # below max_model_len.
+        return max(override, max_model_len)
     # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
     # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
@@ -1264,7 +1278,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and not _sparse_indexer_triton_fallback_enabled()
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
