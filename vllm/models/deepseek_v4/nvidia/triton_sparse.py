@@ -104,6 +104,17 @@ class DeepseekV4TritonMLAAttention(DeepseekV4FlashInferSM120Attention):
     backend_cls = DeepseekV4TritonMLASparseBackend
     _require_flashinfer_capability: ClassVar[bool] = False
 
+    def _global_topk_output_buffers(
+        self, topk_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return pre-allocated output buffers for the C4A top-k kernel.
+
+        The v0.27-era eager scratch pool no longer exists on this branch; the
+        Triton port keeps the hook so ``compute_global_topk_indices_and_lens``
+        falls back to its internal scratch (as it did when the pool was None).
+        """
+        return None
+
     def _forward_decode(
         self,
         q: torch.Tensor,
