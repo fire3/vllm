@@ -154,8 +154,10 @@ class DeepseekV4SparseMLAMetadataBuilder(
             (max_num_batched_tokens,), dtype=torch.int32, device=device
         )
 
-        assert hasattr(self.kv_cache_spec, "compress_ratio")
-        self.compress_ratio = self.kv_cache_spec.compress_ratio
+        # KV cache specs expose the per-state compression as
+        # ``tokens_per_state`` (DeepSeek V4 sets it to ``compress_ratio``).
+        assert isinstance(self.kv_cache_spec.tokens_per_state, int)
+        self.compress_ratio = self.kv_cache_spec.tokens_per_state
 
         # Pre-allocate compressed slot mapping buffer for CUDA graph address
         # stability when compress_ratio > 1.
