@@ -747,7 +747,11 @@ def tf32_hc_prenorm_gemm(
     See the caller function for shape requirement
     """
     _lazy_init()
-    if _tf32_hc_prenorm_gemm_impl is None:
+    # DeepGEMM's hyperconnection kernels only support SM90/SM100/SM120. The
+    # vendored module can still be importable on SM89 (e.g. prebuilt wheels),
+    # so gate on full platform support instead of symbol availability alone;
+    # otherwise the native entrypoint asserts "Unsupported architecture".
+    if _tf32_hc_prenorm_gemm_impl is None or not is_deep_gemm_supported():
         return _tf32_hc_prenorm_gemm_torch(x, fn, out, sqrsum, num_split)
     return _tf32_hc_prenorm_gemm_impl(
         x,
@@ -767,10 +771,10 @@ def _tf32_hc_prenorm_gemm_torch(
 ) -> None:
     """Torch fallback for DeepGEMM ``tf32_hc_prenorm_gemm``.
 
-    DeepGEMM only supports SM90/SM100/SM120, so on SM89 the vendored module
-    is never built. Match DeepGEMM's contract: ``out = x.float() @ fn.T`` and
-    ``sqrsum = x.float().square().sum(-1)``, splitting K when ``num_split``
-    is given (same layout as the CUDA kernel).
+    DeepGEMM only supports SM90/SM100/SM120; on other architectures (e.g.
+    SM89 / Ada) this reproduces DeepGEMM's contract: ``out = x.float() @ fn.T``
+    and ``sqrsum = x.float().square().sum(-1)``, splitting K when
+    ``num_split`` is given (same layout as the CUDA kernel).
     """
     xf = x.float()
     if num_split is None or num_split <= 1:
