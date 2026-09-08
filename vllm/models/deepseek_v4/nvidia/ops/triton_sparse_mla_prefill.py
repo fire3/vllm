@@ -14,8 +14,9 @@ The tiled, query-major, head-blocked kernel:
     per tile: UE8M0 is a power of two, so the bf16 pre-scale is exact and the
     operand doubles as K and V, with four wide dots (NoPE 256/128/64 +
     RoPE 64) instead of eight 64-wide group dots;
-  * keeps attn-sink handling in Python so the kernel numerics stay identical
-    across prefill and decode rows.
+  * folds the attn-sink softmax reweight into both epilogues (fused and
+    K-split merge), so decode/prefill layers no longer pay for per-layer
+    Python ``logaddexp`` / ``exp`` / ``copy_`` launches.
 
 Decode (one query token per row) routes through this same kernel via
 ``triton_sparse_mla_decode_vllm``. The kernel still runs on the padded head
@@ -642,12 +643,37 @@ def _ksplit_chunk_body(
         # leak stale partial output into the result.
         mask=h_mask,
     )
+
+
+@triton.jit
+def _attn_sink_weight(lse, sink):
+    """Attention output weight after combining KV LSE with the attn sink.
+
+    Matches the old Python-side ``logaddexp`` reweight:
+    ``w = exp(lse - logaddexp(lse, sink))`` with no-data rows forced to zero.
+    Both operands are natural-log LSEs. ``-inf`` sinks (no sink for a head)
+    must leave data rows untouched, and rows with no KV data must stay zero
+    even when a finite sink exists.
+    """
+    has_data = lse > -1e20
+    combined = tl.where(
+        sink == float("-inf"),
+        lse,
+        tl.maximum(lse, sink)
+        + tl.math.log(1.0 + tl.math.exp(-tl.abs(lse - sink))),
+    )
+    # Avoid -inf - -inf (NaN) on empty rows; the where below zeroes them.
+    logit = tl.where(has_data, lse, 0.0)
+    return tl.where(has_data, tl.math.exp(logit - combined), 0.0)
+
+
 @triton.jit
 def _merge_ksplit_kernel(
     partial_out_ptr,  # [T, S, H, D] bf16
     partial_lse_ptr,  # [T, S, H] f32
     O_ptr,  # [T, H, D] bf16
     LSE_ptr,  # [T, H] f32
+    attn_sink_ptr,  # [H] f32, natural-log sink (unused when HAS_SINK is 0)
     swa_indptr_ptr,  # [T+1] int32, runtime SWA CSR indptr
     extra_indptr_ptr,  # [T+1] int32, runtime extra CSR indptr
     H: tl.int32,
@@ -664,6 +690,7 @@ def _merge_ksplit_kernel(
     BLOCK_D: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     """Flash-decoding merge: combine per-chunk partials via LSE weighting.
 
@@ -755,14 +782,20 @@ def _merge_ksplit_kernel(
 
     denom_s = tl.where(denom > 0.0, denom, 1.0)
     res = acc / denom_s[:, None]
+    out_lse = m + tl.math.log(denom_s)
+    out_lse = tl.where(denom > 0.0, out_lse, float("-inf"))
+    if HAS_SINK:
+        sink = tl.load(
+            attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")
+        )
+        w = _attn_sink_weight(out_lse, sink)
+        res = res * w[:, None]
     o_base = t * stride_ob + h_offs[:, None] * stride_oh
     tl.store(
         O_ptr + o_base + d_offs[None, :],
         res.to(tl.bfloat16),
         mask=h_mask[:, None] & d_mask[None, :],
     )
-    out_lse = m + tl.math.log(denom_s)
-    out_lse = tl.where(denom > 0.0, out_lse, float("-inf"))
     tl.store(LSE_ptr + t * H + h_offs, out_lse, mask=h_mask)
 
 
@@ -789,8 +822,9 @@ def _pack_sparse_rows_kernel(
 @triton.jit
 def _tiled_sparse_prefill_kernel(
     Q_ptr,  # [T, H, D] bf16
-    O_ptr,  # [T, H, D] bf16, pre-sink output
-    LSE_ptr,  # [T, H] f32, pre-sink LSE (for the Python-side sink)
+    O_ptr,  # [T, H, D] bf16, sink-reweighted output
+    LSE_ptr,  # [T, H] f32, raw attention LSE (pre-sink, natural log)
+    attn_sink_ptr,  # [H] f32, natural-log sink (unused when HAS_SINK is 0)
     swa_cache_fp8_ptr,  # SWA NoPE fp8 flat view
     swa_cache_uint8_ptr,  # SWA scale uint8 flat view
     swa_cache_bf16_ptr,  # SWA RoPE bf16 flat view
@@ -818,6 +852,7 @@ def _tiled_sparse_prefill_kernel(
     stride_ob: tl.int32,
     stride_oh: tl.int32,
     HAS_EXTRA: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_DIM: tl.constexpr,
@@ -934,8 +969,22 @@ def _tiled_sparse_prefill_kernel(
                 SCALE_STRIDE=SCALE_STRIDE,
             )
 
-    # Finalize: normalize and write the pre-sink output and LSE.
+    # Finalize: normalize, apply the sink reweight in-kernel, and store.
     safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+    lse = tl.where(
+        l_i > 0.0,
+        m_i / LOG2E + tl.math.log(safe_l),
+        float("-inf"),
+    )
+    if HAS_SINK:
+        sink = tl.load(
+            attn_sink_ptr + h_offs, mask=h_mask, other=float("-inf")
+        )
+        w = _attn_sink_weight(lse, sink)
+        acc0 = acc0 * w[:, None]
+        acc1 = acc1 * w[:, None]
+        acc2 = acc2 * w[:, None]
+        acc_rope = acc_rope * w[:, None]
     o_base = t * stride_ob + h_offs[:, None] * stride_oh
     tl.store(
         O_ptr + o_base + c0[None, :],
@@ -956,11 +1005,6 @@ def _tiled_sparse_prefill_kernel(
         O_ptr + o_base + (NOPE_DIM + rope_offs)[None, :],
         (acc_rope / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None],
-    )
-    lse = tl.where(
-        l_i > 0.0,
-        m_i / LOG2E + tl.math.log(safe_l),
-        float("-inf"),
     )
     tl.store(LSE_ptr + t * H + h_offs, lse, mask=h_mask)
 
@@ -1319,10 +1363,15 @@ def triton_sparse_mla_prefill_vllm(
     ksplit_plan = _ksplit_plan(
         T, H, swa_max_width, extra_max_width, q.device
     )
+    # HAS_SINK=False kernels never dereference the sink pointer, so reuse the
+    # per-call LSE tensor as a safe dummy instead of allocating another one.
+    attn_sink_ptr = attn_sink if attn_sink is not None else lse
+    has_sink = attn_sink is not None
     launch_args = dict(
         Q_ptr=q,
         O_ptr=out,
         LSE_ptr=lse,
+        attn_sink_ptr=attn_sink_ptr,
         swa_cache_fp8_ptr=swa_fp8,
         swa_cache_uint8_ptr=swa_uint8,
         swa_cache_bf16_ptr=swa_bf16,
@@ -1350,6 +1399,7 @@ def triton_sparse_mla_prefill_vllm(
         stride_ob=out.stride(0),
         stride_oh=out.stride(1),
         HAS_EXTRA=has_extra,
+        HAS_SINK=has_sink,
         GROUP_DIM=_GROUP_DIM,
         NOPE_DIM=_NOPE_DIM,
         TOKEN_DATA_STRIDE=_TOKEN_DATA_STRIDE,
@@ -1417,6 +1467,7 @@ def triton_sparse_mla_prefill_vllm(
             partial_lse,
             out,
             lse,
+            attn_sink_ptr,
             swa_indptr,
             extra_indptr if has_extra else swa_indptr,
             H=H,
@@ -1433,6 +1484,7 @@ def triton_sparse_mla_prefill_vllm(
             BLOCK_D=128,
             CHUNK_SIZE=chunk_size,
             HAS_EXTRA=has_extra,
+            HAS_SINK=has_sink,
             num_warps=8,
         )
     else:
@@ -1444,12 +1496,3 @@ def triton_sparse_mla_prefill_vllm(
             num_warps=_DEFAULT_NUM_WARPS,
             num_stages=2,
         )
-
-    if attn_sink is not None:
-        combined = torch.logaddexp(lse, attn_sink.view(1, -1).expand_as(lse))
-        w = torch.where(
-            lse > -1e20,
-            torch.exp(lse - combined),
-            torch.zeros_like(lse),
-        )
-        out.copy_((out.float() * w.unsqueeze(-1)).to(torch.bfloat16))
