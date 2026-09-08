@@ -919,6 +919,12 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         del runner.kv_cache_config
     # Dropping the manager releases the profiling graphs and throwaway pool.
     runner.cudagraph_manager = None
+    from vllm.v1.worker.gpu.shutdown import release_sparse_mla_capture_scratch
+
+    # The profiling graphs were just dropped with the manager; their
+    # exact-capacity scratch entries would otherwise linger until process exit
+    # and stack with every subsequent re-capture.
+    release_sparse_mla_capture_scratch()
     # Release encoder graphs captured during profiling; the real
     # capture_model() re-captures them.
     if runner.model_state.supports_mm_inputs:

@@ -883,3 +883,82 @@ def test_csr_eager_scratch_converges_per_slot():
     finally:
         cache.clear()
         torch.cuda.empty_cache()
+
+
+def test_captured_scratch_release_api():
+    """Captured-scratch entries must be releasable by session / wholesale."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.deepseek_v4.nvidia.ops import (
+        triton_sparse_mla_prefill as _mod,
+    )
+
+    device = torch.device("cuda")
+    csr = _mod._CSR_FLAT_BUFFERS
+    partial = _mod._KSPLIT_PARTIAL_BUFFERS
+    csr.clear()
+    partial.clear()
+    try:
+        # Fake captured entries with the real cache key layout
+        # (device, capacity/T, slot/S, stream, token). Only the last two
+        # fields and tensor contents matter to the release API.
+        csr[(0, 0, 0, 123, 1)] = torch.empty(8, dtype=torch.int32, device=device)
+        csr[(0, 0, 1, 123, 1)] = torch.empty(8, dtype=torch.int32, device=device)
+        partial[(0, 1, 2, 3, 123, 2)] = (
+            torch.empty(2, 2, 2, 2, dtype=torch.bfloat16, device=device),
+            torch.empty(2, 2, 2, dtype=torch.float32, device=device),
+        )
+
+        stats = _mod.scratch_stats()
+        assert stats["csr_flat_buffers"]["captured_sessions"] == 1
+        assert stats["ksplit_partial_buffers"]["captured_sessions"] == 1
+
+        _mod.release_capture_scratch(1, device_index=0)
+        assert not any(k[-1] == 1 for k in csr)
+        assert stats["ksplit_partial_buffers"]["captured_sessions"] == 1
+
+        _mod.release_all_capture_scratch(device_index=0)
+        assert not any(k[-1] != 0 for k in csr)
+        assert not any(k[-1] != 0 for k in partial)
+    finally:
+        csr.clear()
+        partial.clear()
+        torch.cuda.empty_cache()
+
+
+def test_ksplit_plan_parallelism_and_budget():
+    """The adaptive K-split planner fills the GPU and caps partial bytes."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.deepseek_v4.nvidia.ops import (
+        triton_sparse_mla_prefill as _mod,
+    )
+
+    device = torch.device("cuda")
+    sm = _mod._get_sm_count(device)
+    h_blocks = 1  # H=8 / BLOCK_H=8
+
+    # A batch that already fills the GPU must stay on the fused kernel.
+    assert _mod._ksplit_plan(2 * sm, 8, 128, 512, device) is None
+
+    # A small decode batch should split, stay within budget, and land in a
+    # small handful of chunk-count choices.
+    plan = _mod._ksplit_plan(8, 8, 128, 512, device)
+    assert plan is not None
+    chunk, S = plan
+    assert chunk >= _mod._DEFAULT_BLOCK_K
+    assert S >= 1
+    bytes_used = (
+        8
+        * S
+        * 8
+        * _mod._KSPLIT_PARTIAL_BYTES_PER_CELL
+    )
+    assert bytes_used <= _mod._KSPLIT_BUDGET_BYTES
+
+    # For an underfilled fused grid the planner must produce at least a few
+    # CTAs (roughly 4 waves) rather than one CTA per query row.
+    target_ctas = 8 * S * h_blocks
+    assert target_ctas >= min(4 * sm // 2, 8), (
+        f"planner left GPU underfilled: T=8 S={S} sm={sm}"
+    )

@@ -10,10 +10,10 @@ The tiled, query-major, head-blocked kernel:
   * fuses the SWA and compressed (c4/c128) sources into one launch that
     shares the online-softmax state (``m_i``/``l_i``/``acc``) across both
     sources, dropping the intermediate out/LSE tensors and the Python merge;
-  * computes QK scores and K=V accumulation per 64-dim group with ``tl.dot``
-    (fp8 -> bf16 upcast, fp32 accumulate -- the SM89 pattern established by
-    the MQA-logits fix), applying the per-(token, group) UE8M0 scale after
-    the score dot and pre-scaling the value operand;
+  * computes QK scores and K=V accumulation from a single pre-scaled KV load
+    per tile: UE8M0 is a power of two, so the bf16 pre-scale is exact and the
+    operand doubles as K and V, with four wide dots (NoPE 256/128/64 +
+    RoPE 64) instead of eight 64-wide group dots;
   * keeps attn-sink handling in Python so the kernel numerics stay identical
     across prefill and decode rows.
 
@@ -22,11 +22,14 @@ Decode (one query token per row) routes through this same kernel via
 count; removing padded heads is explicitly out of scope.
 """
 
+import logging
 from typing import Optional
 
 import torch
 
 from vllm.triton_utils import tl, triton
+
+logger = logging.getLogger(__name__)
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
@@ -42,13 +45,17 @@ _PACK_BLOCK = 128
 _DEFAULT_BLOCK_H = 8
 _DEFAULT_BLOCK_K = 32
 _DEFAULT_NUM_WARPS = 8
-_KSPLIT_CHUNK = 32
 # K-split is only useful when the batch is too small to fill the GPU on its
-# own (decode); prefill rows already give (T, 1) parallelism. The cutoff also
-# bounds the cached [T, S, H, D] partial buffers: at T=2048/S=68/H=8 the
-# bf16 partial out alone would be 1.1 GiB per (T, S) combo, accumulating
-# across chunked-prefill sizes and OOMing at high GPU-memory utilization.
+# own (decode); prefill rows already give (T, 1) parallelism. The eager
+# scratch cache below still keeps a full-capacity slab per (S, H), sized to
+# this row count, so runtime row counts never stack separate buffers.
 _KSPLIT_MAX_T = 64
+# Adaptive K-split planning bounds and memory budget. 1030 bytes is the
+# per-(row, chunk, head) footprint of partial_out (512 bf16) + partial_lse
+# (1 f32) as keyed by the kernel launch.
+_KSPLIT_BUDGET_BYTES = 256 << 20
+_MAX_KSPLIT_CHUNK = 256
+_SM_COUNT: dict[int, int] = {}
 
 # Bound the number of scratch-cache entries so a pathological many-keys model
 # cannot silently grow the cache without limit. Captured-graph buffers
@@ -56,6 +63,12 @@ _KSPLIT_MAX_T = 64
 # CUDA graphs. Eager entries are recreated on demand, so evicting them is
 # safe.
 _MAX_SCRATCH_ENTRIES = 64
+# Above this many live capture sessions the operator is almost certainly
+# re-capturing without tearing the old CUDA graphs down (or the graph teardown
+# path is not releasing its scratch). Eight sessions is generous: a decode
+# engine captures a handful of FULL buckets plus one profiling pass on a
+# worker stream.
+_MAX_CAPTURE_SESSIONS = 8
 
 # Per-(device, stream) capture-session counter: every CUDA graph capture gets
 # a unique token so scratch buffers are keyed per graph instance. The counter
@@ -86,6 +99,89 @@ def _capture_token() -> int:
         return _CAPTURE_SESSION[key]
     _PREV_CAPTURING[key] = False
     return 0
+
+
+def current_capture_session(
+    device: Optional[torch.device] = None,
+    stream: Optional[torch.cuda.Stream] = None,
+) -> int:
+    """Return the active capture-session token for a (device, stream).
+
+    Returns 0 when nothing was ever captured on this stream. The token is
+    stable for the whole ``torch.cuda.graph`` block that allocated scratch, so
+    the graph owner can call ``release_capture_scratch`` with it once the CUDA
+    graph is destroyed or re-captured.
+    """
+    if stream is None:
+        stream = torch.cuda.current_stream(device)
+    key = (
+        stream.device.index if stream.device.index is not None else 0,
+        stream.cuda_stream,
+    )
+    return _CAPTURE_SESSION.get(key, 0)
+
+
+def release_capture_scratch(
+    session: int,
+    device_index: Optional[int] = None,
+) -> None:
+    """Drop captured scratch belonging to one CUDA-graph session.
+
+    The graph owner must call this only after the graph itself (and therefore
+    every pointer baked into it) is destroyed or is about to be re-captured;
+    replaying a graph whose scratch was released would read freed memory.
+    """
+    assert session != 0, "session 0 is eager execution and has no owner"
+    for cache in (_CSR_FLAT_BUFFERS, _KSPLIT_PARTIAL_BUFFERS):
+        for key in list(cache):
+            if key[-1] == session and (
+                device_index is None or key[0] == device_index
+            ):
+                cache.pop(key, None)
+
+
+def release_all_capture_scratch(device_index: Optional[int] = None) -> None:
+    """Drop every captured-scratch entry (e.g. runner shutdown / teardown).
+
+    Eager (token 0) entries are grow-only scratch shared across steps and can
+    stay until the process exits; only graph-owned entries must follow the
+    graph lifetime.
+    """
+    for cache in (_CSR_FLAT_BUFFERS, _KSPLIT_PARTIAL_BUFFERS):
+        for key in list(cache):
+            if key[-1] != 0 and (
+                device_index is None or key[0] == device_index
+            ):
+                cache.pop(key, None)
+
+
+def scratch_stats() -> dict:
+    """Return scratch-cache sizes for diagnostics / capture-leak tests."""
+
+    def _bytes(value: object) -> int:
+        if isinstance(value, torch.Tensor):
+            return value.numel() * value.element_size()
+        if isinstance(value, (tuple, list)):
+            return sum(_bytes(v) for v in value)
+        return 0
+
+    def _entry_stats(cache: dict) -> dict:
+        entries = len(cache)
+        eager_bytes = sum(_bytes(v) for k, v in cache.items() if k[-1] == 0)
+        captured_bytes = sum(
+            _bytes(v) for k, v in cache.items() if k[-1] != 0
+        )
+        return {
+            "entries": entries,
+            "eager_bytes": eager_bytes,
+            "captured_bytes": captured_bytes,
+            "captured_sessions": len({k[-1] for k in cache if k[-1] != 0}),
+        }
+
+    return {
+        "csr_flat_buffers": _entry_stats(_CSR_FLAT_BUFFERS),
+        "ksplit_partial_buffers": _entry_stats(_KSPLIT_PARTIAL_BUFFERS),
+    }
 
 
 @triton.jit
@@ -211,6 +307,162 @@ def _tiled_sparse_prefill_ksplit_kernel(
 
 
 @triton.jit
+def _scan_mla_source(
+    q0,
+    q1,
+    q2,
+    q_rope,
+    fp8_p,
+    uint8_p,
+    bf16_p,
+    idx_p,
+    start: tl.int32,
+    end: tl.int32,
+    page_size: tl.int32,
+    page_bytes: tl.int64,
+    layer_off: tl.int64,
+    scale_off: tl.int64,
+    num_slots: tl.int32,
+    h_mask,
+    m_i,
+    l_i,
+    acc0,
+    acc1,
+    acc2,
+    acc_rope,
+    sm_scale: tl.float32,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_DIM: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    TOKEN_DATA_STRIDE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
+):
+    """Scan one source's CSR range into the shared online-softmax state.
+
+    Single source path shared by the fused (SWA then extra) kernel and the
+    K-split chunk body so both scan the exact same paged gather / pre-scale /
+    dot sequence. ``q0/q1/q2`` are the contiguous NoPE query slices
+    [H, 256] / [H, 128] / [H, 64] (power-of-two Triton blocks summing to 448)
+    and ``q_rope`` is [H, 64]; KV tiles are loaded once per tile, pre-scaled
+    in bf16 (UE8M0 is a power of two, so the conversion is exact and K/V
+    share the operand), and consumed by four wide dots instead of eight
+    64-wide group dots.
+    """
+    length = end - start
+    k_offs = tl.arange(0, BLOCK_K)
+    c0 = tl.arange(0, 256)
+    c1 = 256 + tl.arange(0, 128)
+    c2 = 384 + tl.arange(0, 64)
+    rope_offs = tl.arange(0, GROUP_DIM)
+    g0 = tl.arange(0, 4)
+    g1 = 4 + tl.arange(0, 2)
+
+    for k_start in tl.range(0, length, BLOCK_K):
+        pos = k_start + k_offs
+        in_range = pos < length
+        slot = tl.load(idx_p + start + pos, mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < num_slots)
+        safe_slot = tl.minimum(tl.maximum(slot, 0), num_slots - 1)
+        page_ids = (safe_slot // page_size).to(tl.int64)
+        page_offs = (safe_slot % page_size).to(tl.int64)
+        data_base = (
+            page_ids * page_bytes + layer_off + page_offs * TOKEN_DATA_STRIDE
+        )
+        scale_base = (
+            page_ids * page_bytes
+            + layer_off
+            + scale_off
+            + page_offs * SCALE_STRIDE
+        )
+
+        # Group loads -> 4 data loads: NoPE is gathered as 256+128+64
+        # contiguous power-of-two slices and RoPE as one bf16 slice.
+        kv0 = tl.load(
+            fp8_p + data_base[:, None] + c0[None, :].to(tl.int64),
+            mask=valid[:, None],
+            other=0.0,
+        )
+        kv1 = tl.load(
+            fp8_p + data_base[:, None] + c1[None, :].to(tl.int64),
+            mask=valid[:, None],
+            other=0.0,
+        )
+        kv2 = tl.load(
+            fp8_p + data_base[:, None] + c2[None, :].to(tl.int64),
+            mask=valid[:, None],
+            other=0.0,
+        )
+        rope_elem_base = ((data_base + NOPE_DIM) // 2)[:, None]
+        kv_rope = tl.load(
+            bf16_p + rope_elem_base + rope_offs[None, :].to(tl.int64),
+            mask=valid[:, None],
+            other=0.0,
+        )
+        sc0 = tl.load(
+            uint8_p + scale_base[:, None] + g0[None, :],
+            mask=valid[:, None],
+            other=127,
+        )
+        sc1 = tl.load(
+            uint8_p + scale_base[:, None] + g1[None, :],
+            mask=valid[:, None],
+            other=127,
+        )
+        sc2 = tl.load(
+            uint8_p + scale_base + 6, mask=valid, other=127
+        )
+        s0 = tl.math.exp2(sc0.to(tl.float32) - 127.0)
+        s1 = tl.math.exp2(sc1.to(tl.float32) - 127.0)
+        s2 = tl.math.exp2(sc2.to(tl.float32) - 127.0)
+        # Broadcast each token's group scale across its 64 columns, then
+        # flatten to the segment width. The scaled operand doubles as K for
+        # scores and V for accumulation (UE8M0 is a power of two, so bf16
+        # rounding is exact).
+        s0w = tl.reshape(
+            tl.broadcast_to(
+                s0[:, :, None],
+                (BLOCK_K, 4, GROUP_DIM),
+            ),
+            (BLOCK_K, 256),
+        )
+        s1w = tl.reshape(
+            tl.broadcast_to(
+                s1[:, :, None],
+                (BLOCK_K, 2, GROUP_DIM),
+            ),
+            (BLOCK_K, 128),
+        )
+        kv0s = (kv0.to(tl.float32) * s0w).to(tl.bfloat16)
+        kv1s = (kv1.to(tl.float32) * s1w).to(tl.bfloat16)
+        kv2s = (kv2.to(tl.float32) * s2[:, None]).to(tl.bfloat16)
+
+        scores = tl.dot(q0, tl.trans(kv0s))
+        scores += tl.dot(q1, tl.trans(kv1s))
+        scores += tl.dot(q2, tl.trans(kv2s))
+        scores += tl.dot(q_rope, tl.trans(kv_rope))
+        scores = scores * sm_scale
+        scores = tl.where(valid[None, :] & h_mask[:, None], scores, -1e30)
+
+        # Online softmax update (base-2, tile-level).
+        scores_log2 = scores * LOG2E
+        tile_max = tl.max(scores_log2, axis=1)
+        m_new = tl.maximum(m_i, tile_max)
+        alpha = tl.math.exp2(m_i - m_new)
+        p = tl.math.exp2(scores_log2 - m_new[:, None])
+        p = tl.where(valid[None, :] & h_mask[:, None], p, 0.0)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        p_bf16 = p.to(tl.bfloat16)
+
+        acc0 = acc0 * alpha[:, None] + tl.dot(p_bf16, kv0s)
+        acc1 = acc1 * alpha[:, None] + tl.dot(p_bf16, kv1s)
+        acc2 = acc2 * alpha[:, None] + tl.dot(p_bf16, kv2s)
+        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
+        m_i = m_new
+
+    return m_i, l_i, acc0, acc1, acc2, acc_rope
+
+@triton.jit
 def _ksplit_chunk_body(
     Q_ptr,
     partial_out_ptr,
@@ -261,47 +513,31 @@ def _ksplit_chunk_body(
 ):
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    d_offs = tl.arange(0, GROUP_DIM)
+    c0 = tl.arange(0, 256)
+    c1 = 256 + tl.arange(0, 128)
+    c2 = 384 + tl.arange(0, 64)
+    rope_offs = tl.arange(0, GROUP_DIM)
 
-    # Q per 64-dim group, loaded once and reused by every KV tile.
+    # Q loaded as four contiguous power-of-two slices instead of 8 group
+    # tiles; KV tiles below share these across every scanned chunk.
     q_base = t * stride_qb + h_offs[:, None] * stride_qh
     q0 = tl.load(
-        Q_ptr + q_base + (0 * GROUP_DIM + d_offs)[None, :],
+        Q_ptr + q_base + c0[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
     q1 = tl.load(
-        Q_ptr + q_base + (1 * GROUP_DIM + d_offs)[None, :],
+        Q_ptr + q_base + c1[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
     q2 = tl.load(
-        Q_ptr + q_base + (2 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q3 = tl.load(
-        Q_ptr + q_base + (3 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q4 = tl.load(
-        Q_ptr + q_base + (4 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q5 = tl.load(
-        Q_ptr + q_base + (5 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q6 = tl.load(
-        Q_ptr + q_base + (6 * GROUP_DIM + d_offs)[None, :],
+        Q_ptr + q_base + c2[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
     q_rope = tl.load(
-        Q_ptr + q_base + (NOPE_DIM + d_offs)[None, :],
+        Q_ptr + q_base + (NOPE_DIM + rope_offs)[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
@@ -309,13 +545,9 @@ def _ksplit_chunk_body(
     # Online-softmax state, base-2 like the decode kernel.
     m_i = tl.full([BLOCK_H], -1e30, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc0 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc1 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc2 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc3 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc4 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc5 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc6 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
+    acc0 = tl.zeros([BLOCK_H, 256], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_H, 128], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
     acc_rope = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
 
     # Select this CTA's source (SWA chunks first, then extra) from the runtime
@@ -337,169 +569,60 @@ def _ksplit_chunk_body(
     k_begin = chunk_idx * CHUNK_SIZE
     k_end = tl.minimum(k_begin + CHUNK_SIZE, length)
 
-    k_offs = tl.arange(0, BLOCK_K)
-    for k_start in tl.range(k_begin, k_end, BLOCK_K):
-        pos = k_start + k_offs
-        in_range = pos < k_end
-        slot = tl.load(idx_p + start + pos, mask=in_range, other=-1)
-        valid = in_range & (slot >= 0) & (slot < num_slots)
-        safe_slot = tl.minimum(tl.maximum(slot, 0), num_slots - 1)
-        page_ids = (safe_slot // page_size).to(tl.int64)
-        page_offs = (safe_slot % page_size).to(tl.int64)
-        data_base = (
-            page_ids * page_bytes + layer_off + page_offs * TOKEN_DATA_STRIDE
-        )
-        scale_base = (
-            page_ids * page_bytes
-            + layer_off
-            + scale_off
-            + page_offs * SCALE_STRIDE
-        )
-
-        addrs0 = (
-            data_base[:, None]
-            + (0 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-        )
-        kv0 = tl.load(fp8_p + addrs0, mask=valid[:, None], other=0.0)
-        addrs1 = (
-            data_base[:, None]
-            + (1 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-        )
-        kv1 = tl.load(fp8_p + addrs1, mask=valid[:, None], other=0.0)
-        addrs2 = (
-            data_base[:, None]
-            + (2 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-        )
-        kv2 = tl.load(fp8_p + addrs2, mask=valid[:, None], other=0.0)
-        addrs3 = (
-            data_base[:, None]
-            + (3 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-        )
-        kv3 = tl.load(fp8_p + addrs3, mask=valid[:, None], other=0.0)
-        addrs4 = (
-            data_base[:, None]
-            + (4 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-        )
-        kv4 = tl.load(fp8_p + addrs4, mask=valid[:, None], other=0.0)
-        addrs5 = (
-            data_base[:, None]
-            + (5 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-        )
-        kv5 = tl.load(fp8_p + addrs5, mask=valid[:, None], other=0.0)
-        addrs6 = (
-            data_base[:, None]
-            + (6 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-        )
-        kv6 = tl.load(fp8_p + addrs6, mask=valid[:, None], other=0.0)
-        rope_elem_base = ((data_base + NOPE_DIM) // 2)[:, None]
-        kv_rope = tl.load(
-            bf16_p + rope_elem_base + d_offs[None, :].to(tl.int64),
-            mask=valid[:, None],
-            other=0.0,
-        )
-        sc0 = tl.load(uint8_p + scale_base + 0, mask=valid, other=127)
-        sc1 = tl.load(uint8_p + scale_base + 1, mask=valid, other=127)
-        sc2 = tl.load(uint8_p + scale_base + 2, mask=valid, other=127)
-        sc3 = tl.load(uint8_p + scale_base + 3, mask=valid, other=127)
-        sc4 = tl.load(uint8_p + scale_base + 4, mask=valid, other=127)
-        sc5 = tl.load(uint8_p + scale_base + 5, mask=valid, other=127)
-        sc6 = tl.load(uint8_p + scale_base + 6, mask=valid, other=127)
-
-        s0 = tl.math.exp2(sc0.to(tl.float32) - 127.0)
-        s1 = tl.math.exp2(sc1.to(tl.float32) - 127.0)
-        s2 = tl.math.exp2(sc2.to(tl.float32) - 127.0)
-        s3 = tl.math.exp2(sc3.to(tl.float32) - 127.0)
-        s4 = tl.math.exp2(sc4.to(tl.float32) - 127.0)
-        s5 = tl.math.exp2(sc5.to(tl.float32) - 127.0)
-        s6 = tl.math.exp2(sc6.to(tl.float32) - 127.0)
-        scores = tl.dot(q0, tl.trans(kv0.to(tl.bfloat16)))
-        scores = scores * s0[None, :]
-        scores += tl.dot(q1, tl.trans(kv1.to(tl.bfloat16))) * s1[None, :]
-        scores += tl.dot(q2, tl.trans(kv2.to(tl.bfloat16))) * s2[None, :]
-        scores += tl.dot(q3, tl.trans(kv3.to(tl.bfloat16))) * s3[None, :]
-        scores += tl.dot(q4, tl.trans(kv4.to(tl.bfloat16))) * s4[None, :]
-        scores += tl.dot(q5, tl.trans(kv5.to(tl.bfloat16))) * s5[None, :]
-        scores += tl.dot(q6, tl.trans(kv6.to(tl.bfloat16))) * s6[None, :]
-        scores += tl.dot(q_rope, tl.trans(kv_rope))
-        scores = scores * sm_scale
-        scores = tl.where(valid[None, :] & h_mask[:, None], scores, -1e30)
-
-        # Online softmax update (base-2, tile-level).
-        scores_log2 = scores * LOG2E
-        tile_max = tl.max(scores_log2, axis=1)
-        m_new = tl.maximum(m_i, tile_max)
-        alpha = tl.math.exp2(m_i - m_new)
-        p = tl.math.exp2(scores_log2 - m_new[:, None])
-        p = tl.where(valid[None, :] & h_mask[:, None], p, 0.0)
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        p_bf16 = p.to(tl.bfloat16)
-
-        kv0s = (kv0.to(tl.float32) * s0[:, None]).to(tl.bfloat16)
-        kv1s = (kv1.to(tl.float32) * s1[:, None]).to(tl.bfloat16)
-        kv2s = (kv2.to(tl.float32) * s2[:, None]).to(tl.bfloat16)
-        kv3s = (kv3.to(tl.float32) * s3[:, None]).to(tl.bfloat16)
-        kv4s = (kv4.to(tl.float32) * s4[:, None]).to(tl.bfloat16)
-        kv5s = (kv5.to(tl.float32) * s5[:, None]).to(tl.bfloat16)
-        kv6s = (kv6.to(tl.float32) * s6[:, None]).to(tl.bfloat16)
-        acc0 = acc0 * alpha[:, None] + tl.dot(p_bf16, kv0s)
-        acc1 = acc1 * alpha[:, None] + tl.dot(p_bf16, kv1s)
-        acc2 = acc2 * alpha[:, None] + tl.dot(p_bf16, kv2s)
-        acc3 = acc3 * alpha[:, None] + tl.dot(p_bf16, kv3s)
-        acc4 = acc4 * alpha[:, None] + tl.dot(p_bf16, kv4s)
-        acc5 = acc5 * alpha[:, None] + tl.dot(p_bf16, kv5s)
-        acc6 = acc6 * alpha[:, None] + tl.dot(p_bf16, kv6s)
-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
-        m_i = m_new
+    m_i, l_i, acc0, acc1, acc2, acc_rope = _scan_mla_source(
+        q0,
+        q1,
+        q2,
+        q_rope,
+        fp8_p,
+        uint8_p,
+        bf16_p,
+        idx_p,
+        start + k_begin,
+        start + k_end,
+        page_size,
+        page_bytes,
+        layer_off,
+        scale_off,
+        num_slots,
+        h_mask,
+        m_i,
+        l_i,
+        acc0,
+        acc1,
+        acc2,
+        acc_rope,
+        sm_scale,
+        BLOCK_H=BLOCK_H,
+        BLOCK_K=BLOCK_K,
+        GROUP_DIM=GROUP_DIM,
+        NOPE_DIM=NOPE_DIM,
+        TOKEN_DATA_STRIDE=TOKEN_DATA_STRIDE,
+        SCALE_STRIDE=SCALE_STRIDE,
+    )
 
     # Finalize: normalize and write this chunk's partial output + LSE.
     safe_l = tl.where(l_i > 0.0, l_i, 1.0)
     has_data = l_i > 0.0
     p_base = t * stride_pt + pid_chunk * stride_ps
     tl.store(
-        partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (0 * GROUP_DIM + d_offs)[None, :],
+        partial_out_ptr + p_base + h_offs[:, None] * stride_ph + c0[None, :],
         (acc0 / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
-        partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (1 * GROUP_DIM + d_offs)[None, :],
+        partial_out_ptr + p_base + h_offs[:, None] * stride_ph + c1[None, :],
         (acc1 / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
-        partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (2 * GROUP_DIM + d_offs)[None, :],
+        partial_out_ptr + p_base + h_offs[:, None] * stride_ph + c2[None, :],
         (acc2 / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None] & has_data[:, None],
     )
     tl.store(
         partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (3 * GROUP_DIM + d_offs)[None, :],
-        (acc3 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None] & has_data[:, None],
-    )
-    tl.store(
-        partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (4 * GROUP_DIM + d_offs)[None, :],
-        (acc4 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None] & has_data[:, None],
-    )
-    tl.store(
-        partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (5 * GROUP_DIM + d_offs)[None, :],
-        (acc5 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None] & has_data[:, None],
-    )
-    tl.store(
-        partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (6 * GROUP_DIM + d_offs)[None, :],
-        (acc6 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None] & has_data[:, None],
-    )
-    tl.store(
-        partial_out_ptr + p_base + h_offs[:, None] * stride_ph
-        + (NOPE_DIM + d_offs)[None, :],
+        + (NOPE_DIM + rope_offs)[None, :],
         (acc_rope / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None] & has_data[:, None],
     )
@@ -519,8 +642,6 @@ def _ksplit_chunk_body(
         # leak stale partial output into the result.
         mask=h_mask,
     )
-
-
 @triton.jit
 def _merge_ksplit_kernel(
     partial_out_ptr,  # [T, S, H, D] bf16
@@ -717,47 +838,31 @@ def _tiled_sparse_prefill_kernel(
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offs < H
-    d_offs = tl.arange(0, GROUP_DIM)
+    c0 = tl.arange(0, 256)
+    c1 = 256 + tl.arange(0, 128)
+    c2 = 384 + tl.arange(0, 64)
+    rope_offs = tl.arange(0, GROUP_DIM)
 
-    # Q per 64-dim group, loaded once and reused by every KV tile.
+    # Q loaded as four contiguous power-of-two slices instead of 8 group
+    # tiles; KV tiles below share these across every scanned chunk.
     q_base = t * stride_qb + h_offs[:, None] * stride_qh
     q0 = tl.load(
-        Q_ptr + q_base + (0 * GROUP_DIM + d_offs)[None, :],
+        Q_ptr + q_base + c0[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
     q1 = tl.load(
-        Q_ptr + q_base + (1 * GROUP_DIM + d_offs)[None, :],
+        Q_ptr + q_base + c1[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
     q2 = tl.load(
-        Q_ptr + q_base + (2 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q3 = tl.load(
-        Q_ptr + q_base + (3 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q4 = tl.load(
-        Q_ptr + q_base + (4 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q5 = tl.load(
-        Q_ptr + q_base + (5 * GROUP_DIM + d_offs)[None, :],
-        mask=h_mask[:, None],
-        other=0.0,
-    )
-    q6 = tl.load(
-        Q_ptr + q_base + (6 * GROUP_DIM + d_offs)[None, :],
+        Q_ptr + q_base + c2[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
     q_rope = tl.load(
-        Q_ptr + q_base + (NOPE_DIM + d_offs)[None, :],
+        Q_ptr + q_base + (NOPE_DIM + rope_offs)[None, :],
         mask=h_mask[:, None],
         other=0.0,
     )
@@ -765,16 +870,10 @@ def _tiled_sparse_prefill_kernel(
     # Online-softmax state, base-2 like the decode kernel.
     m_i = tl.full([BLOCK_H], -1e30, dtype=tl.float32)
     l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
-    acc0 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc1 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc2 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc3 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc4 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc5 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-    acc6 = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
+    acc0 = tl.zeros([BLOCK_H, 256], dtype=tl.float32)
+    acc1 = tl.zeros([BLOCK_H, 128], dtype=tl.float32)
+    acc2 = tl.zeros([BLOCK_H, 64], dtype=tl.float32)
     acc_rope = tl.zeros([BLOCK_H, GROUP_DIM], dtype=tl.float32)
-
-    k_offs = tl.arange(0, BLOCK_K)
 
     for src in range(2):
         if src == 0:
@@ -803,187 +902,58 @@ def _tiled_sparse_prefill_kernel(
         if src == 0 or HAS_EXTRA:
             start = tl.load(indptr_p + t)
             end = tl.load(indptr_p + t + 1)
-            length = end - start
-
-            for k_start in tl.range(0, length, BLOCK_K):
-                pos = k_start + k_offs
-                in_range = pos < length
-                slot = tl.load(idx_p + start + pos, mask=in_range, other=-1)
-                valid = in_range & (slot >= 0) & (slot < num_slots)
-                safe_slot = tl.minimum(tl.maximum(slot, 0), num_slots - 1)
-                page_ids = (safe_slot // page_size).to(tl.int64)
-                page_offs = (safe_slot % page_size).to(tl.int64)
-                data_base = (
-                    page_ids * page_bytes
-                    + layer_off
-                    + page_offs * TOKEN_DATA_STRIDE
-                )
-                scale_base = (
-                    page_ids * page_bytes
-                    + layer_off
-                    + scale_off
-                    + page_offs * SCALE_STRIDE
-                )
-
-                # Gather all 8 group tiles once per KV tile; they feed both
-                # the score phase and the value phase of this tile.
-                addrs0 = (
-                    data_base[:, None]
-                    + (0 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-                )
-                kv0 = tl.load(fp8_p + addrs0, mask=valid[:, None], other=0.0)
-                addrs1 = (
-                    data_base[:, None]
-                    + (1 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-                )
-                kv1 = tl.load(fp8_p + addrs1, mask=valid[:, None], other=0.0)
-                addrs2 = (
-                    data_base[:, None]
-                    + (2 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-                )
-                kv2 = tl.load(fp8_p + addrs2, mask=valid[:, None], other=0.0)
-                addrs3 = (
-                    data_base[:, None]
-                    + (3 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-                )
-                kv3 = tl.load(fp8_p + addrs3, mask=valid[:, None], other=0.0)
-                addrs4 = (
-                    data_base[:, None]
-                    + (4 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-                )
-                kv4 = tl.load(fp8_p + addrs4, mask=valid[:, None], other=0.0)
-                addrs5 = (
-                    data_base[:, None]
-                    + (5 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-                )
-                kv5 = tl.load(fp8_p + addrs5, mask=valid[:, None], other=0.0)
-                addrs6 = (
-                    data_base[:, None]
-                    + (6 * GROUP_DIM + d_offs)[None, :].to(tl.int64)
-                )
-                kv6 = tl.load(fp8_p + addrs6, mask=valid[:, None], other=0.0)
-                rope_elem_base = ((data_base + NOPE_DIM) // 2)[:, None]
-                kv_rope = tl.load(
-                    bf16_p + rope_elem_base + d_offs[None, :].to(tl.int64),
-                    mask=valid[:, None],
-                    other=0.0,
-                )
-                sc0 = tl.load(
-                    uint8_p + scale_base + 0, mask=valid, other=127
-                )
-                sc1 = tl.load(
-                    uint8_p + scale_base + 1, mask=valid, other=127
-                )
-                sc2 = tl.load(
-                    uint8_p + scale_base + 2, mask=valid, other=127
-                )
-                sc3 = tl.load(
-                    uint8_p + scale_base + 3, mask=valid, other=127
-                )
-                sc4 = tl.load(
-                    uint8_p + scale_base + 4, mask=valid, other=127
-                )
-                sc5 = tl.load(
-                    uint8_p + scale_base + 5, mask=valid, other=127
-                )
-                sc6 = tl.load(
-                    uint8_p + scale_base + 6, mask=valid, other=127
-                )
-
-                # Score phase: per-group dot (fp8 losslessly upcast to bf16),
-                # then the group scale is applied to the finished score row
-                # (constant per token and group, so it commutes with the dot).
-                s0 = tl.math.exp2(sc0.to(tl.float32) - 127.0)
-                s1 = tl.math.exp2(sc1.to(tl.float32) - 127.0)
-                s2 = tl.math.exp2(sc2.to(tl.float32) - 127.0)
-                s3 = tl.math.exp2(sc3.to(tl.float32) - 127.0)
-                s4 = tl.math.exp2(sc4.to(tl.float32) - 127.0)
-                s5 = tl.math.exp2(sc5.to(tl.float32) - 127.0)
-                s6 = tl.math.exp2(sc6.to(tl.float32) - 127.0)
-                scores = tl.dot(q0, tl.trans(kv0.to(tl.bfloat16)))
-                scores = scores * s0[None, :]
-                scores += tl.dot(q1, tl.trans(kv1.to(tl.bfloat16))) * s1[None, :]
-                scores += tl.dot(q2, tl.trans(kv2.to(tl.bfloat16))) * s2[None, :]
-                scores += tl.dot(q3, tl.trans(kv3.to(tl.bfloat16))) * s3[None, :]
-                scores += tl.dot(q4, tl.trans(kv4.to(tl.bfloat16))) * s4[None, :]
-                scores += tl.dot(q5, tl.trans(kv5.to(tl.bfloat16))) * s5[None, :]
-                scores += tl.dot(q6, tl.trans(kv6.to(tl.bfloat16))) * s6[None, :]
-                scores += tl.dot(q_rope, tl.trans(kv_rope))
-                scores = scores * sm_scale
-                scores = tl.where(valid[None, :] & h_mask[:, None], scores, -1e30)
-
-                # Online softmax update (base-2, tile-level).
-                # The accumulator runs in log2 space (like the decode kernel:
-                # ``scores_log2 = scores * LOG2E``); without the conversion the
-                # exp2 weights are flattened by 2^(s) instead of e^(s).
-                scores_log2 = scores * LOG2E
-                tile_max = tl.max(scores_log2, axis=1)
-                m_new = tl.maximum(m_i, tile_max)
-                alpha = tl.math.exp2(m_i - m_new)
-                p = tl.math.exp2(scores_log2 - m_new[:, None])
-                p = tl.where(valid[None, :] & h_mask[:, None], p, 0.0)
-                l_i = l_i * alpha + tl.sum(p, axis=1)
-                p_bf16 = p.to(tl.bfloat16)
-
-                # Value phase: pre-scale each group by its power-of-2 scale
-                # (exact in bf16), then dot with the bf16 weights.
-                kv0s = (kv0.to(tl.float32) * s0[:, None]).to(tl.bfloat16)
-                kv1s = (kv1.to(tl.float32) * s1[:, None]).to(tl.bfloat16)
-                kv2s = (kv2.to(tl.float32) * s2[:, None]).to(tl.bfloat16)
-                kv3s = (kv3.to(tl.float32) * s3[:, None]).to(tl.bfloat16)
-                kv4s = (kv4.to(tl.float32) * s4[:, None]).to(tl.bfloat16)
-                kv5s = (kv5.to(tl.float32) * s5[:, None]).to(tl.bfloat16)
-                kv6s = (kv6.to(tl.float32) * s6[:, None]).to(tl.bfloat16)
-                acc0 = acc0 * alpha[:, None] + tl.dot(p_bf16, kv0s)
-                acc1 = acc1 * alpha[:, None] + tl.dot(p_bf16, kv1s)
-                acc2 = acc2 * alpha[:, None] + tl.dot(p_bf16, kv2s)
-                acc3 = acc3 * alpha[:, None] + tl.dot(p_bf16, kv3s)
-                acc4 = acc4 * alpha[:, None] + tl.dot(p_bf16, kv4s)
-                acc5 = acc5 * alpha[:, None] + tl.dot(p_bf16, kv5s)
-                acc6 = acc6 * alpha[:, None] + tl.dot(p_bf16, kv6s)
-                acc_rope = acc_rope * alpha[:, None] + tl.dot(p_bf16, kv_rope)
-                m_i = m_new
+            m_i, l_i, acc0, acc1, acc2, acc_rope = _scan_mla_source(
+                q0,
+                q1,
+                q2,
+                q_rope,
+                fp8_p,
+                uint8_p,
+                bf16_p,
+                idx_p,
+                start,
+                end,
+                page_size,
+                page_bytes,
+                layer_off,
+                scale_off,
+                num_slots,
+                h_mask,
+                m_i,
+                l_i,
+                acc0,
+                acc1,
+                acc2,
+                acc_rope,
+                sm_scale,
+                BLOCK_H=BLOCK_H,
+                BLOCK_K=BLOCK_K,
+                GROUP_DIM=GROUP_DIM,
+                NOPE_DIM=NOPE_DIM,
+                TOKEN_DATA_STRIDE=TOKEN_DATA_STRIDE,
+                SCALE_STRIDE=SCALE_STRIDE,
+            )
 
     # Finalize: normalize and write the pre-sink output and LSE.
     safe_l = tl.where(l_i > 0.0, l_i, 1.0)
     o_base = t * stride_ob + h_offs[:, None] * stride_oh
     tl.store(
-        O_ptr + o_base + (0 * GROUP_DIM + d_offs)[None, :],
+        O_ptr + o_base + c0[None, :],
         (acc0 / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None],
     )
     tl.store(
-        O_ptr + o_base + (1 * GROUP_DIM + d_offs)[None, :],
+        O_ptr + o_base + c1[None, :],
         (acc1 / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None],
     )
     tl.store(
-        O_ptr + o_base + (2 * GROUP_DIM + d_offs)[None, :],
+        O_ptr + o_base + c2[None, :],
         (acc2 / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None],
     )
     tl.store(
-        O_ptr + o_base + (3 * GROUP_DIM + d_offs)[None, :],
-        (acc3 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-    tl.store(
-        O_ptr + o_base + (4 * GROUP_DIM + d_offs)[None, :],
-        (acc4 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-    tl.store(
-        O_ptr + o_base + (5 * GROUP_DIM + d_offs)[None, :],
-        (acc5 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-    tl.store(
-        O_ptr + o_base + (6 * GROUP_DIM + d_offs)[None, :],
-        (acc6 / safe_l[:, None]).to(tl.bfloat16),
-        mask=h_mask[:, None],
-    )
-    tl.store(
-        O_ptr + o_base + (NOPE_DIM + d_offs)[None, :],
+        O_ptr + o_base + (NOPE_DIM + rope_offs)[None, :],
         (acc_rope / safe_l[:, None]).to(tl.bfloat16),
         mask=h_mask[:, None],
     )
@@ -1044,6 +1014,15 @@ _CSR_FLAT_BUFFERS: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
 
 
 def _evict_eager_scratch(cache: dict) -> None:
+    captured_sessions = {key[-1] for key in cache if key[-1] != 0}
+    if len(captured_sessions) > _MAX_CAPTURE_SESSIONS:
+        logger.warning(
+            "sparse-MLA captured scratch sessions=%d, nbytes=%s; check for "
+            "graph re-capture leak (release_capture_scratch / "
+            "release_all_capture_scratch should be called when graphs die)",
+            len(captured_sessions),
+            scratch_stats(),
+        )
     if len(cache) <= _MAX_SCRATCH_ENTRIES:
         return
     for key in list(cache):
@@ -1137,6 +1116,71 @@ def _pack_sparse_rows(
 
 _KSPLIT_PARTIAL_BUFFERS: dict[tuple[int, int, int, int, int, int], tuple] = {}
 
+_KSPLIT_PARTIAL_BYTES_PER_CELL = 2 * (_NOPE_DIM + _ROPE_DIM) + 4
+
+
+def _get_sm_count(device: torch.device) -> int:
+    """Cache ``multi_processor_count`` per device for K-split planning."""
+    index = device.index if device.index is not None else 0
+    if index not in _SM_COUNT:
+        _SM_COUNT[index] = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+    return _SM_COUNT[index]
+
+
+def _ksplit_plan(
+    T: int,
+    H: int,
+    swa_max_width: int,
+    extra_max_width: int,
+    device: torch.device,
+) -> Optional[tuple[int, int]]:
+    """Choose (CHUNK_SIZE, S) for the K-split path, or None to use fused.
+
+    The fused kernel already gives one CTA per (query row, head block), so
+    when that grid fills the GPU there is nothing left for K-split to
+    parallelize. Below that, split the row into enough chunks to reach
+    roughly 4 waves of CTAs (T * S * head blocks), while capping S so the
+    partial buffers cannot grow without bound. The returned CHUNK_SIZE is the
+    same value every layer (SWA/compressed) must use: each CTA derives its
+    source and in-row chunk from the runtime CSR lengths, so a FULL CUDA
+    graph stays correct for any replayed row length inside the captured
+    capacity.
+    """
+    h_blocks = triton.cdiv(H, _DEFAULT_BLOCK_H)
+    sm_count = _get_sm_count(device)
+    if T * h_blocks >= 2 * sm_count:
+        return None
+
+    total_w = swa_max_width + extra_max_width
+    if total_w <= 0:
+        return None
+
+    # Aim for ~4*SM CTAs total. S is additionally capped at 32 so an
+    # extremely wide row cannot demand dozens of merge passes per token.
+    s_target = max(1, min((4 * sm_count) // max(1, T * h_blocks), 32))
+    chunk = min(
+        _MAX_KSPLIT_CHUNK,
+        max(_DEFAULT_BLOCK_K, triton.cdiv(total_w, s_target)),
+    )
+
+    def _chunk_count(width: int) -> int:
+        return triton.cdiv(width, chunk)
+
+    S = _chunk_count(swa_max_width) + _chunk_count(extra_max_width)
+    budget = _KSPLIT_BUDGET_BYTES
+    while (
+        S > 0
+        and T * S * H * _KSPLIT_PARTIAL_BYTES_PER_CELL > budget
+        and chunk < _MAX_KSPLIT_CHUNK
+    ):
+        chunk = min(_MAX_KSPLIT_CHUNK, chunk * 2)
+        S = _chunk_count(swa_max_width) + _chunk_count(extra_max_width)
+    if S <= 0:
+        return None
+    return chunk, S
+
 
 def _get_ksplit_partial_buffers(
     T: int,
@@ -1152,8 +1196,10 @@ def _get_ksplit_partial_buffers(
     its own [T, S, H, D] slab, so a server that sees many batch sizes over
     time reserved up to ``sum(1..64)`` rows of scratch (~1.1 GiB at S=68,
     H=8 on a TP=8 rank, and far more at lower TP) while never evicting enough
-    to matter. The K-split path only runs for T <= _KSPLIT_MAX_T, so the
-    eager cache is bounded by one full-capacity slab per (S, H).
+    to matter. The adaptive K-split planner may run beyond T=64 when the
+    fused grid is still GPU-underfilled, so an eager slab grows to the
+    largest row count ever requested for a given (S, H) instead of slicing
+    past its capacity.
 
     Captured-graph calls keep exact [T, S, H, D] buffers keyed by the capture
     session: their addresses are baked into the CUDA graphs, so they must not
@@ -1172,11 +1218,16 @@ def _get_ksplit_partial_buffers(
         token,
     )
     buf = _KSPLIT_PARTIAL_BUFFERS.get(key)
-    if buf is not None:
+    if buf is not None and buf[0].shape[0] >= T:
         return buf[0][:T], buf[1][:T]
     # Eager entries are shared across every decode row count, so allocate the
     # full K-split capacity once instead of growing one slab per distinct T.
+    # The adaptive planner can legitimately run K-split for row counts above
+    # _KSPLIT_MAX_T, so grow an existing eager slab in place rather than
+    # slicing past its row capacity.
     rows = T if token != 0 else max(T, _KSPLIT_MAX_T)
+    if buf is not None:
+        rows = max(rows, buf[0].shape[0])
     d = _NOPE_DIM + _ROPE_DIM
     partial_out = torch.zeros(rows, S, H, d, dtype=torch.bfloat16, device=device)
     # Initialize the LSE slab to -inf so a chunk that is ever (mistakenly)
@@ -1253,7 +1304,21 @@ def triton_sparse_mla_prefill_vllm(
     extra_scale_off = extra_page_size * _TOKEN_DATA_STRIDE
     lse = torch.empty(T, H, dtype=torch.float32, device=q.device)
 
-    use_ksplit = T <= _KSPLIT_MAX_T
+    swa_max_width = max(
+        swa_indices.reshape(T, -1).stride(0),
+        swa_indices.reshape(T, -1).shape[1],
+    )
+    extra_max_width = (
+        max(
+            extra_indices.reshape(T, -1).stride(0),
+            extra_indices.reshape(T, -1).shape[1],
+        )
+        if has_extra
+        else 0
+    )
+    ksplit_plan = _ksplit_plan(
+        T, H, swa_max_width, extra_max_width, q.device
+    )
     launch_args = dict(
         Q_ptr=q,
         O_ptr=out,
@@ -1290,30 +1355,16 @@ def triton_sparse_mla_prefill_vllm(
         TOKEN_DATA_STRIDE=_TOKEN_DATA_STRIDE,
         SCALE_STRIDE=_SCALE_STRIDE,
     )
-    if use_ksplit:
-        # K-split path: (T, S_MAX, H-blocks) CTAs each scan one 32-token chunk
-        # of one source, then a small merge kernel combines the partials with
-        # flash-decoding LSE weighting. S_MAX is the fixed chunk count for the
-        # max buffer row capacity (width-independent): every CTA selects its
-        # source/chunk from the runtime CSR lengths, so FULL-graph replay is
-        # correct for any runtime c128 width. Default on for decode-sized
-        # batches; T > _KSPLIT_MAX_T falls back to the single-CTA fused kernel.
-        swa_max_width = max(
-            swa_indices.reshape(T, -1).stride(0),
-            swa_indices.reshape(T, -1).shape[1],
-        )
-        extra_max_width = (
-            max(
-                extra_indices.reshape(T, -1).stride(0),
-                extra_indices.reshape(T, -1).shape[1],
-            )
-            if has_extra
-            else 0
-        )
-        S = (
-            triton.cdiv(swa_max_width, _KSPLIT_CHUNK)
-            + triton.cdiv(extra_max_width, _KSPLIT_CHUNK)
-        )
+    if ksplit_plan is not None:
+        # K-split path: (T, S_MAX, H-blocks) CTAs each scan one adaptive
+        # chunk of one source, then a small merge kernel combines the
+        # partials with flash-decoding LSE weighting. S_MAX is the fixed
+        # chunk count for the max buffer row capacity (width-independent):
+        # every CTA selects its source/chunk from the runtime CSR lengths, so
+        # FULL-graph replay is correct for any runtime row length inside the
+        # captured capacity. Chosen only while the fused grid leaves the GPU
+        # underfilled, and capped by an explicit partial-buffer budget.
+        chunk_size, S = ksplit_plan
         D = _NOPE_DIM + _ROPE_DIM
         partial_out, partial_lse = _get_ksplit_partial_buffers(T, S, H, q.device)
         grid = (T, S, triton.cdiv(H, _DEFAULT_BLOCK_H))
@@ -1350,7 +1401,7 @@ def triton_sparse_mla_prefill_vllm(
             stride_ph=D,
             stride_lt=S * H,
             stride_ls=H,
-            CHUNK_SIZE=_KSPLIT_CHUNK,
+            CHUNK_SIZE=chunk_size,
             BLOCK_H=_DEFAULT_BLOCK_H,
             BLOCK_K=_DEFAULT_BLOCK_K,
             GROUP_DIM=_GROUP_DIM,
@@ -1380,7 +1431,7 @@ def triton_sparse_mla_prefill_vllm(
             BLOCK_H=8,
             BLOCK_S=8,
             BLOCK_D=128,
-            CHUNK_SIZE=_KSPLIT_CHUNK,
+            CHUNK_SIZE=chunk_size,
             HAS_EXTRA=has_extra,
             num_warps=8,
         )
