@@ -43,6 +43,15 @@ _TOKEN_DATA_STRIDE = 576  # bytes per token in the data section
 _SCALE_STRIDE = 8  # bytes per token in the scale section
 
 _PACK_BLOCK = 128
+_PACK_BLOCK_T = 128
+# Decode-sized batches run the CSR pack as a single CTA that fuses clamp +
+# exclusive prefix-sum + copy, so each source pays one launch instead of
+# zeros/clamp/cumsum/pack. Larger rows keep the multi-CTA pack, which would
+# otherwise serialize thousands of stores through one CTA.
+_PACK_FUSED_MAX_T = 64
+# The CSR scratch cache is keyed by ``slot``; indptr needs its own buffer so
+# it cannot alias the flat-slot used by the kernel it feeds.
+_CSR_INDPTR_SLOT_BASE = 1 << 20
 _DEFAULT_BLOCK_H = 8
 _DEFAULT_BLOCK_K = 32
 _DEFAULT_NUM_WARPS = 8
@@ -820,6 +829,48 @@ def _pack_sparse_rows_kernel(
 
 
 @triton.jit
+def _pack_csr_small_kernel(
+    dense_ptr,  # [T, W] int32
+    lens_ptr,  # [T] int32
+    flat_ptr,  # [T*W] int32 scratch, only the valid prefix is written
+    indptr_ptr,  # [T+1] int32 scratch
+    stride_d: tl.int32,
+    T: tl.int32,
+    max_width: tl.int32,
+    BLOCK_T: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Single-CTA pack: clamp + exclusive prefix sum + flat copy in one launch.
+
+    Replaces the Python ``clamp -> zeros -> cumsum -> copy-kernel`` chain for
+    small (decode-sized) batches. The runtime row count and width can be below
+    the compile-time block extents; masked lanes are never stored. A stale /
+    negative lens row is clamped to ``[0, max_width]`` first so indptr stays
+    monotonic and the copy never escapes the flat buffer.
+    """
+    t_offs = tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T
+    lens = tl.load(lens_ptr + t_offs, mask=t_mask, other=0)
+    lens = tl.minimum(tl.maximum(lens, 0), max_width)
+    start = tl.cumsum(lens, axis=0) - lens
+    tl.store(indptr_ptr + t_offs, start, mask=t_mask)
+    tl.store(indptr_ptr + T, tl.sum(lens, axis=0))
+
+    for w0 in tl.range(0, max_width, BLOCK_W):
+        w = w0 + tl.arange(0, BLOCK_W)
+        m = t_mask[:, None] & (w[None, :] < lens[:, None])
+        vals = tl.load(
+            dense_ptr + t_offs[:, None] * stride_d + w[None, :],
+            mask=m,
+            other=-1,
+        )
+        # Masked lanes may point past the valid prefix but must stay inside the
+        # row's flat capacity; the store mask suppresses them.
+        safe_col = tl.minimum(w, tl.maximum(max_width - 1, 0))
+        tl.store(flat_ptr + start[:, None] + safe_col[None, :], vals, mask=m)
+
+
+@triton.jit
 def _tiled_sparse_prefill_kernel(
     Q_ptr,  # [T, H, D] bf16
     O_ptr,  # [T, H, D] bf16, sink-reweighted output
@@ -1130,14 +1181,34 @@ def _pack_sparse_rows(
 
     ``flat`` is a max-capacity cached buffer (T * buffer-row-width); only the
     valid prefix of each row is written, so no CPU/GPU sync is needed to learn
-    the true nnz. The grid covers the buffer row capacity (outer stride of the
+    the true nnz. The pack covers the buffer row capacity (outer stride of the
     sliced max-width buffer view), not the active width, so a FULL CUDA graph
-    packs every runtime row length up to the capacity.
+    packs every runtime row length up to the capacity. Decode-sized batches
+    additionally fuse the prefix-sum metadata into one CTA.
     """
     T = lens.shape[0]
     dense = indices.reshape(T, -1)
     max_width = max(dense.stride(0), dense.shape[1])
-    lens32 = lens.reshape(T).to(torch.int32)
+    lens32 = lens.reshape(T).contiguous().to(torch.int32)
+    if T <= _PACK_FUSED_MAX_T:
+        flat = _get_csr_flat_buffer(T * max_width, lens.device, slot)
+        indptr = _get_csr_flat_buffer(
+            T + 1, lens.device, _CSR_INDPTR_SLOT_BASE + slot
+        )
+        _pack_csr_small_kernel[(1,)](
+            dense,
+            lens32,
+            flat,
+            indptr,
+            dense.stride(0),
+            T,
+            max_width,
+            BLOCK_T=_PACK_BLOCK_T,
+            BLOCK_W=_PACK_BLOCK,
+            num_warps=8,
+        )
+        return flat, indptr
+
     # Defensive clamp: a stale/negative lens row (e.g. a padding row that was
     # not rewritten this step, or a corrupted length from a batch transition)
     # must never make indptr non-monotonic or drive the pack past the flat

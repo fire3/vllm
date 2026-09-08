@@ -242,6 +242,35 @@ def test_pack_sparse_rows_csr():
     assert torch.equal(flat[:expected_flat.shape[0]], expected_flat)
 
 
+def test_pack_sparse_rows_fused_small_batch():
+    """Single-CTA pack must match torch cumsum at the fused-T upper bound."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
+        _PACK_FUSED_MAX_T,
+    )
+
+    device = torch.device("cuda")
+    T, W = _PACK_FUSED_MAX_T, 512
+    torch.manual_seed(7)
+    dense = torch.randint(-1, 1000, (T, W), device=device, dtype=torch.int32)
+    # Include an out-of-range stale row that the kernel must clamp.
+    lens = torch.randint(0, W, (T,), device=device, dtype=torch.int32)
+    lens[0] = 4096
+    lens[1] = -7
+
+    flat, indptr = _pack_sparse_rows(dense, lens)
+
+    clamped = torch.clamp(lens, min=0, max=W)
+    expected_indptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    torch.cumsum(clamped, dim=0, out=expected_indptr[1:])
+    assert torch.equal(indptr, expected_indptr)
+    expected_flat = torch.cat([dense[i, :clamped[i]] for i in range(T)]).to(
+        torch.int32
+    )
+    assert torch.equal(flat[:expected_flat.shape[0]], expected_flat)
+
+
 @pytest.mark.parametrize("with_sink", [False, True])
 @pytest.mark.parametrize("with_extra", [False, True])
 def test_tiled_prefill_matches_reference(with_sink, with_extra):
