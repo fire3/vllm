@@ -65,6 +65,13 @@ _KSPLIT_MAX_T = 64
 # (1 f32) as keyed by the kernel launch.
 _KSPLIT_BUDGET_BYTES = 256 << 20
 _MAX_KSPLIT_CHUNK = 256
+# Hard upper bound on the CSR row length a scan kernel will walk. The pack
+# kernels already clamp every row to its buffer row width, so this is a no-op
+# for healthy metadata: it only keeps a corrupted or aliased ``indptr`` value
+# from turning ``tl.range(0, length, BLOCK_K)`` into a near-infinite (silent)
+# hang. 2**16 is far above any legitimate row width (a few thousand slots),
+# so it can only ever engage on garbage.
+_MAX_SCAN_ROW_LEN = tl.constexpr(1 << 16)
 _SM_COUNT: dict[int, int] = {}
 
 # Bound the number of scratch-cache entries so a pathological many-keys model
@@ -252,12 +259,12 @@ def _tiled_sparse_prefill_ksplit_kernel(
 
     swa_start = tl.load(swa_indptr_ptr + t)
     swa_end = tl.load(swa_indptr_ptr + t + 1)
-    swa_len = swa_end - swa_start
+    swa_len = tl.minimum(swa_end - swa_start, _MAX_SCAN_ROW_LEN)
     swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
     if HAS_EXTRA:
         extra_start = tl.load(extra_indptr_ptr + t)
         extra_end = tl.load(extra_indptr_ptr + t + 1)
-        extra_len = extra_end - extra_start
+        extra_len = tl.minimum(extra_end - extra_start, _MAX_SCAN_ROW_LEN)
         extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
     else:
         extra_chunks = 0
@@ -359,7 +366,7 @@ def _scan_mla_source(
     share the operand), and consumed by four wide dots instead of eight
     64-wide group dots.
     """
-    length = end - start
+    length = tl.minimum(end - start, _MAX_SCAN_ROW_LEN)
     k_offs = tl.arange(0, BLOCK_K)
     c0 = tl.arange(0, 256)
     c1 = 256 + tl.arange(0, 128)
@@ -575,7 +582,7 @@ def _ksplit_chunk_body(
     start = tl.where(is_extra, extra_start, swa_start)
     end = tl.where(is_extra, extra_end, swa_end)
     chunk_idx = pid_chunk - tl.where(is_extra, swa_chunks, 0)
-    length = end - start
+    length = tl.minimum(end - start, _MAX_SCAN_ROW_LEN)
     k_begin = chunk_idx * CHUNK_SIZE
     k_end = tl.minimum(k_begin + CHUNK_SIZE, length)
 
@@ -721,11 +728,15 @@ def _merge_ksplit_kernel(
     # Per-row valid chunk range: chunks beyond the runtime row length were not
     # (re)written by this step's ksplit kernel, so they must be masked instead
     # of trusting their (potentially stale) partial LSE.
-    swa_len = tl.load(swa_indptr_ptr + t + 1) - tl.load(swa_indptr_ptr + t)
+    swa_len = tl.minimum(
+        tl.load(swa_indptr_ptr + t + 1) - tl.load(swa_indptr_ptr + t),
+        _MAX_SCAN_ROW_LEN,
+    )
     swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
     if HAS_EXTRA:
-        extra_len = (
-            tl.load(extra_indptr_ptr + t + 1) - tl.load(extra_indptr_ptr + t)
+        extra_len = tl.minimum(
+            tl.load(extra_indptr_ptr + t + 1) - tl.load(extra_indptr_ptr + t),
+            _MAX_SCAN_ROW_LEN,
         )
         extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
     else:
