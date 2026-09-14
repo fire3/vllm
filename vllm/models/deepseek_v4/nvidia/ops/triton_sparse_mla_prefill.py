@@ -215,6 +215,47 @@ def scratch_stats() -> dict:
 
 
 @triton.jit
+def _sanitize_row(
+    start_raw: tl.int32,
+    end_raw: tl.int32,
+    max_len: tl.int32,
+    flat_len: tl.int32,
+):
+    """Turn one runtime CSR row into a ``(start, length)`` pair safe to scan.
+
+    Single source of truth for the row bounds: the fused scan, the K-split
+    chunk classification, the K-split chunk body and the merge all derive
+    their ``(start, length)`` here. Deriving them in one place is what keeps
+    the chunk arithmetic consistent -- if the kernel that writes the partials
+    and the kernel that merges them disagreed on a row's chunk count, the
+    merge would weight chunks nobody wrote (or read past the partial buffer).
+
+    Both clamps are no-ops for healthy metadata and only sanitize garbage:
+
+    * ``length`` is clamped into ``[0, min(max_len, _MAX_SCAN_ROW_LEN)]``. The
+      pack kernels already clamp every row to its buffer row width, so the
+      upper clamp can only engage on a corrupted/aliased ``indptr``; the
+      **lower** clamp is the important half -- an inverted row (``end <
+      start``) would otherwise feed a negative trip count into
+      ``tl.range(0, length, BLOCK_K)``, which is the failure mode that leaves
+      a kernel spinning forever instead of retiring.
+    * ``start`` is clamped into ``[0, flat_len - max_len]`` so that the whole
+      row slice stays inside the flat slot buffer. The gather
+      ``idx_p + start + pos`` is masked only by ``pos < length``, so an
+      out-of-range CSR base would otherwise read outside the buffer.
+
+    ``flat_len`` is the flat buffer's element count (``T * max_len`` for the
+    CSR layout this module packs) and is always >= ``max_len``.
+    """
+    length = tl.minimum(
+        end_raw - start_raw, tl.minimum(max_len, _MAX_SCAN_ROW_LEN)
+    )
+    length = tl.maximum(length, 0)
+    start = tl.minimum(tl.maximum(start_raw, 0), flat_len - max_len)
+    return start, length
+
+
+@triton.jit
 def _tiled_sparse_prefill_ksplit_kernel(
     Q_ptr,  # [T, H, D] bf16
     partial_out_ptr,  # [T, S, H, D] bf16, per-chunk normalized output
@@ -240,7 +281,8 @@ def _tiled_sparse_prefill_ksplit_kernel(
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
     extra_num_slots: tl.int32,
-    max_len: tl.int32,
+    swa_max_len: tl.int32,
+    extra_max_len: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -271,19 +313,25 @@ def _tiled_sparse_prefill_ksplit_kernel(
     pid_chunk = tl.program_id(1)
     pid_h = tl.program_id(2)
 
-    swa_start = tl.load(swa_indptr_ptr + t)
-    swa_end = tl.load(swa_indptr_ptr + t + 1)
-    swa_len = tl.minimum(swa_end - swa_start, _MAX_SCAN_ROW_LEN)
+    swa_start, swa_len = _sanitize_row(
+        tl.load(swa_indptr_ptr + t),
+        tl.load(swa_indptr_ptr + t + 1),
+        swa_max_len,
+        tl.num_programs(0) * swa_max_len,
+    )
     swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
     if HAS_EXTRA:
-        extra_start = tl.load(extra_indptr_ptr + t)
-        extra_end = tl.load(extra_indptr_ptr + t + 1)
-        extra_len = tl.minimum(extra_end - extra_start, _MAX_SCAN_ROW_LEN)
+        extra_start, extra_len = _sanitize_row(
+            tl.load(extra_indptr_ptr + t),
+            tl.load(extra_indptr_ptr + t + 1),
+            extra_max_len,
+            tl.num_programs(0) * extra_max_len,
+        )
         extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
     else:
         extra_chunks = 0
         extra_start = 0
-        extra_end = 0
+        extra_len = 0
     total_chunks = swa_chunks + extra_chunks
 
     if pid_chunk < total_chunks:
@@ -298,13 +346,13 @@ def _tiled_sparse_prefill_ksplit_kernel(
             swa_cache_bf16_ptr,
             swa_idx_ptr,
             swa_start,
-            swa_end,
+            swa_len,
             extra_cache_fp8_ptr,
             extra_cache_uint8_ptr,
             extra_cache_bf16_ptr,
             extra_idx_ptr,
             extra_start,
-            extra_end,
+            extra_len,
             sm_scale,
             swa_page_size,
             swa_page_bytes,
@@ -316,7 +364,6 @@ def _tiled_sparse_prefill_ksplit_kernel(
             extra_layer_off,
             extra_scale_off,
             extra_num_slots,
-            max_len,
             H,
             stride_qb,
             stride_qh,
@@ -349,13 +396,12 @@ def _scan_mla_source(
     bf16_p,
     idx_p,
     start: tl.int32,
-    end: tl.int32,
+    length: tl.int32,
     page_size: tl.int32,
     page_bytes: tl.int64,
     layer_off: tl.int64,
     scale_off: tl.int64,
     num_slots: tl.int32,
-    max_len: tl.int32,
     h_mask,
     m_i,
     l_i,
@@ -382,10 +428,13 @@ def _scan_mla_source(
     share the operand), and consumed by four wide dots instead of eight
     64-wide group dots.
     """
-    # ``max_len`` is the source's flat row capacity (host-side buffer width):
-    # a row can never contain more entries than its CSR slice holds, so this is
-    # a no-op for healthy metadata and bounds the trip count for garbage.
-    length = tl.minimum(end - start, tl.minimum(max_len, _MAX_SCAN_ROW_LEN))
+    # ``length`` arrives already sanitized by ``_sanitize_row`` for the direct
+    # callers (non-negative, bounded by the source's row capacity). Re-clamp
+    # here because the K-split chunk body passes a *derived* slice
+    # (``k_end - k_begin``), which is negative whenever a chunk starts past
+    # the row end. A negative trip count in ``tl.range`` is what turns a
+    # no-op into a runaway loop, so this is the last line of defence.
+    length = tl.maximum(length, 0)
     k_offs = tl.arange(0, BLOCK_K)
     c0 = tl.arange(0, 256)
     c1 = 256 + tl.arange(0, 128)
@@ -510,13 +559,13 @@ def _ksplit_chunk_body(
     swa_cache_bf16_ptr,
     swa_idx_ptr,
     swa_start: tl.int32,
-    swa_end: tl.int32,
+    swa_len: tl.int32,
     extra_cache_fp8_ptr,
     extra_cache_uint8_ptr,
     extra_cache_bf16_ptr,
     extra_idx_ptr,
     extra_start: tl.int32,
-    extra_end: tl.int32,
+    extra_len: tl.int32,
     sm_scale: tl.float32,
     swa_page_size: tl.int32,
     swa_page_bytes: tl.int64,
@@ -528,7 +577,6 @@ def _ksplit_chunk_body(
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
     extra_num_slots: tl.int32,
-    max_len: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -600,9 +648,8 @@ def _ksplit_chunk_body(
     scale_off = tl.where(is_extra, extra_scale_off, swa_scale_off)
     num_slots = tl.where(is_extra, extra_num_slots, swa_num_slots)
     start = tl.where(is_extra, extra_start, swa_start)
-    end = tl.where(is_extra, extra_end, swa_end)
+    length = tl.where(is_extra, extra_len, swa_len)
     chunk_idx = pid_chunk - tl.where(is_extra, swa_chunks, 0)
-    length = tl.minimum(end - start, tl.minimum(max_len, _MAX_SCAN_ROW_LEN))
     k_begin = chunk_idx * CHUNK_SIZE
     k_end = tl.minimum(k_begin + CHUNK_SIZE, length)
 
@@ -616,13 +663,15 @@ def _ksplit_chunk_body(
         bf16_p,
         idx_p,
         start + k_begin,
-        start + k_end,
+        # A chunk classified inside its source's chunk count always starts
+        # before the row end, so this is a plain slice; the clamp only shields
+        # the empty-row case (``length == 0``) from a negative difference.
+        tl.maximum(k_end - k_begin, 0),
         page_size,
         page_bytes,
         layer_off,
         scale_off,
         num_slots,
-        max_len,
         h_mask,
         m_i,
         l_i,
@@ -713,7 +762,8 @@ def _merge_ksplit_kernel(
     attn_sink_ptr,  # [H] f32, natural-log sink (unused when HAS_SINK is 0)
     swa_indptr_ptr,  # [T+1] int32, runtime SWA CSR indptr
     extra_indptr_ptr,  # [T+1] int32, runtime extra CSR indptr
-    max_len: tl.int32,
+    swa_max_len: tl.int32,
+    extra_max_len: tl.int32,
     H: tl.int32,
     stride_pt: tl.int32,
     stride_ps: tl.int32,
@@ -749,21 +799,35 @@ def _merge_ksplit_kernel(
 
     # Per-row valid chunk range: chunks beyond the runtime row length were not
     # (re)written by this step's ksplit kernel, so they must be masked instead
-    # of trusting their (potentially stale) partial LSE.
-    swa_len = tl.minimum(
-        tl.load(swa_indptr_ptr + t + 1) - tl.load(swa_indptr_ptr + t),
-        tl.minimum(max_len, _MAX_SCAN_ROW_LEN),
+    # of trusting their (potentially stale) partial LSE. The bounds come from
+    # the same ``_sanitize_row`` the ksplit kernel uses, so both agree on a
+    # row's chunk count by construction.
+    _, swa_len = _sanitize_row(
+        tl.load(swa_indptr_ptr + t),
+        tl.load(swa_indptr_ptr + t + 1),
+        swa_max_len,
+        tl.num_programs(0) * swa_max_len,
     )
     swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
     if HAS_EXTRA:
-        extra_len = tl.minimum(
-            tl.load(extra_indptr_ptr + t + 1) - tl.load(extra_indptr_ptr + t),
-            tl.minimum(max_len, _MAX_SCAN_ROW_LEN),
+        _, extra_len = _sanitize_row(
+            tl.load(extra_indptr_ptr + t),
+            tl.load(extra_indptr_ptr + t + 1),
+            extra_max_len,
+            tl.num_programs(0) * extra_max_len,
         )
         extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
     else:
         extra_chunks = 0
-    total_chunks = swa_chunks + extra_chunks
+    # The planner sizes S as ceil(width / CHUNK_SIZE) summed over both sources
+    # with this same CHUNK_SIZE, so a sanitized row can never ask for more
+    # chunks than S. Clamp to the partial buffer's actual chunk capacity
+    # anyway -- it is derivable from the strides, so this costs no extra
+    # argument: ``s_offs`` below indexes the [T, S, ...] slabs and an
+    # over-count would read past their end.
+    total_chunks = tl.minimum(
+        swa_chunks + extra_chunks, stride_pt // stride_ps
+    )
 
     # Pass 1: max LSE over chunks (per head).
     m = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
@@ -930,7 +994,8 @@ def _tiled_sparse_prefill_kernel(
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
     extra_num_slots: tl.int32,
-    max_len: tl.int32,
+    swa_max_len: tl.int32,
+    extra_max_len: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -1020,8 +1085,13 @@ def _tiled_sparse_prefill_kernel(
             num_slots = extra_num_slots
 
         if src == 0 or HAS_EXTRA:
-            start = tl.load(indptr_p + t)
-            end = tl.load(indptr_p + t + 1)
+            src_max_len = swa_max_len if src == 0 else extra_max_len
+            start, length = _sanitize_row(
+                tl.load(indptr_p + t),
+                tl.load(indptr_p + t + 1),
+                src_max_len,
+                tl.num_programs(0) * src_max_len,
+            )
             m_i, l_i, acc0, acc1, acc2, acc_rope = _scan_mla_source(
                 q0,
                 q1,
@@ -1032,13 +1102,12 @@ def _tiled_sparse_prefill_kernel(
                 bf16_p,
                 idx_p,
                 start,
-                end,
+                length,
                 page_size,
                 page_bytes,
                 layer_off,
                 scale_off,
                 num_slots,
-                max_len,
                 h_mask,
                 m_i,
                 l_i,
@@ -1477,10 +1546,15 @@ def triton_sparse_mla_prefill_vllm(
         if has_extra
         else 0
     )
-    # Hard upper bound for one row's CSR slice (= the source buffer's row
-    # capacity). Passed into the kernels so a corrupted/aliased indptr can only
-    # produce a bounded scan instead of a near-infinite one.
-    max_len = max(swa_max_width, extra_max_width, 1)
+    # Per-source row capacity = the source buffer's row width, i.e. exactly the
+    # width ``_pack_sparse_rows`` clamps each CSR row to. Passing it per source
+    # (rather than one max over both) makes the kernels' bound identical to the
+    # producer's clamp, so ``_sanitize_row`` is a no-op on healthy metadata and
+    # each source is bounded by its own capacity instead of the larger of the
+    # two. The kernels derive the flat buffer length from it as
+    # ``T * max_len``, matching the ``T * max_width`` the pack allocates.
+    swa_max_len = max(swa_max_width, 1)
+    extra_max_len = max(extra_max_width, 1)
     ksplit_plan = _ksplit_plan(
         T, H, swa_max_width, extra_max_width, q.device
     )
@@ -1514,7 +1588,8 @@ def triton_sparse_mla_prefill_vllm(
         extra_layer_off=int(extra_layer_off),
         extra_scale_off=int(extra_scale_off),
         extra_num_slots=extra_num_slots,
-        max_len=max_len,
+        swa_max_len=swa_max_len,
+        extra_max_len=extra_max_len,
         H=H,
         stride_qb=q.stride(0),
         stride_qh=q.stride(1),
@@ -1565,7 +1640,8 @@ def triton_sparse_mla_prefill_vllm(
             extra_layer_off=int(extra_layer_off),
             extra_scale_off=int(extra_scale_off),
             extra_num_slots=extra_num_slots,
-            max_len=max_len,
+            swa_max_len=swa_max_len,
+            extra_max_len=extra_max_len,
             H=H,
             stride_qb=q.stride(0),
             stride_qh=q.stride(1),
@@ -1593,7 +1669,8 @@ def triton_sparse_mla_prefill_vllm(
             attn_sink_ptr,
             swa_indptr,
             extra_indptr if has_extra else swa_indptr,
-            max_len,
+            swa_max_len,
+            extra_max_len,
             H=H,
             stride_pt=S * H * D,
             stride_ps=H * D,
@@ -1610,6 +1687,12 @@ def triton_sparse_mla_prefill_vllm(
             HAS_EXTRA=has_extra,
             HAS_SINK=has_sink,
             num_warps=8,
+            # The merge's two passes loop over a chunk count derived from the
+            # device-side CSR indptr. Software-pipelining a dynamic-bound loop
+            # is the construct this path is hardened against, so the merge gets
+            # the same num_stages as the scan kernels instead of Triton's
+            # default of 3.
+            num_stages=_MLA_NUM_STAGES,
         )
     else:
         grid = (T, triton.cdiv(H, _DEFAULT_BLOCK_H))

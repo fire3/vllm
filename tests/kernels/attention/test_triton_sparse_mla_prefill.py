@@ -15,6 +15,7 @@ import torch
 
 from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
     _pack_sparse_rows,
+    _sanitize_row,
 )
 from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_decode import (
     triton_sparse_mla_decode_vllm,
@@ -22,6 +23,28 @@ from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_decode import (
 from vllm.models.deepseek_v4.nvidia.triton_sparse import (
     DeepseekV4TritonMLAAttention,
 )
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _sanitize_row_kernel(
+    starts_ptr,
+    ends_ptr,
+    out_start_ptr,
+    out_len_ptr,
+    max_len: tl.int32,
+    flat_len: tl.int32,
+    n: tl.int32,
+    BLOCK: tl.constexpr,
+):
+    """Drive the module's row sanitizer over a vector of ``(start, end)``."""
+    offs = tl.arange(0, BLOCK)
+    m = offs < n
+    starts = tl.load(starts_ptr + offs, mask=m, other=0)
+    ends = tl.load(ends_ptr + offs, mask=m, other=0)
+    start, length = _sanitize_row(starts, ends, max_len, flat_len)
+    tl.store(out_start_ptr + offs, start, mask=m)
+    tl.store(out_len_ptr + offs, length, mask=m)
 
 _PAGE_SIZE = 64
 _DATA_STRIDE = 576
@@ -990,4 +1013,142 @@ def test_ksplit_plan_parallelism_and_budget():
     target_ctas = 8 * S * h_blocks
     assert target_ctas >= min(4 * sm // 2, 8), (
         f"planner left GPU underfilled: T=8 S={S} sm={sm}"
+    )
+
+
+@pytest.mark.parametrize("force_fused", [False, True])
+def test_corrupt_indptr_does_not_runaway(monkeypatch, force_fused):
+    """Corrupt CSR metadata must degrade to a bounded scan, never spin.
+
+    The 2026-09-14 device-side hang was attributed to a scan loop whose trip
+    count comes from the device-side ``indptr``: a stale/inverted row can turn
+    ``tl.range(0, length, BLOCK_K)`` into a negative upper bound, which does
+    not retire. Reproduce exactly that metadata and assert the operator still
+    finishes and produces the empty-row result. **This test hanging is the
+    failure mode**; the assertions below only pin down the degraded output.
+
+    Both branches are exercised: the plain fused kernel and the K-split
+    partial+merge path (which derives its chunk counts from the same indptr,
+    so it must agree with the chunk body on every row).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.deepseek_v4.nvidia.ops import (
+        triton_sparse_mla_prefill as _mod,
+    )
+
+    device = torch.device("cuda")
+    (
+        q,
+        sinks,
+        main_cache,
+        _,
+        _,
+        swa_indices,
+        swa_lens,
+        extra_cache,
+        _,
+        _,
+        extra_indices,
+        extra_lens,
+    ) = _make_prefill_inputs(device)
+    T, H, _ = q.shape
+    softmax_scale = _D ** -0.5
+
+    if force_fused:
+        monkeypatch.setattr(_mod, "_ksplit_plan", lambda *a, **k: None)
+    else:
+        # T * h_blocks (32 * 2) is far below the GPU's CTA budget, so the
+        # planner picks K-split on its own. Assert that assumption so a future
+        # heuristic change cannot silently turn this into a duplicate case.
+        assert (
+            _mod._ksplit_plan(
+                T, H, swa_indices.shape[-1], extra_indices.shape[-1], device
+            )
+            is not None
+        )
+
+    real_pack = _mod._pack_sparse_rows
+
+    def corrupt_pack(indices, lens, slot=0):
+        """Real pack, then invert row 0: ``start=1 > end=0``."""
+        flat, indptr = real_pack(indices, lens, slot=slot)
+        indptr.zero_()
+        indptr[0] = 1
+        return flat, indptr
+
+    monkeypatch.setattr(_mod, "_pack_sparse_rows", corrupt_pack)
+
+    out = torch.zeros(T, H, _D, dtype=torch.bfloat16, device=device)
+    attn = _make_attn(sinks, softmax_scale)
+    attn._launch_sparse_mla_prefill(
+        q=q,
+        swa_kv_cache=main_cache,
+        swa_indices=swa_indices.unsqueeze(1),
+        swa_lens=swa_lens,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+        out=out,
+    )
+    torch.cuda.synchronize()
+
+    # Every row is empty (row 0 inverted -> clamped to length 0, the rest have
+    # zero width), so the kernel must return the empty-row result instead of
+    # reading a negative-length row.
+    assert torch.equal(out, torch.zeros_like(out)), (
+        "corrupt indptr leaked non-empty attention output"
+    )
+
+
+def test_sanitize_row_clamps_both_ends():
+    """``_sanitize_row`` must bound length from below *and* above.
+
+    Guards the single source of truth the scan kernels share: a negative
+    ``end - start`` becomes an empty row (not a negative trip count), an
+    oversized row is capped at the source's row capacity, and the CSR base is
+    clamped so ``start + length`` stays inside the flat slot buffer.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm.models.deepseek_v4.nvidia.ops import (
+        triton_sparse_mla_prefill as _mod,
+    )
+
+    device = torch.device("cuda")
+    max_len, rows = 16, 8
+    flat_len = rows * max_len
+    starts = torch.tensor(
+        [0, 1, 8, -3, 10_000, 0, 2, 5], device=device, dtype=torch.int32
+    )
+    ends = torch.tensor(
+        [0, 0, 8, 1, 10_000, 10_000, 4, 1_000_000_000],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    out_s = torch.empty(rows, device=device, dtype=torch.int32)
+    out_l = torch.empty(rows, device=device, dtype=torch.int32)
+    _sanitize_row_kernel[(1,)](
+        starts, ends, out_s, out_l, max_len, flat_len, rows, BLOCK=16
+    )
+    s, length = out_s.cpu().tolist(), out_l.cpu().tolist()
+
+    # Explicit expectations, independent of the kernel's own arithmetic:
+    #   row 1  inverted (start=1 > end=0)      -> empty row
+    #   row 3  negative start, positive extent -> start clamped, length kept
+    #   row 4  zero extent, huge base          -> base clamped into the buffer
+    #   row 5  extent far past capacity        -> capped at max_len
+    #   row 7  extent past 2**16               -> still capped at max_len
+    assert length == [0, 0, 0, 4, 0, 16, 2, 16], f"length={length}"
+    assert s == [0, 1, 8, 0, 96, 0, 2, 5], f"start={s}"
+
+    # The invariants the scan kernels rely on.
+    assert all(v >= 0 for v in length), f"negative length: {length}"
+    assert all(v >= 0 for v in s), f"negative start: {s}"
+    assert all(a + b <= flat_len for a, b in zip(s, length)), (
+        f"row slice escapes the flat buffer: {s} + {length} > {flat_len}"
+    )
+    assert all(v <= max_len for v in length), (
+        f"length exceeds the source capacity: {length} > {max_len}"
     )
