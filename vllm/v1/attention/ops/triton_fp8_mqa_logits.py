@@ -120,7 +120,12 @@ def _fp8_mqa_logits_kernel(
 
     start_ind = tl.maximum(start_ind, 0)
     end_ind = tl.minimum(end_ind, seq_len_kv)
-    shifted_end = end_ind - start_ind
+    # Keep the loop trip count non-negative: a stale / inverted row (e.g. a
+    # padding row whose [start, end) was never rewritten this step, which this
+    # pipeline has been seen to produce) would otherwise feed a negative bound
+    # into ``tl.range``. Negative trip counts are UB-adjacent in the generated
+    # loop and can turn into a near-infinite run instead of a no-op.
+    shifted_end = tl.maximum(end_ind - start_ind, 0)
     shifted_unmasked_end = shifted_end // BLOCK_KV * BLOCK_KV
 
     kv_col_offsets = tl.arange(0, BLOCK_KV) + start_ind
@@ -337,7 +342,9 @@ def _fp8_mqa_logits_sm89_kernel(
 
     start_ind = tl.maximum(start_ind, 0)
     end_ind = tl.minimum(end_ind, seq_len_kv)
-    shifted_end = end_ind - start_ind
+    # See ``_fp8_mqa_logits_kernel``: clamp the trip count to [0, seq_len_kv]
+    # so an inverted / stale row is a no-op instead of a pathological loop.
+    shifted_end = tl.maximum(end_ind - start_ind, 0)
     shifted_unmasked_end = shifted_end // BLOCK_KV * BLOCK_KV
 
     kv_col_offsets = tl.arange(0, BLOCK_KV) + start_ind

@@ -24,6 +24,7 @@ count; removing padded heads is explicitly out of scope.
 """
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -73,6 +74,18 @@ _MAX_KSPLIT_CHUNK = 256
 # so it can only ever engage on garbage.
 _MAX_SCAN_ROW_LEN = tl.constexpr(1 << 16)
 _SM_COUNT: dict[int, int] = {}
+
+# ---- 鲁棒性开关（2026-09-14 挂死复盘）-------------------------------------
+# 现场：8 卡 100% 利用率但只有 ~110W、host 线程在 libcuda 里 sched_yield 自旋、
+# 进程 R 状态且 SIGKILL 带不走 —— 典型的"设备侧 kernel 永不退出"。
+# 这条链上唯一会软件流水的构造就是扫描循环 `tl.range(0, length, BLOCK_K)`，
+# 而它的上界来自 device 端 CSR，于是 num_stages>1（Triton 对动态上界循环做
+# 多级 pipelining）成了最可疑的一环。默认改为不流水（num_stages=1），想回到
+# 旧行为/做 A/B 时设 VLLM_TRITON_MLA_NUM_STAGES=2。
+_MLA_NUM_STAGES = int(os.environ.get("VLLM_TRITON_MLA_NUM_STAGES", "1"))
+# 需要时彻底绕开 K-split（partial 缓冲 + merge kernel 那一整套），
+# 只跑最简的融合 kernel：VLLM_TRITON_MLA_FORCE_FUSED=1。
+_MLA_FORCE_FUSED = os.environ.get("VLLM_TRITON_MLA_FORCE_FUSED", "0") == "1"
 
 # Bound the number of scratch-cache entries so a pathological many-keys model
 # cannot silently grow the cache without limit. Captured-graph buffers
@@ -227,6 +240,7 @@ def _tiled_sparse_prefill_ksplit_kernel(
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
     extra_num_slots: tl.int32,
+    max_len: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -302,6 +316,7 @@ def _tiled_sparse_prefill_ksplit_kernel(
             extra_layer_off,
             extra_scale_off,
             extra_num_slots,
+            max_len,
             H,
             stride_qb,
             stride_qh,
@@ -340,6 +355,7 @@ def _scan_mla_source(
     layer_off: tl.int64,
     scale_off: tl.int64,
     num_slots: tl.int32,
+    max_len: tl.int32,
     h_mask,
     m_i,
     l_i,
@@ -366,7 +382,10 @@ def _scan_mla_source(
     share the operand), and consumed by four wide dots instead of eight
     64-wide group dots.
     """
-    length = tl.minimum(end - start, _MAX_SCAN_ROW_LEN)
+    # ``max_len`` is the source's flat row capacity (host-side buffer width):
+    # a row can never contain more entries than its CSR slice holds, so this is
+    # a no-op for healthy metadata and bounds the trip count for garbage.
+    length = tl.minimum(end - start, tl.minimum(max_len, _MAX_SCAN_ROW_LEN))
     k_offs = tl.arange(0, BLOCK_K)
     c0 = tl.arange(0, 256)
     c1 = 256 + tl.arange(0, 128)
@@ -509,6 +528,7 @@ def _ksplit_chunk_body(
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
     extra_num_slots: tl.int32,
+    max_len: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -582,7 +602,7 @@ def _ksplit_chunk_body(
     start = tl.where(is_extra, extra_start, swa_start)
     end = tl.where(is_extra, extra_end, swa_end)
     chunk_idx = pid_chunk - tl.where(is_extra, swa_chunks, 0)
-    length = tl.minimum(end - start, _MAX_SCAN_ROW_LEN)
+    length = tl.minimum(end - start, tl.minimum(max_len, _MAX_SCAN_ROW_LEN))
     k_begin = chunk_idx * CHUNK_SIZE
     k_end = tl.minimum(k_begin + CHUNK_SIZE, length)
 
@@ -602,6 +622,7 @@ def _ksplit_chunk_body(
         layer_off,
         scale_off,
         num_slots,
+        max_len,
         h_mask,
         m_i,
         l_i,
@@ -692,6 +713,7 @@ def _merge_ksplit_kernel(
     attn_sink_ptr,  # [H] f32, natural-log sink (unused when HAS_SINK is 0)
     swa_indptr_ptr,  # [T+1] int32, runtime SWA CSR indptr
     extra_indptr_ptr,  # [T+1] int32, runtime extra CSR indptr
+    max_len: tl.int32,
     H: tl.int32,
     stride_pt: tl.int32,
     stride_ps: tl.int32,
@@ -730,13 +752,13 @@ def _merge_ksplit_kernel(
     # of trusting their (potentially stale) partial LSE.
     swa_len = tl.minimum(
         tl.load(swa_indptr_ptr + t + 1) - tl.load(swa_indptr_ptr + t),
-        _MAX_SCAN_ROW_LEN,
+        tl.minimum(max_len, _MAX_SCAN_ROW_LEN),
     )
     swa_chunks = tl.cdiv(swa_len, CHUNK_SIZE)
     if HAS_EXTRA:
         extra_len = tl.minimum(
             tl.load(extra_indptr_ptr + t + 1) - tl.load(extra_indptr_ptr + t),
-            _MAX_SCAN_ROW_LEN,
+            tl.minimum(max_len, _MAX_SCAN_ROW_LEN),
         )
         extra_chunks = tl.cdiv(extra_len, CHUNK_SIZE)
     else:
@@ -908,6 +930,7 @@ def _tiled_sparse_prefill_kernel(
     extra_layer_off: tl.int64,
     extra_scale_off: tl.int64,
     extra_num_slots: tl.int32,
+    max_len: tl.int32,
     H: tl.int32,
     stride_qb: tl.int32,
     stride_qh: tl.int32,
@@ -1015,6 +1038,7 @@ def _tiled_sparse_prefill_kernel(
                 layer_off,
                 scale_off,
                 num_slots,
+                max_len,
                 h_mask,
                 m_i,
                 l_i,
@@ -1202,6 +1226,13 @@ def _pack_sparse_rows(
     max_width = max(dense.stride(0), dense.shape[1])
     lens32 = lens.reshape(T).contiguous().to(torch.int32)
     if T <= _PACK_FUSED_MAX_T:
+        # The single-CTA pack covers rows with one ``tl.arange(0, BLOCK_T)``
+        # vector: rows past BLOCK_T would silently keep a stale indptr entry,
+        # which the scan kernels would then read as a garbage row length (a
+        # near-infinite scan). Keep the invariant explicit.
+        assert T <= _PACK_BLOCK_T, (
+            f"fused CSR pack requires T <= BLOCK_T ({_PACK_BLOCK_T}), got {T}"
+        )
         flat = _get_csr_flat_buffer(T * max_width, lens.device, slot)
         indptr = _get_csr_flat_buffer(
             T + 1, lens.device, _CSR_INDPTR_SLOT_BASE + slot
@@ -1276,6 +1307,10 @@ def _ksplit_plan(
     """
     h_blocks = triton.cdiv(H, _DEFAULT_BLOCK_H)
     sm_count = _get_sm_count(device)
+    if _MLA_FORCE_FUSED:
+        # Opt-out: run the plain fused kernel only (no partial buffers, no
+        # merge pass) when bisecting K-split-specific problems.
+        return None
     if T * h_blocks >= 2 * sm_count:
         return None
 
@@ -1442,6 +1477,10 @@ def triton_sparse_mla_prefill_vllm(
         if has_extra
         else 0
     )
+    # Hard upper bound for one row's CSR slice (= the source buffer's row
+    # capacity). Passed into the kernels so a corrupted/aliased indptr can only
+    # produce a bounded scan instead of a near-infinite one.
+    max_len = max(swa_max_width, extra_max_width, 1)
     ksplit_plan = _ksplit_plan(
         T, H, swa_max_width, extra_max_width, q.device
     )
@@ -1475,6 +1514,7 @@ def triton_sparse_mla_prefill_vllm(
         extra_layer_off=int(extra_layer_off),
         extra_scale_off=int(extra_scale_off),
         extra_num_slots=extra_num_slots,
+        max_len=max_len,
         H=H,
         stride_qb=q.stride(0),
         stride_qh=q.stride(1),
@@ -1525,6 +1565,7 @@ def triton_sparse_mla_prefill_vllm(
             extra_layer_off=int(extra_layer_off),
             extra_scale_off=int(extra_scale_off),
             extra_num_slots=extra_num_slots,
+            max_len=max_len,
             H=H,
             stride_qb=q.stride(0),
             stride_qh=q.stride(1),
@@ -1542,7 +1583,7 @@ def triton_sparse_mla_prefill_vllm(
             SCALE_STRIDE=_SCALE_STRIDE,
             HAS_EXTRA=has_extra,
             num_warps=_DEFAULT_NUM_WARPS,
-            num_stages=2,
+            num_stages=_MLA_NUM_STAGES,
         )
         _merge_ksplit_kernel[(T, triton.cdiv(H, 8), triton.cdiv(D, 128))](
             partial_out,
@@ -1552,6 +1593,7 @@ def triton_sparse_mla_prefill_vllm(
             attn_sink_ptr,
             swa_indptr,
             extra_indptr if has_extra else swa_indptr,
+            max_len,
             H=H,
             stride_pt=S * H * D,
             stride_ps=H * D,
@@ -1576,5 +1618,5 @@ def triton_sparse_mla_prefill_vllm(
             BLOCK_H=_DEFAULT_BLOCK_H,
             BLOCK_K=_DEFAULT_BLOCK_K,
             num_warps=_DEFAULT_NUM_WARPS,
-            num_stages=2,
+            num_stages=_MLA_NUM_STAGES,
         )
