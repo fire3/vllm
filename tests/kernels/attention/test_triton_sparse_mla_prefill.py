@@ -1137,11 +1137,12 @@ def test_sanitize_row_clamps_both_ends():
     # Explicit expectations, independent of the kernel's own arithmetic:
     #   row 1  inverted (start=1 > end=0)      -> empty row
     #   row 3  negative start, positive extent -> start clamped, length kept
-    #   row 4  zero extent, huge base          -> base clamped into the buffer
+    #   row 4  zero extent, huge base          -> base clamped to flat_len -
+    #                                             max_len (= the last row start)
     #   row 5  extent far past capacity        -> capped at max_len
     #   row 7  extent past 2**16               -> still capped at max_len
     assert length == [0, 0, 0, 4, 0, 16, 2, 16], f"length={length}"
-    assert s == [0, 1, 8, 0, 96, 0, 2, 5], f"start={s}"
+    assert s == [0, 1, 8, 0, 112, 0, 2, 5], f"start={s}"
 
     # The invariants the scan kernels rely on.
     assert all(v >= 0 for v in length), f"negative length: {length}"
