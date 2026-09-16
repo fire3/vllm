@@ -13,7 +13,7 @@ is a drop-in swap:
 No FlashInfer kernel is required by this backend.
 """
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -37,6 +37,9 @@ from vllm.models.deepseek_v4.nvidia.ops.triton_sparse_mla_prefill import (
     triton_sparse_mla_prefill_vllm,
 )
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLAMetadata
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
 class DeepseekV4TritonMLASparseBackend(DeepseekV4FlashInferMLASparseBackend):
