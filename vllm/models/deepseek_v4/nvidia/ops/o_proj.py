@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 
@@ -178,7 +180,7 @@ def deep_gemm_fp8_o_proj(
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     wo_a: nn.Module,
-    wo_b: nn.Module,
+    wo_b: Callable[[torch.Tensor], torch.Tensor],
     *,
     n_groups: int,
     heads_per_group: int,
@@ -191,7 +193,9 @@ def deep_gemm_fp8_o_proj(
     """O projection: inverse RoPE + grouped wo_a + wo_b.
 
     Shared by the FlashMLA and FlashInfer CUDA backends. The attention
-    layer selects the recipe at initialization.
+    layer selects the recipe at initialization. ``wo_b`` is any callable over
+    the flattened ``z``: the projection module itself, or a wrapper that also
+    reduce-scatters its output (DeepSeek-V4.1 GEMM-RS).
     """
     if current_platform.is_cuda() and not is_deep_gemm_supported():
         return _triton_o_proj_fallback(

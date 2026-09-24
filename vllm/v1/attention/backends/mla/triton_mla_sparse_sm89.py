@@ -47,7 +47,7 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.kv_cache_interface import KVCacheLayout
+from vllm.v1.kv_cache_interface import KVCacheLayout, KVCacheSpec
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import AttentionSpec
@@ -65,7 +65,9 @@ class TritonMLASparseSM89Backend(AttentionBackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
         return [MultipleOf(64)]
 
     @staticmethod
